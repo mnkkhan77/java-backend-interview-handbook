@@ -37,4 +37,29 @@ Open [`handbook.html`](handbook.html) directly in a browser, or visit the [live 
 
 ---
 
+## ⚛️ React / Frontend Interview Handbook
+
+A **dedicated companion handbook** for **Frontend / React Engineer** roles — same format, depth, and reader as the Java handbook, in the [`react/`](react/) folder.
+
+### 🌐 Live site: **[inter-lyart.vercel.app/react](https://inter-lyart.vercel.app/react)**
+
+| # | Chapter | # | Chapter |
+|---|---------|---|---------|
+| 01 | Introduction & HR | 13 | Next.js, SSR & Server Components |
+| 02 | JavaScript Fundamentals | 14 | Performance Optimization |
+| 03 | Advanced JavaScript & Async | 15 | React Internals (Fiber & Reconciliation) |
+| 04 | TypeScript for React | 16 | Styling & CSS Architecture |
+| 05 | React Fundamentals | 17 | Testing (Jest & RTL) |
+| 06 | React Hooks | 18 | Accessibility (a11y) |
+| 07 | Advanced Hooks & Custom Hooks | 19 | Browser & Web Platform Fundamentals |
+| 08 | Component Patterns | 20 | Frontend Security |
+| 09 | State Management | 21 | Build Tools & Tooling |
+| 10 | Data Fetching & Server State | 22 | Frontend System Design |
+| 11 | Forms & Validation | 23 | Data Structures & Algorithms (JS) |
+| 12 | React Router & Navigation | 24 | Behavioural & Self-Introduction |
+
+Regenerate the React readers after editing any chapter with `python react/_build_index.py`.
+
+---
+
 *Built as a personal interview-prep resource. Deployed on [Vercel](https://vercel.com).*
