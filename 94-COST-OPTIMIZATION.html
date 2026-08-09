@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>94-COST-OPTIMIZATION.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 94 — COST OPTIMIZATION</h1>
+
+<p class="roi">Volume 5 — Enterprise AI Engineering · Chapter 7 of 12</p>
+
+<div class="callout">
+Observability at Scale (Chapter 93) gave you the dashboards, traces, and token-level telemetry to <em>see</em> exactly what your AI system is doing in production — which prompts run hot, which chains fan out into a dozen model calls, which advisor silently doubles your context on every turn. This chapter turns that visibility into leverage: once cost is measurable, it becomes optimizable, and the difference between a prototype that costs $200 a month and a production system serving the same traffic for $6,000 a month is almost never the foundation model's list price — it is a small number of architectural decisions this chapter will make explicit.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every earlier volume in this series optimized for one thing: getting the system to work at all — to retrieve the right document, to call the right tool, to hold a coherent conversation. Cost was, correctly, a secondary concern while you were still proving the architecture out. In production, that ordering inverts. A feature that works correctly but costs $4 per user interaction will not survive a single pricing review, no matter how impressive the demo was. Cost is not a footnote to AI Engineering — for most organizations shipping LLM-backed features at real scale, it is the single constraint that determines which architecture survives contact with a budget owner.
+</p>
+
+<p>
+The reason this deserves a dedicated chapter, rather than a paragraph in each earlier chapter, is that LLM cost behaves differently from almost every other cost line item a backend engineer has managed before. A database read either happens or it doesn't, and its cost is nearly flat regardless of the data returned. An LLM call's cost is a function of <em>how much text flows through it in both directions</em> — the prompt, the retrieved context (Volume 3), the conversation memory (Spring AI's <code>ChatMemory</code>, covered in the Memory chapter), the tool definitions and tool results (Volume 4), and the generated response, all billed per token, often at different rates for input versus output. A single careless architectural choice — retrieving ten chunks when three would do, or replaying full conversation history on every turn instead of summarizing it — multiplies cost linearly or worse across every single request, forever, until someone notices.
+</p>
+
+<p>
+There is a second reason this matters specifically for you as a Java/Spring engineer moving into this space: cost optimization in AI systems is genuinely an engineering discipline with real trade-offs, not a finance-team spreadsheet exercise bolted on afterward. It touches architecture (which model handles which request), caching (semantic, not just key-based), request shaping (how much context actually needs to reach the model), and even code-level decisions inside your <code>ChatClient</code> pipelines. Treat this chapter the way you would treat a chapter on database query optimization — the concepts here are the AI-system equivalent of knowing when a query needs an index, and skipping this discipline produces the AI-system equivalent of an unindexed table scan on every request, silently, at scale.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+Cost optimization for compute is not a new discipline invented for LLMs — it is one of the oldest problems in computing, and understanding its earlier forms tells you which patterns will transfer and which will not.
+</p>
+
+<h3>2.1 The Mainframe Era: Metered Compute</h3>
+
+<p>
+In the earliest era of commercial computing, compute itself was metered and scarce — organizations paid for CPU-seconds on shared mainframes, and engineering discipline around batching jobs, scheduling off-peak, and minimizing wasted cycles was central to the job, not an afterthought. That discipline largely disappeared during the decades of cheap, abundant commodity compute and, later, elastic cloud infrastructure, where the marginal cost of an extra request became close enough to zero that most application engineers stopped thinking about it at the request level.
+</p>
+
+<h3>2.2 The Cloud Cost Optimization Era (2010s)</h3>
+
+<p>
+Compute cost re-emerged as a first-class engineering concern with the rise of cloud infrastructure billing — the discipline now known as <strong>FinOps</strong>. Engineers learned to right-size EC2 instances, exploit spot pricing, tier storage by access frequency (hot/warm/cold), and cache aggressively to avoid redundant database or API calls. Every one of those patterns is a direct ancestor of a pattern you will use in this chapter: model tiering is instance right-sizing; prompt caching is a warm-cache pattern; semantic caching is a more powerful cousin of the HTTP response cache you have built before.
+</p>
+
+<h3>2.3 The LLM API Era (2020s): Cost Returns to the Request Level</h3>
+
+<p>
+What is genuinely new with foundation models is that cost has returned to being a <em>per-request, content-dependent, highly variable</em> quantity — closer in spirit to the mainframe era than to flat-rate cloud compute. Two identical API endpoints processing the same number of requests per second can have wildly different bills depending purely on how much text each request pushes through the model and which model answers it. Early LLM adopters (2022–2023) largely ignored this, treating API cost the way they had treated cloud compute cost for a decade — "it will scale down as prices drop." Prices did drop substantially per token, but token <em>volume</em> per request grew even faster as RAG pipelines, agentic tool loops (Volume 4), and long conversation histories became standard, and many organizations found their AI feature bills growing even as the underlying per-token price fell. This is the single most important historical lesson for this chapter: <strong>falling unit price does not guarantee falling total cost</strong> — architecture governs volume, and volume dominates.
+</p>
+
+<table>
+<tr><th>Era</th><th>Cost Model</th><th>Optimization Pattern</th><th>Direct Descendant in This Chapter</th></tr>
+<tr><td>Mainframe</td><td>Metered CPU-seconds</td><td>Batching, off-peak scheduling</td><td>Batch/async LLM processing for non-interactive workloads</td></tr>
+<tr><td>Cloud (FinOps)</td><td>Metered instance-hours, storage tiers</td><td>Right-sizing, caching, tiered storage</td><td>Model tiering, response/semantic caching</td></tr>
+<tr><td>LLM APIs</td><td>Metered input/output tokens, per model</td><td>Context minimization, model routing, caching</td><td>Every technique in Sections 5, 9, and 10 of this chapter</td></tr>
+</table>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Deliver the required quality of AI-generated output to every request, at the lowest sustainable cost, without the cost model becoming invisible to the engineers whose architectural decisions actually drive it.</strong>
+</div>
+
+<p>
+Unpack that statement carefully, because each clause rules out a tempting but wrong solution. "Required quality" rules out the naive fix of routing everything to the cheapest available model — a support-ticket triage task and a contract-clause risk analysis do not have the same acceptable error rate, and collapsing them onto one cheap model to save money produces a system that is cheap and wrong. "Lowest sustainable cost" rules out the opposite naive fix of always using the largest, most capable model "to be safe" — that is the AI-system equivalent of provisioning your largest EC2 instance type for every microservice regardless of load, and it does not survive a cost review at scale. "Without the cost model becoming invisible" is the clause most teams miss: cost optimization that lives entirely in a finance dashboard, disconnected from the engineers writing prompts and designing retrieval pipelines, cannot influence the decisions that actually determine token volume — it can only complain about them after the bill arrives.
+</p>
+
+<p>
+Restated in engineering terms, the problem has three coupled sub-problems you will solve together in this chapter: <strong>(1) reduce the tokens that must be processed</strong> for a given request without harming output quality, <strong>(2) route each request to the cheapest model capable of meeting its quality bar</strong>, and <strong>(3) avoid re-paying for work already done</strong> — through caching at multiple layers. Every technique in this chapter is an instance of one of these three levers.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Token Is the Unit of Cost — Internalize This Completely</h3>
+
+<p>
+As covered in the Tokens chapter, models do not bill by the character, the word, or the API call — they bill by the token, separately for input (prompt) tokens and output (completion) tokens, almost always at different rates, with output tokens typically priced several times higher than input tokens because generation is more computationally expensive per token than reading. This asymmetry alone has architectural consequences: a design that asks a model to echo back large amounts of text (e.g., "repeat the relevant passage before answering") is quietly far more expensive than one that asks it to reference the passage by identifier, because you are paying the output rate for text you already had.
+</p>
+
+<h3>4.2 The Three Cost Levers, With Intuition</h3>
+
+<p>
+Think of the total dollar cost of an AI feature as a simple multiplication, even though the real system is more nuanced:
+</p>
+
+<pre>
+Cost ≈ (requests per period)
+      × (input tokens per request × input price per token)
+      × (model tier multiplier)
+      + (requests per period)
+      × (output tokens per request × output price per token)
+      × (model tier multiplier)
+      × (1 − cache hit rate)
+</pre>
+
+<p>
+Every optimization technique in this chapter attacks exactly one of the four levers visible in that formula: <strong>requests</strong> (can this call be avoided or batched?), <strong>tokens per request</strong> (can the prompt or context be smaller without losing signal?), <strong>model tier multiplier</strong> (does this request need the flagship model, or would a smaller one do?), and <strong>cache hit rate</strong> (has this exact or semantically equivalent work already been paid for?). A useful mental habit going forward: whenever you look at any proposed cost optimization, ask "which of these four numbers does this actually move, and by how much?" Optimizations that don't map cleanly onto one of these four are usually cosmetic.
+</p>
+
+<h3>4.3 Model Tiering as an Analogy You Already Know</h3>
+
+<p>
+You have made this exact trade-off before, just with a different resource. When you choose between a full SQL join across normalized tables versus a denormalized read-optimized view, or between a synchronous call and an async queued job, you are trading accuracy/freshness/simplicity against cost and latency. Model tiering is the same trade: a small, fast, cheap model (think of it as an index-only query) handles the bulk of simple, high-volume requests — classification, extraction, short-answer lookups — while a large, expensive, slow model (the full join across every table) is reserved for requests that genuinely need deep reasoning, long-context synthesis, or high-stakes accuracy. The engineering skill is not "always use the cheap model" or "always use the expensive one" — it is building the <strong>routing logic</strong> that decides, per request, which tier is sufficient, and that routing logic is itself a small classification problem you can solve cheaply.
+</p>
+
+<h3>4.4 Caching Is Not One Thing — It Is a Spectrum</h3>
+
+<p>
+Backend engineers default to thinking of caching as "same key, same value" — an exact-match lookup. LLM systems support that (identical prompt → cached identical response) but gain enormous additional leverage from two other forms: <strong>prefix/prompt caching</strong>, where a model provider caches the computation for a shared prefix (a long system prompt, a large retrieved document) across many requests so only the varying suffix is billed at full price; and <strong>semantic caching</strong>, where a new request that is not textually identical to a past one, but is <em>meaning-equivalent</em> (measured via embedding similarity, as covered in the Vector Mathematics chapter), reuses a past response instead of triggering a new model call at all. Semantic caching is the highest-leverage and most AI-specific technique in this entire chapter, because natural-language requests rarely repeat verbatim but very often repeat in intent — "what's our refund policy" and "how do refunds work here" are different strings and the same cache hit, if your caching layer is built to recognize that.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through what actually happens, step by step, in a cost-optimized request pipeline, so you can reason about edge cases rather than memorizing a checklist.
+</p>
+
+<h3>5.1 Step 1 — Request Classification (Routing Decision)</h3>
+
+<p>
+Before any expensive model is invoked, a lightweight classifier — which itself may be a small, cheap LLM call, a traditional ML classifier, or even a rules-based heuristic on request metadata — inspects the incoming request and assigns it a difficulty/risk tier. Edge case to reason through immediately: what happens when the classifier itself is wrong and routes a genuinely hard request to the cheap model? This is why production routers almost always pair tiering with a <strong>confidence-based escalation path</strong> — if the cheap model's response comes back with low self-reported confidence, fails a structured-output validation (Volume 2), or triggers a guardrail check (later chapter), the request is automatically retried against the next tier up. The cost of the wasted cheap-tier call is trivial compared to the cost of the expensive-tier call it might have avoided on the 80–95% of requests that didn't need escalation.
+</p>
+
+<h3>5.2 Step 2 — Context Assembly With a Token Budget</h3>
+
+<p>
+Rather than assembling "all context that might be relevant," a cost-aware pipeline assembles context against an explicit token budget, in priority order: system instructions first (fixed, small), then the highest-relevance retrieved chunks (Volume 3's re-ranking becomes a cost lever here, not just a quality lever — sending the top 3 re-ranked chunks instead of the top 10 raw-retrieved chunks is a direct token, and therefore dollar, reduction), then conversation memory, summarized rather than replayed verbatim once it exceeds a threshold (Memory chapter), then the user's current turn. If the budget is exceeded, the pipeline trims from the lowest-priority end first — never truncates from the middle in a way that could sever the system instructions or the user's actual question, which is a subtle bug that produces bizarre model behavior with no obvious error in your logs.
+</p>
+
+<h3>5.3 Step 3 — Cache Lookup Before Model Invocation</h3>
+
+<p>
+Before the assembled request reaches the model, it is checked against a cache layer, typically in two stages: an exact-match check (hash of the fully assembled prompt) for maximum speed on true repeats, then, if configured, a semantic check (embed the user's query, search a small recent-query vector index for a near-duplicate above a similarity threshold, as covered in the Vector Mathematics chapter). Edge case: semantic caching is unsafe for requests where staleness matters — a cached answer to "what's the current status of order #4471" must never be served semantically to a different order number, so semantic caches need scoping keys (per-tenant, per-entity) layered on top of similarity, not similarity alone.
+</p>
+
+<h3>5.4 Step 4 — Invocation, Streaming, and Early Termination</h3>
+
+<p>
+The model is invoked, ideally with streaming enabled (Streaming chapter) so that if a downstream guardrail or the user themselves cancels the request mid-generation, the pipeline can terminate the stream early — you are billed for output tokens actually generated, so cutting a runaway or clearly-off-track generation short is a real, if situational, cost control, particularly relevant for open-ended creative or agentic loops that can otherwise generate far more output than needed.
+</p>
+
+<h3>5.5 Step 5 — Response Caching and Telemetry</h3>
+
+<p>
+The final response is written back into the cache layer (both exact-match and, if applicable, the semantic index) so the next equivalent request is nearly free, and the full token accounting for the request — input tokens, output tokens, model tier used, cache hit/miss, routing decision — is emitted as a metric, closing the loop back to the observability infrastructure from Chapter 93. Without this last step, every other step in this pipeline is un-auditable: you cannot tell whether your routing logic is actually saving money without the per-request token and tier data to prove it.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+This topic needs very little formalism — the arithmetic is simple multiplication and the leverage comes from where you apply it, not from complex equations — but a few concrete relationships are worth making precise because they change how you prioritize effort.
+</p>
+
+<h3>6.1 Blended Cost Per Request</h3>
+
+<pre>
+Cost_per_request = (input_tokens × price_in) + (output_tokens × price_out)
+
+Example — a RAG-backed support answer, GPT-4-class pricing shape:
+  input_tokens  = 2,400   (system prompt + 4 retrieved chunks + history)
+  output_tokens =   350
+  price_in      = $0.0000025 / token   ($2.50 / 1M tokens)
+  price_out     = $0.0000100 / token   ($10.00 / 1M tokens)
+
+  Cost = (2,400 × 0.0000025) + (350 × 0.0000100)
+       = $0.0060 + $0.0035
+       = $0.0095 per request  →  ~$9.50 per 1,000 requests
+</pre>
+
+<p>
+Notice that even though output tokens are 4× more expensive per token here, input tokens still contribute more than half the cost in this example simply because there are nearly 7× as many of them — this is the mathematical justification for why context minimization (fewer retrieved chunks, summarized history) is usually the single highest-leverage lever, ahead of model tier selection, whenever input tokens dominate the mix.
+</p>
+
+<h3>6.2 The Multiplicative Effect of Scale</h3>
+
+<pre>
+Monthly cost = requests_per_day × 30 × cost_per_request
+
+  10,000 requests/day × 30 × $0.0095  =  $2,850 / month
+ 100,000 requests/day × 30 × $0.0095  = $28,500 / month
+1,000,000 requests/day × 30 × $0.0095 = $285,000 / month
+</pre>
+
+<p>
+This is the number that makes cost optimization non-optional past a certain scale: a $0.001 reduction per request (roughly one fewer retrieved chunk, or 100 fewer output tokens) is invisible in a demo and is a six-figure annual saving at a million requests a day. Cost bugs that would never justify an engineering ticket at prototype scale absolutely justify one at production scale — always evaluate a proposed optimization against your actual or projected request volume, not against the per-request number in isolation.
+</p>
+
+<h3>6.3 Cache Hit Rate as a Multiplier on Everything Else</h3>
+
+<pre>
+Effective cost = Cost_per_request × (1 − cache_hit_rate)
+
+  cache_hit_rate = 0%   → Effective cost = 100% of full cost
+  cache_hit_rate = 40%  → Effective cost =  60% of full cost
+  cache_hit_rate = 75%  → Effective cost =  25% of full cost
+</pre>
+
+<p>
+Because cache hit rate multiplies the <em>entire</em> per-request cost (both input and output tokens, regardless of which model tier answered), improving it compounds with every other optimization in this chapter rather than competing with them — this is why Section 10 places caching first among the best practices.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Cost-Optimized Request Pipeline</h3>
+
+<pre>
+  Incoming request
+        │
+        ▼
+ ┌──────────────────┐
+ │ 1. Classify /      │  cheap/fast: heuristic, small model, or metadata rule
+ │    route by tier    │
+ └────────┬───────────┘
+          │
+          ▼
+ ┌──────────────────┐        HIT → return cached response
+ │ 2. Cache lookup     │────────────────────────────────► (near-zero cost)
+ │  exact + semantic   │
+ └────────┬───────────┘
+          │ MISS
+          ▼
+ ┌──────────────────┐
+ │ 3. Assemble context │  token budget enforced: system → top-K reranked
+ │    within budget    │  chunks → summarized memory → current turn
+ └────────┬───────────┘
+          │
+          ▼
+ ┌──────────────────┐
+ │ 4. Invoke tier-N    │──── low confidence / validation failure ────┐
+ │    model (streamed) │                                             │
+ └────────┬───────────┘                                              │
+          │ confident, valid                                         ▼
+          ▼                                              ┌──────────────────┐
+ ┌──────────────────┐                                    │ Escalate to        │
+ │ 5. Cache response + │◄───────────────────────────────│ tier-(N+1) model    │
+ │    emit cost metric │        result flows back        └──────────────────┘
+ └────────┬───────────┘
+          ▼
+     Return to caller
+</pre>
+
+<h3>7.2 Token Budget Allocation Inside a Single Prompt</h3>
+
+<pre>
+ Context window budget: 8,000 tokens (deliberately reserved, not the model max)
+
+ ┌───────────────────────────────────────────────────────────┐ 0
+ │ System instructions (fixed)                    ~300 tokens │
+ ├───────────────────────────────────────────────────────────┤ 300
+ │ Top-3 re-ranked retrieved chunks             ~1,800 tokens │
+ │  (was top-10 raw chunks at ~6,000 tokens before rerank —   │
+ │   this single change cut input cost ~70% for this route)   │
+ ├───────────────────────────────────────────────────────────┤ 2,100
+ │ Summarized conversation memory                 ~400 tokens │
+ │  (was full transcript, growing unbounded per turn before   │
+ │   the summarizing advisor was introduced)                  │
+ ├───────────────────────────────────────────────────────────┤ 2,500
+ │ Current user turn                              ~150 tokens │
+ ├───────────────────────────────────────────────────────────┤ 2,650
+ │ Reserved for output generation               ~1,000 tokens │
+ └───────────────────────────────────────────────────────────┘ 3,650
+   Unused headroom: 4,350 tokens — available for growth, not
+   an invitation to fill it "just in case."
+</pre>
+
+<p class="followup">
+<strong>Read the second diagram as a lesson, not just a picture:</strong> the single highest-leverage line in that whole budget was replacing raw top-10 retrieval with re-ranked top-3 — a Volume 3 technique that most teams file under "quality improvement" and never credit as the cost optimization it also is. The best cost work in AI Engineering is frequently indistinguishable from the best quality work: sending the model less irrelevant text tends to make it both cheaper and more accurate, because it removes distracting content from its attention (Attention chapter) at the same time it removes billed tokens.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+Cost optimization is not a single component — it is a set of concerns distributed across the same orchestration layer introduced in earlier chapters, plus one new piece: a dedicated cost-governance service that sits alongside observability rather than inside the request's hot path.
+</p>
+
+<pre>
+                        ┌─────────────────────────────────────────┐
+                        │            Spring Boot Application        │
+                        │   Rate limiting · per-tenant quotas        │
+                        └───────────────────┬───────────────────────┘
+                                           ▼
+        ┌──────────────────────────────────────────────────────────────┐
+        │                 Orchestration Layer (ChatClient +               │
+        │            Advisors: routing, cache, budget, memory)            │
+        └───────┬───────────────┬───────────────┬─────────────┬──────────┘
+                ▼               ▼               ▼             ▼
+      ┌─────────────┐  ┌───────────────┐ ┌─────────────┐ ┌───────────────┐
+      │ Cache Layer   │  │ Model Router   │ │ Retrieval /  │ │ Tool Calling   │
+      │ exact +       │  │ tier-N vs      │ │ Reranking    │ │ budget-aware   │
+      │ semantic      │  │ tier-(N+1)     │ │ (Volume 3)   │ │ loops (Vol. 4) │
+      └─────────────┘  └───────┬───────┘ └─────────────┘ └───────────────┘
+                                 ▼
+                    ┌──────────────────────────┐
+                    │  Foundation Model Provider │
+                    │  (multiple tiers/vendors)  │
+                    └────────────┬─────────────┘
+                                 ▼
+              ┌──────────────────────────────────────────┐
+              │  Token & Cost Telemetry (feeds Ch. 93       │
+              │  observability stack: per-tenant, per-route,│
+              │  per-model dashboards + budget alerts)      │
+              └──────────────────────────────────────────┘
+                                 ▼
+              ┌──────────────────────────────────────────┐
+              │  Cost Governance Service (offline/async)    │
+              │  - Nightly cost-per-feature rollups          │
+              │  - Anomaly detection on spend velocity       │
+              │  - Budget alerts, per-tenant hard caps        │
+              └──────────────────────────────────────────┘
+</pre>
+
+<p>
+The critical architectural decision visible in this diagram is that the <strong>Cost Governance Service is deliberately out of the synchronous request path</strong>. Real-time hard-cutoffs at the request level (per-tenant rate limits, per-request budget enforcement) belong in the orchestration layer where latency budgets already exist; slower, higher-context analysis — "which feature's cost grew 40% week over week, and why" — belongs in an asynchronous rollup job that can afford to be minutes or hours behind, the same separation you already apply between synchronous request validation and offline batch analytics in any mature backend system.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI gives you concrete seams to implement every lever from Section 4 without inventing infrastructure from scratch.
+</p>
+
+<h3>9.1 Model Routing via Multiple ChatModel Beans</h3>
+
+<p>
+Because Spring AI's <code>ChatModel</code> is an interface, not a concrete class tied to one provider or tier, a routing layer is naturally expressed as a service holding references to multiple named <code>ChatModel</code> beans (e.g., a small/cheap model and a large/flagship model, potentially even from different providers) and selecting between them per request:
+</p>
+
+<pre>
+@Service
+public class TieredChatRouter {
+
+    private final ChatClient cheapClient;
+    private final ChatClient flagshipClient;
+    private final RequestDifficultyClassifier classifier;
+
+    public TieredChatRouter(
+            @Qualifier("cheapChatModel") ChatModel cheapModel,
+            @Qualifier("flagshipChatModel") ChatModel flagshipModel,
+            RequestDifficultyClassifier classifier) {
+        this.cheapClient = ChatClient.create(cheapModel);
+        this.flagshipClient = ChatClient.create(flagshipModel);
+        this.classifier = classifier;
+    }
+
+    public String answer(String userQuery, String context) {
+        Difficulty tier = classifier.classify(userQuery);
+
+        ChatClient chosen = (tier == Difficulty.SIMPLE)
+                ? cheapClient
+                : flagshipClient;
+
+        ChatResponse response = chosen.prompt()
+                .system("Answer using only the provided context.")
+                .user(u -> u.text(userQuery))
+                .call()
+                .chatResponse();
+
+        if (tier == Difficulty.SIMPLE && looksLowConfidence(response)) {
+            // escalate once, rather than trusting a shaky cheap-tier answer
+            return flagshipClient.prompt()
+                    .user(u -> u.text(userQuery))
+                    .call()
+                    .content();
+        }
+        return response.getResult().getOutput().getText();
+    }
+}
+</pre>
+
+<h3>9.2 Advisors as the Natural Home for Budget and Cache Logic</h3>
+
+<p>
+As covered in the Advisors chapter, Spring AI's <code>Advisor</code> mechanism (the AOP-flavored interceptor pattern around every <code>ChatClient</code> call) is the correct place to implement cost controls, precisely because it is cross-cutting: a <code>ContextBudgetAdvisor</code> can trim the assembled prompt to a token ceiling before the request leaves the process, and a <code>ResponseCacheAdvisor</code> can short-circuit the call chain entirely on a cache hit, returning a synthesized <code>ChatResponse</code> without ever reaching the model — the same pattern you already use for a caching interceptor in a traditional Spring MVC or WebFlux pipeline, just wired into the model-call chain instead of the HTTP filter chain.
+</p>
+
+<h3>9.3 Token Accounting From ChatResponse Metadata</h3>
+
+<p>
+Every <code>ChatResponse</code> exposes usage metadata (prompt tokens, completion tokens) via its metadata accessor, which is exactly the raw material the Cost Governance Service in Section 8 needs. In practice, teams wrap this extraction in a small component invoked from an advisor's "after" hook, tagging each record with tenant ID, route name, and model tier before publishing it to the metrics pipeline described in Chapter 93 — this is the same "capture metadata, emit a metric, move on" pattern you already apply to HTTP request/response logging via a <code>Filter</code> or interceptor.
+</p>
+
+<h3>9.4 Structured Output as an Indirect Cost Control</h3>
+
+<p>
+Structured output (covered in its own chapter) is worth mentioning here because it has a cost dimension most engineers miss: constraining a model to return a compact JSON object instead of a free-form prose explanation directly reduces output tokens, and combined with validation, it reduces the retry/escalation rate described in Section 5.1 — fewer malformed responses means fewer wasted calls.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Optimize context before you optimize model choice.</strong> As Section 6.1's arithmetic showed, input tokens frequently dominate the cost equation in RAG-heavy systems; re-ranking down to the smallest sufficient context (Volume 3) is usually higher-leverage than switching models.</li>
+<li><strong>Cache at every layer you can, cheapest layer first.</strong> Check exact-match before semantic, semantic before invoking any model, and prefer provider-side prompt/prefix caching for large, stable shared context (system prompts, static reference documents) so you are not re-paying full price for text that never changes.</li>
+<li><strong>Build routing on measured task difficulty, not intuition.</strong> Instrument which requests actually needed the flagship model's escalation path (Section 5.1) and use that data to continuously retune the classifier — routing decisions made once at launch and never revisited drift out of alignment with real traffic patterns.</li>
+<li><strong>Set token budgets as hard architectural limits, not soft guidelines.</strong> A context-assembly step with no enforced ceiling will grow unboundedly as retrieval, memory, and tool results accumulate over a system's lifetime — enforce the budget in code (an advisor, as in Section 9.2), not in a comment telling future engineers to "keep this small."</li>
+<li><strong>Attribute cost per tenant, per feature, and per route — not just in aggregate.</strong> An aggregate monthly bill tells you the trend is bad; per-route attribution tells you which specific prompt template or retrieval pipeline to fix.</li>
+<li><strong>Treat output length as something you actively constrain</strong>, via explicit instructions, max-token limits, and structured output schemas — an unconstrained model will often produce longer answers than necessary, and you are billed at the (typically higher) output rate for every extra token.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Assuming a cheaper per-token price means a cheaper feature.</strong> As Section 2.3 covered historically, falling unit prices are routinely outpaced by rising token volume per request as pipelines grow more elaborate — always evaluate total projected spend, not headline pricing.</li>
+<li><strong>Retrieving more context "to be safe" without re-ranking it down.</strong> Over-retrieval (Volume 3) is simultaneously a quality problem (irrelevant context competes for the model's attention) and a cost problem (every retrieved token is billed) — teams that fix it for quality reasons often discover the cost win as a pleasant side effect, and vice versa.</li>
+<li><strong>Replaying full conversation history on every turn indefinitely.</strong> Without summarization (Memory chapter), a long-running conversation's input token count — and therefore its per-turn cost — grows roughly linearly with turn count, turning a cheap early conversation into an expensive late one with no warning until someone reviews the bill.</li>
+<li><strong>Caching by exact string match only, and concluding "caching doesn't help our workload."</strong> Natural-language input rarely repeats verbatim; teams that stop at exact-match caching frequently see near-zero hit rates and abandon caching entirely, missing the much larger gains available from semantic caching.</li>
+<li><strong>Routing purely on request type instead of measured difficulty.</strong> A rule like "all summarization requests go to the cheap model" ignores that some individual documents are far harder to summarize accurately than others — difficulty varies within a task type, not just across task types, and blunt category-based routing routes some genuinely hard requests to a model that cannot handle them.</li>
+<li><strong>Letting agentic tool-calling loops (Volume 4) run unbounded.</strong> An agent that re-plans, re-retrieves, and re-invokes tools without an iteration or token ceiling can silently consume far more tokens per user request than a single chat completion, and this failure mode is invisible until observability (Chapter 93) surfaces it — cap iteration counts and cumulative token spend per agentic run explicitly.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Cost, latency, and throughput are tightly coupled in this domain in ways that are worth making explicit, because optimizing one without checking the others can quietly regress a different metric.
+</p>
+
+<ul>
+<li><strong>Smaller models are usually both cheaper and faster</strong> — the same reduction in parameter count that lowers price per token also typically lowers inference latency, so model tiering (Section 4.3) is frequently a latency win as well as a cost win, not a trade-off between them.</li>
+<li><strong>Caching improves latency and cost simultaneously</strong> — a cache hit both avoids the model's per-token billing and avoids its inference latency entirely, which is why cache hit rate is worth optimizing even in latency-sensitive paths, not just cost-sensitive ones.</li>
+<li><strong>Context trimming reduces both cost and time-to-first-token</strong> — a shorter prompt is billed for fewer input tokens and is also processed faster by the model before generation begins, so the context-budget discipline from Section 5.2 pays a latency dividend as well.</li>
+<li><strong>Escalation paths add latency on the requests that trigger them</strong> — the confidence-based escalation pattern from Section 5.1 saves money on the majority of requests but costs a full extra round trip's worth of latency on the minority that escalate; this trade-off needs to be sized against your latency SLO, not assumed to be free.</li>
+<li><strong>Aggressive output-length constraints can clip legitimately long, correct answers</strong> — a hard max-token cap set too conservatively trades cost savings for truncated, unusable responses, which then triggers retries that erase the savings and add latency; tune the cap against real output-length distributions, not a guess.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+This topic's security surface is narrower than earlier Volume 5 chapters, but it is real and worth naming honestly rather than padding with generic advice. The primary risk is <strong>cost-based denial of service</strong>: an attacker (or simply an unthrottled internal client) who can trigger unbounded model calls — long adversarial inputs designed to maximize retrieved context, prompts crafted to induce very long generations, or an agentic loop coaxed into excessive tool-calling iterations (Volume 4) — can drive spend up sharply without ever breaching data confidentiality or integrity. Per-tenant rate limiting, hard per-request token ceilings, and the iteration caps mentioned in Section 11 are your primary defenses, and they belong in the same category as the rate-limiting you already apply to protect against traditional API abuse, just measured in tokens and model-seconds instead of requests per second.
+</p>
+
+<p>
+A secondary, more subtle risk is <strong>cache poisoning across tenants</strong>: a semantic cache that is not correctly scoped per tenant (Section 5.3) can leak one customer's cached response to a different customer's semantically similar query, which is simultaneously a cost bug and a data isolation failure — always key semantic cache lookups by tenant/session scope in addition to similarity score, never by similarity alone.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. Why does an LLM API call not cost the same amount every time, even for requests hitting the same endpoint?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>LLM providers bill per token, separately for input and output, so cost varies with how much text is sent (prompt, retrieved context, conversation history) and how much text is generated in response. Two requests to the same endpoint can have very different token counts and therefore very different costs — unlike a typical REST call whose cost is roughly flat regardless of payload content.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Name two concrete ways to reduce the cost of a single RAG-backed request without changing which model answers it.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Retrieve and send fewer, higher-relevance chunks (re-ranking down to the top few instead of sending everything retrieved), and summarize or truncate long conversation history instead of replaying the full transcript on every turn. Both directly reduce input token count, which is billed regardless of model choice.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain the difference between exact-match caching and semantic caching for LLM responses, and when semantic caching can be unsafe.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Exact-match caching returns a stored response only when the new request is textually identical (or hashes identically) to a past one. Semantic caching embeds the new request and compares it by similarity to past requests, returning a cached response for meaning-equivalent but differently worded queries, which produces far higher hit rates on natural language traffic. It becomes unsafe when the underlying answer is time-sensitive or entity-specific (e.g., an order status lookup) — a semantically similar query about a different entity or a since-changed fact can incorrectly reuse a stale or wrong cached answer unless the cache is scoped by entity/tenant keys in addition to similarity.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. What is model tiering / routing, and why is a confidence-based escalation path important to pair with it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Model tiering routes requests to different models based on task difficulty — cheap/fast models for simple requests, expensive/capable models reserved for genuinely hard ones — reducing average cost across a mixed workload. An escalation path is necessary because the routing classifier can misjudge difficulty; without a way to detect a low-confidence or invalid cheap-tier response and retry against a stronger model, misrouted hard requests silently receive poor answers instead of being caught and corrected.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Your team's monthly LLM bill grew 3x over two months while traffic only grew 20%. Walk through how you would diagnose the cause.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Start from per-request, per-route, per-tenant token telemetry (built in the observability layer) rather than the aggregate bill — aggregate spend can't distinguish "more requests" from "more expensive requests." Check for growth in average tokens per request over time (a common cause: unbounded conversation history growth without summarization, or a retrieval pipeline returning more/larger chunks than before due to a reranking regression or a data ingestion change). Check for a shift in model-tier distribution (a routing regression sending more traffic to the flagship tier than before). Check for a drop in cache hit rate (a cache invalidation bug, a TTL misconfiguration, or increased traffic diversity outrunning the cache's coverage). Check for agentic loops (Volume 4) taking more iterations per run than before, e.g., due to a tool starting to fail and triggering retries. The key discipline is that the fix must be traced to one of the four cost levers — request volume, tokens per request, model tier, cache hit rate — rather than treated as a vague "usage went up."</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly name that 3x cost growth against 20% traffic growth means the <em>cost per request</em> roughly 2.5x'd, and say you would pull historical per-request token/tier/cache-hit metrics to find exactly when that inflection happened, then correlate it against recent deploys — this shows you reason from the cost formula in Section 6.1 rather than guessing, and that you treat cost regressions like any other production regression: bisectable against deploy history.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. How would you design token-budget enforcement in a Spring AI application so it cannot be bypassed by future engineers adding new context sources?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Centralize context assembly and budget enforcement in a single cross-cutting component — a Spring AI Advisor — rather than trusting every call site to individually respect a token limit. The advisor intercepts the fully assembled prompt before it reaches the model, applies a fixed token ceiling with a defined trim priority (drop lowest-priority context first: older memory, then lower-relevance retrieved chunks, never the system instructions or current user turn), and rejects or logs any request that would still exceed the budget after trimming. Because it runs in the advisor chain rather than being opt-in code each feature team must remember to call, new context sources added later are automatically subject to the same budget without requiring every future engineer to know the rule exists.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A product team wants to ship a new agentic feature (Volume 4) that can call multiple tools in a loop. How do you review this proposal from a cost-governance perspective before approving it for production?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>An unbounded agentic loop is one of the highest cost-risk patterns in this chapter because each iteration can itself invoke a full model call plus tool calls, and a single user request can silently fan out into a large, unpredictable number of billed calls. As a staff-level reviewer, require: an explicit hard cap on iterations and on cumulative tokens per run, enforced in code, not as a suggested guideline; per-run cost estimation logged and attributed to the tenant/feature so spend is visible before it becomes an aggregate surprise; a defined fallback behavior when the cap is hit (return partial results with a clear status, rather than silently truncating); and a pre-launch load/cost test that models realistic worst-case tool-failure-and-retry scenarios, since tool failures are exactly what tend to drive loops toward their iteration ceiling. The broader strategic point to make to the product team: agentic features should be priced and capacity-planned per-run, not estimated by extrapolating from single-call chat feature costs, because the cost distribution has a much longer tail.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How do you build organizational incentives so that engineers building AI features naturally make cost-aware architectural decisions, rather than cost optimization being a recurring retrofit project?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Make cost visible at the point of decision, not just at the point of billing. Concretely: surface per-route and per-feature token/cost metrics in the same dashboards engineers already use for latency and error rate (extending the Chapter 93 observability stack rather than building a separate finance-only view), so a context-bloat regression is as visible as a latency regression during normal development. Bake budget-aware defaults into shared infrastructure — the token-budget advisor, the tiered router, the caching layer from this chapter — so the cost-conscious path is also the path of least resistance, the same way a shared connection-pooling library makes the resource-efficient choice the default rather than something each team must remember to implement. Finally, attribute cost to the team/feature that generates it in recurring review, the same way you would attribute a reliability incident, so cost has an owner rather than being everyone's and no one's responsibility.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Using the cost formula from Section 6.1, explain why a system with heavy retrieval (many, large chunks) but short answers will benefit more from context minimization than from model tiering, while a system with short prompts but long, detailed generated answers will benefit more from output-length constraints and model tiering. Give a concrete example feature for each case.</li>
+<li>A colleague argues "since token prices keep falling every year, cost optimization work now will be obsolete in six months." Using the historical argument from Section 2.3, explain why this reasoning is incomplete, and what tends to grow faster than price falls.</li>
+<li>Explain, in your own words, why semantic caching needs to be scoped (by tenant, by entity, by time-sensitivity) rather than applied globally based on similarity score alone. Construct one concrete failure example.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Take a RAG pipeline you have access to (or design one on paper) and compute its per-request cost using the Section 6.1 formula with a realistic token count for its retrieved context, history, and typical output length. Then apply one change — re-ranking to fewer chunks, or summarizing history past a turn threshold — and recompute the cost. Express the saving as both a per-request dollar amount and a projected monthly saving at 100,000 requests/day.</li>
+<li>Sketch a Spring AI <code>Advisor</code> (in real or pseudo Java, in the style of Section 9.2) that enforces a fixed token budget on the assembled prompt before it reaches the model, trimming the lowest-priority context first when the budget is exceeded. Identify what metadata it should log on every trim event so a future cost investigation (as in Interview Q5) has the data it needs.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>LLM cost is a function of tokens, not requests — input and output tokens are billed separately, usually at different rates, so the same endpoint can vary wildly in cost depending purely on prompt and context size.</li>
+<li>Every cost optimization technique reduces to one of four levers: request volume, tokens per request, model tier, or cache hit rate — evaluate any proposed optimization by which of these it actually moves.</li>
+<li>Context minimization (better retrieval, re-ranking, summarized memory) is frequently the single highest-leverage cost lever, and it usually improves quality at the same time, because it removes irrelevant content from the model's attention as well as from the bill.</li>
+<li>Model tiering with a confidence-based escalation path lets most traffic run on cheap, fast models while still catching the minority of requests that genuinely need a stronger model — routing must be built on measured difficulty, not intuition, and retuned as traffic evolves.</li>
+<li>Caching spans a spectrum from exact-match to provider-side prefix caching to semantic caching, and hit rate acts as a multiplier on your entire cost equation — it compounds with, rather than competes against, every other optimization.</li>
+<li>Cost governance belongs partly in the synchronous request path (advisors enforcing budgets, routing, and rate limits) and partly in an asynchronous rollup layer (attribution, anomaly detection, budget alerts) — conflating the two either slows down every request or leaves spend invisible until the bill arrives.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Scaling (Chapter 95) picks up where cost optimization leaves off — once you can make each request cheap and efficient, the next engineering problem is making the whole system handle order-of-magnitude more of those requests without falling over: connection and throughput limits against model providers, horizontal scaling of the orchestration layer, queueing and backpressure for bursty traffic, and how the caching and routing infrastructure built in this chapter needs to evolve when it is no longer serving thousands of requests a day, but millions.
+</p>
+
+</div>
+
+</body>
+</html>

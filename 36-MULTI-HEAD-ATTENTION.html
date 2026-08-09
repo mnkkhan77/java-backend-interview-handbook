@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>36-MULTI-HEAD-ATTENTION.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 36 — MULTI-HEAD ATTENTION</h1>
+
+<p class="roi">Volume 1 — AI Foundations · Chapter 9 of 22</p>
+
+<div class="callout">
+The Query, Key, and Value chapter gave you a single attention mechanism: one set of learned projections, one similarity computation, one weighted blend of values. That single mechanism already lets a token look at every other token and decide what matters. But a single attention "view" can only ask one kind of question of the sentence at a time — either "what refers to me?" or "what is nearby me in meaning?" but not comfortably both, using the same numbers, in the same pass. Multi-head attention is the architectural answer to that limitation: run several independent attention mechanisms in parallel, each free to specialize in a different kind of relationship, and combine their answers. Understanding exactly how and why this works is the last conceptual piece you need before the full Transformer block (Chapter 38) will make complete sense end to end.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Imagine you hand a single, very capable editor a sentence and ask them to annotate every word with everything relevant to it — its grammatical subject, its emotional tone, its long-range reference back to a noun three clauses earlier, and its rhyme or rhythm relationship to nearby words. One editor, doing one pass, with one notion of "similarity," will end up averaging all of those signals together into a single blurry judgment per word. What you actually want is a small panel of specialist editors — one who only tracks grammatical dependencies, one who only tracks coreference ("which noun does 'it' refer to?"), one who only tracks local phrase structure — each producing their own independent annotation, which you then combine. That panel-of-specialists idea, applied inside a single attention layer of a Transformer, is exactly what multi-head attention is.
+</p>
+
+<p>
+This matters concretely for your journey toward production AI engineering for a very practical reason: multi-head attention is not a footnote optimization, it is the mechanism directly responsible for a Transformer's ability to simultaneously track syntax, semantics, and long-range dependencies within the same layer. Every model you will call through Spring AI's <code>ChatModel</code> abstraction — GPT-family, Claude, Gemini, Llama — is built from stacked layers of exactly this mechanism, typically with dozens of heads per layer and dozens of layers. When you later reason about context window limits, why certain models handle long documents better than others, why attention computation dominates inference cost and thus API pricing, or why some architectures use fewer, larger heads while others use many small ones, you are reasoning directly about design choices made inside multi-head attention. Skipping past it as "just an implementation detail" of single-head attention would leave a permanent gap in your mental model of how these systems actually compute.
+</p>
+
+<p>
+There is also a very human reason this chapter deserves real attention (pun intended): "multi-head attention" is one of the single most frequently asked deep-dive interview topics for any AI engineering role above entry level, precisely because it is easy to describe vaguely ("it lets the model attend to different things") and hard to describe precisely (how many parameters does it actually add? why split the dimension instead of just running several full-size attentions? what exactly gets concatenated, and in what order?). This chapter is built to get you past the vague version and into the precise one.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+Before attention existed as a standalone mechanism, sequence models like recurrent neural networks (RNNs) and their gated variants (LSTMs, GRUs) processed a sentence strictly left to right (or with a second pass right to left, in "bidirectional" variants), compressing everything seen so far into a single fixed-size hidden state vector. By the time the model reached word twenty, everything relevant about word one had to survive being repeatedly compressed and overwritten through nineteen intermediate steps — a well-documented bottleneck that caused long-range dependencies to fade, sometimes called the "vanishing context" problem in practice (related to, but distinct from, the vanishing gradient problem in training).
+</p>
+
+<p>
+The 2014–2015 wave of "attention" mechanisms (originally introduced for neural machine translation, notably by Bahdanau et al. and later refined by Luong et al.) fixed this by letting a decoder look back directly at every encoder position and learn a weighted focus over them, rather than relying purely on a compressed hidden state. This was a single attention distribution per decoding step — effectively what the Query/Key/Value chapter described as one attention "head." It was already a major improvement, but researchers building the 2017 Transformer architecture ("Attention Is All You Need," Vaswani et al.) observed a specific weakness even in this improved single-attention setup: a single softmax-weighted average, computed from one shared set of learned projections, forces the model to commit to one notion of relevance per layer. If the "right" relationship for word A to word B is syntactic (subject-verb agreement) and the right relationship for word A to word C is semantic (topical similarity), a single attention distribution has to represent both blended into one number per pair, computed with one shared geometry.
+</p>
+
+<p>
+The fix the Transformer paper introduced was almost embarrassingly simple in hindsight, which is often the sign of a genuinely good idea: instead of computing attention once with the full-size Query, Key, and Value vectors, split the model's working dimension into several smaller slices, run the entire attention computation independently and in parallel on each slice with its own learned projections, and concatenate the results back together. Each slice is a "head." This single architectural choice — multi-head attention — became one of the two or three most consequential design decisions in the entire Transformer, and it has survived essentially unchanged (aside from efficiency variants covered later in this chapter) through every major LLM generation since 2017.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Given a single attention mechanism that must compress every kind of token-to-token relationship into one shared similarity geometry and one softmax distribution per query, design a mechanism that lets a model represent multiple, independent kinds of relationships between the same tokens simultaneously, within a single layer, without a proportional increase in the number of learned parameters or the computational budget.</strong>
+</div>
+
+<p>
+Unpack the constraint at the end of that sentence, because it is the part most explanations skip and the part interviewers actually probe: it would be trivial to get "multiple relationship types" by simply running several complete, full-dimensional attention computations and adding their outputs — but that would multiply the parameter count and compute cost by the number of heads, for no efficiency reason, since the Query/Key/Value projection matrices would each be as large as before. The actual engineering problem multi-head attention solves is subtler: achieve representational diversity across heads while keeping the total parameter budget and total floating-point operations roughly equal to a single full-size attention computation. The solution, as you will see in Sections 5 and 6, is to divide the existing model dimension among the heads rather than multiplying it — each head works with a smaller slice of the representation, and the heads' independent, smaller computations are cheap enough in aggregate to match the cost of one large one.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Core Mental Model: A Panel, Not a Committee-of-One</h3>
+
+<p>
+Recall from the Query, Key, and Value chapter that a single attention head, for each token, produces a Query vector (what am I looking for?), and every token in the sequence produces a Key vector (what do I offer?) and a Value vector (what information do I actually carry, if attended to?). The head computes similarity between the Query and every Key, turns those similarities into a probability distribution via softmax, and produces the token's new representation as a weighted sum of all the Value vectors, weighted by that distribution.
+</p>
+
+<p>
+Multi-head attention takes that entire mechanism and instantiates it several times in parallel — think 8, 12, 16, or even 96+ times in modern large models — with each instantiation ("head") having its own, independently learned Query, Key, and Value projection matrices. Because each head's projections are learned independently during training, gradient descent is free to push different heads toward specializing in different relationships, purely because doing so reduces the overall training loss more effectively than every head learning the same thing. Nobody hand-assigns "head 3 does syntax" — specialization emerges the same way it does everywhere else in deep learning: as the residue of optimizing a shared objective, exactly as the "dial-turning" analogy from the Motivation chapter (Chapter 1 of this volume) described for training in general.
+</p>
+
+<p>
+Empirically, when researchers have inspected trained Transformer models head by head, they have found genuinely interpretable specialization: some heads reliably attend from a pronoun to its antecedent noun (coreference-like behavior), some heads attend almost purely to the immediately preceding or following token (local positional structure), some heads attend from a verb to its direct object, and some heads show diffuse, broad attention that behaves more like a "context summary." No one guaranteed this would happen — it is an emergent consequence of having room (multiple independent heads) for different useful strategies to each find a niche.
+</p>
+
+<h3>4.2 Why Splitting the Dimension, Not Multiplying It, Is the Key Design Choice</h3>
+
+<p>
+Here is the detail that separates a shallow explanation from a precise one. Suppose the model's working dimension (often called <code>d_model</code>) is 512. A single, full-size attention head would use Query/Key/Value projection matrices that map each token's 512-dimensional representation to 512-dimensional Query, Key, and Value vectors. Multi-head attention with, say, 8 heads does not give each head a full 512-dimensional Query/Key/Value space — it gives each head a <code>d_model / num_heads = 512 / 8 = 64</code>-dimensional space instead. Each head is smaller, not additional.
+</p>
+
+<p>
+This is the exact resolution of the Problem Statement's efficiency constraint: 8 heads, each projecting 512 dimensions down to 64 dimensions, together use almost exactly the same total number of parameters and the same total compute as 1 head projecting 512 dimensions to 512 dimensions — because the total output width across all 8 heads (8 × 64 = 512) matches what a single head would have produced anyway. You get representational diversity essentially "for free" in terms of raw compute budget, at the cost of each individual head having a lower-dimensional space to express its similarity function in. That trade — many narrow, specialized views instead of one wide, general view — has proven, empirically and consistently across the entire LLM era, to be a better use of a fixed compute budget.
+</p>
+
+<h3>4.3 An Analogy Worth Internalizing</h3>
+
+<p>
+Picture a single wide-angle camera lens versus an array of eight narrower lenses, each pointed slightly differently, covering the same total sensor area. The wide-angle lens captures everything in one blended, averaged shot. The array of eight narrower lenses captures eight distinct, more focused perspectives on the same scene, which you then lay side by side. Multi-head attention is architecturally the second option, and the "laying side by side" step is literally implemented as vector concatenation, covered mechanically in the next section.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through the mechanism step by step, in the order it actually executes inside a Transformer layer.
+</p>
+
+<h3>5.1 Step 1 — Start From the Same Input, Every Head</h3>
+
+<p>
+Every head receives the exact same input: the sequence of token representations coming into this attention layer (for self-attention, this is the same set of vectors used to produce Queries, Keys, and Values; the Query/Key/Value chapter covered why these three roles, though derived from the same input, are computed via separate learned projections). Critically, no head sees a different subset of tokens — every head sees the full sequence. What differs between heads is not the input, but the learned projection matrices applied to that input.
+</p>
+
+<h3>5.2 Step 2 — Independent Projections Per Head</h3>
+
+<p>
+Each head <em>h</em> has its own learned weight matrices W_Q^h, W_K^h, and W_V^h. For every token's input vector x, head <em>h</em> computes its own Query, Key, and Value:
+</p>
+
+<pre>
+Q_h = x · W_Q^h        (shape: d_model → d_k, where d_k = d_model / num_heads)
+K_h = x · W_K^h        (shape: d_model → d_k)
+V_h = x · W_V^h        (shape: d_model → d_v, typically d_v = d_k)
+</pre>
+
+<p>
+Because W_Q^h, W_K^h, and W_V^h are distinct, randomly initialized, and independently updated matrices for every head, head 1's Query space and head 5's Query space start out uncorrelated and are pushed in different directions by gradient descent over training — this is the entire mechanical source of specialization discussed in Section 4.
+</p>
+
+<h3>5.3 Step 3 — Scaled Dot-Product Attention, Run Independently Per Head</h3>
+
+<p>
+Each head now runs exactly the attention computation from the Query/Key/Value chapter, entirely independently of every other head: compute similarity scores between that head's Queries and Keys, scale, apply softmax to get attention weights, and use those weights to combine that head's Values.
+</p>
+
+<pre>
+head_h_output = softmax( (Q_h · K_h^T) / sqrt(d_k) ) · V_h
+</pre>
+
+<p>
+At this point in the computation, there are <em>num_heads</em> separate output matrices, one per head, each of shape (sequence_length × d_k). They have not interacted with each other at all yet — each head has computed a complete, independent answer to "what should this token's new representation look like, according to my particular notion of relevance?"
+</p>
+
+<h3>5.4 Step 4 — Concatenate</h3>
+
+<p>
+The per-head outputs are laid side by side along the feature dimension for each token — literally concatenated, not summed or averaged. If there are 8 heads each producing a 64-dimensional output per token, concatenation produces one 512-dimensional vector per token (8 × 64 = 512), restoring the original model dimension.
+</p>
+
+<pre>
+concat_output = concat(head_1_output, head_2_output, ..., head_8_output)   → shape: (seq_len × d_model)
+</pre>
+
+<h3>5.5 Step 5 — Final Linear Projection (the Mixing Step)</h3>
+
+<p>
+Concatenation alone would leave the eight heads' outputs sitting next to each other without ever being mixed together into a genuinely combined representation — the model would essentially be reading eight separate reports stapled together rather than one integrated one. To fix this, the concatenated vector is passed through one more learned linear projection matrix, W_O (the "output projection"):
+</p>
+
+<pre>
+MultiHeadOutput = concat_output · W_O          (shape: seq_len × d_model, unchanged)
+</pre>
+
+<p>
+This final projection is small but functionally important: it is the only place in the whole mechanism where information from different heads is allowed to blend together into a single shared representation, and it is a learned matrix, so training decides how much (and how) to mix each head's contribution into the layer's final output for each dimension.
+</p>
+
+<h3>5.6 Edge Cases Worth Reasoning Through Yourself</h3>
+
+<ul>
+<li><strong>What if num_heads does not evenly divide d_model?</strong> In virtually every real implementation this is enforced as a hard constraint at model-construction time (d_model must be divisible by num_heads) precisely so that d_k is a clean integer; there is no standard mechanism for uneven head sizes in the canonical architecture.</li>
+<li><strong>What if one head learns to do (almost) nothing useful?</strong> This does happen in practice — research on "head pruning" has shown many trained Transformers can have a meaningful fraction of their heads removed post-training with minimal accuracy loss, implying real redundancy exists across heads, not perfect specialization in every single one.</li>
+<li><strong>Do all heads use the same attention mask?</strong> Yes — causal masking (preventing a token from attending to future tokens, central to autoregressive generation) and padding masks are applied identically across all heads within a layer; masking is a property of position, not of head identity.</li>
+<li><strong>Is d_k always d_model / num_heads?</strong> That is the canonical, parameter-preserving convention from the original Transformer, and the overwhelming majority of production models still follow it, but nothing in the mathematics <em>requires</em> it — architectures can and occasionally do choose head dimensions independently of head count, trading the "free" efficiency property described in Section 4.2 for other considerations.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+You already have every formula that matters from Section 5; this section only adds the compact notation you will see in papers and codebases, and one intuition about parameter counting that interviewers specifically probe.
+</p>
+
+<h3>6.1 Compact Formalism</h3>
+
+<pre>
+For head i = 1 ... h:
+    head_i = Attention(Q·W_Q^i, K·W_K^i, V·W_V^i)
+           = softmax( (Q W_Q^i)(K W_K^i)^T / sqrt(d_k) ) · (V W_V^i)
+
+MultiHead(Q, K, V) = Concat(head_1, ..., head_h) · W_O
+</pre>
+
+<p>
+where W_Q^i, W_K^i, W_V^i ∈ ℝ^(d_model × d_k), W_O ∈ ℝ^(h·d_v × d_model), and by convention d_k = d_v = d_model / h.
+</p>
+
+<h3>6.2 The Parameter-Counting Intuition</h3>
+
+<p>
+Total parameters across all heads' Q, K, V projections: h heads × (d_model × d_k) per matrix × 3 matrices = h × d_model × (d_model/h) × 3 = d_model² × 3 — <strong>independent of h</strong>. This is the precise mathematical statement of the "free diversity" claim from Section 4.2: whether you use 1 head or 16 heads, the total Query+Key+Value parameter count is identical, because increasing the head count proportionally shrinks each head's projection size. Only the final output projection W_O (size d_model × d_model) and the fixed cost of the softmax/matmul operations depend on h at all, and even those scale mildly. This is precisely why multi-head attention was such an efficient architectural win: diversity of representation was obtained essentially without a parameter-budget or FLOPs tax.
+</p>
+
+<h3>6.3 A Note on Scaling by sqrt(d_k)</h3>
+
+<p>
+Because each head operates in a smaller d_k-dimensional space (e.g., 64 instead of 512), the scaling factor sqrt(d_k) inside each head's softmax is correspondingly smaller than it would be for one full-size head — this is not a separate design choice, it falls directly out of using the same scaled dot-product attention formula from the Query/Key/Value chapter per head, with that head's own (smaller) dimension.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Full Multi-Head Attention Data Flow</h3>
+
+<pre>
+Input tokens (each a d_model=512 dim vector)
+        │
+        ├────────────────┬────────────────┬───────────────┬──── ... (h=8 heads total)
+        ▼                ▼                ▼               ▼
+   ┌─────────┐      ┌─────────┐      ┌─────────┐     ┌─────────┐
+   │ Head 1   │      │ Head 2   │      │ Head 3   │ ... │ Head 8   │
+   │ W_Q¹ W_K¹│      │ W_Q² W_K²│      │ W_Q³ W_K³│     │ W_Q⁸ W_K⁸│
+   │ W_V¹     │      │ W_V²     │      │ W_V³     │     │ W_V⁸     │
+   │          │      │          │      │          │     │          │
+   │ Q,K,V:   │      │ Q,K,V:   │      │ Q,K,V:   │     │ Q,K,V:   │
+   │ 64-dim   │      │ 64-dim   │      │ 64-dim   │     │ 64-dim   │
+   │          │      │          │      │          │     │          │
+   │ scaled   │      │ scaled   │      │ scaled   │     │ scaled   │
+   │ dot-prod │      │ dot-prod │      │ dot-prod │     │ dot-prod │
+   │ attention│      │ attention│      │ attention│     │ attention│
+   │          │      │          │      │          │     │          │
+   │ learns:  │      │ learns:  │      │ learns:  │     │ learns:  │
+   │ "subject-│      │ "nearby  │      │ "corefer-│     │ "broad   │
+   │  verb"   │      │  tokens" │      │  ence"   │     │  topic"  │
+   └────┬────┘      └────┬────┘      └────┬────┘     └────┬────┘
+        │ 64-dim         │ 64-dim         │ 64-dim         │ 64-dim
+        ▼                ▼                ▼                ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │        CONCATENATE along feature dimension → 512-dim          │
+   └───────────────────────────────┬─────────────────────────────┘
+                                    ▼
+                       ┌───────────────────────┐
+                       │  Linear projection W_O  │   ← the ONLY place
+                       │  (512 → 512, mixes      │      heads' info
+                       │   heads together)        │      actually blends
+                       └───────────┬───────────┘
+                                    ▼
+                    Output: one 512-dim vector per token,
+                    fed onward to the feed-forward sublayer
+</pre>
+
+<h3>7.2 Why One Head Is Not Enough — A Concrete Sentence Walkthrough</h3>
+
+<pre>
+Sentence:  "The trophy didn't fit in the suitcase because it was too big."
+Token of interest: "it"
+
+ SINGLE HEAD (one shared similarity space, must average all signal types):
+   "it" ──attends-somewhat-to──> "trophy"   (weak/ambiguous — competes with)
+   "it" ──attends-somewhat-to──> "suitcase" (weak/ambiguous)
+   Result: a blended, uncertain representation — the classic Winograd-
+   schema ambiguity is NOT cleanly resolved by one averaged view.
+
+ MULTI-HEAD (independent specialized views, then combined):
+   Head A (coreference-leaning):  "it" ──strong──> "trophy"
+   Head B (local syntax):         "it" ──strong──> "was" (adjacent verb)
+   Head C (broad topic):          "it" ──diffuse─> {trophy, suitcase, fit}
+   Head D (negation tracking):    "it" ──strong──> "didn't"
+   ... concatenated and mixed by W_O, the FINAL representation of "it"
+   carries all four specialized signals simultaneously, instead of one
+   averaged, muddied signal.
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+Multi-head attention is not a standalone service you deploy — it is a computational primitive executed on GPU/TPU hardware, repeated across every Transformer layer, inside the foundation model box you already saw drawn as the smallest box in the production architecture diagram (Chapter 1). But its cost characteristics ripple outward into decisions you will make as an application engineer building on top of a model API.
+</p>
+
+<pre>
+┌───────────────────────────────────────────────────────────────────────┐
+│                     Model Provider Inference Server                    │
+│                                                                          │
+│   Layer 1: Multi-Head Self-Attention  →  Feed-Forward  → residual+norm  │
+│   Layer 2: Multi-Head Self-Attention  →  Feed-Forward  → residual+norm  │
+│   ...                                                                   │
+│   Layer N: Multi-Head Self-Attention  →  Feed-Forward  → residual+norm  │
+│                                                                          │
+│   Each layer's attention cost scales with:                             │
+│     - sequence_length² (every token attends to every token)            │
+│     - num_heads × head_dim = d_model (roughly fixed per model)         │
+│     - KV-cache memory: grows with sequence_length × num_heads ×        │
+│       head_dim × num_layers, held per active request                   │
+└──────────────────────────────┬──────────────────────────────────────────┘
+                                ▼
+                 Your Spring Boot application (via HTTP/SDK)
+                 - sees only tokens in, tokens out, latency, cost
+                 - never manipulates heads directly
+                 - but MUST reason about the cost curve above when
+                   deciding context length, batching, and model choice
+</pre>
+
+<p>
+The practical consequence: the quadratic term (sequence_length²) inside every head's attention computation is the single biggest reason long-context requests are disproportionately more expensive and slower than short ones, and it is also the direct motivation for efficiency variants you will encounter by name in production model documentation — <strong>Multi-Query Attention (MQA)</strong>, where all heads share a single Key/Value projection to shrink the KV-cache, and <strong>Grouped-Query Attention (GQA)</strong>, a middle ground where small groups of heads share Keys/Values. These are not different mechanisms from what this chapter taught — they are engineering trade-offs applied directly on top of the Section 5 mechanism, sacrificing some of the "every head fully independent" purity for meaningfully lower memory bandwidth and faster inference, which is why most current production-grade LLMs use GQA rather than the original paper's fully independent multi-head design.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+You will not implement multi-head attention yourself in a Spring Boot application — that computation happens inside the model provider's serving infrastructure, entirely behind the API boundary. What you own, as the Java engineer, is understanding how the cost structure described in Section 8 should shape decisions made through Spring AI's abstractions.
+</p>
+
+<table>
+<tr><th>Multi-Head Attention Property</th><th>Spring AI / Application-Level Consequence</th></tr>
+<tr><td>Attention cost grows quadratically with sequence length</td><td>When configuring a <code>ChatClient</code> call, trimming conversation history (or delegating to a memory/summarization <code>Advisor</code>, covered in Volume 2) is not just a token-count nicety — it is directly cutting the quadratic term driving latency and cost.</td></tr>
+<tr><td>KV-cache memory scales with num_heads × head_dim × sequence_length × layers</td><td>This is a root cause of why providers price and rate-limit by token count and why very long context requests can queue or throttle differently than short ones — worth knowing when designing retry/backoff logic around a <code>ChatModel</code> call.</td></tr>
+<tr><td>Different heads specialize in different relationship types (syntax, coreference, topic)</td><td>Explains empirically why some models handle long-range references (pronouns pointing far back) better than others of similar size — a factor worth benchmarking, not assuming, when selecting a model via Spring AI's model-agnostic <code>ChatModel</code> interface.</td></tr>
+<tr><td>Attention is a fixed architectural property of the chosen model, not something you tune per request</td><td>Reinforces the Strategy-pattern mindset from Chapter 1: swap models through the <code>ChatModel</code> abstraction to get a different attention configuration (head count, GQA vs. full MHA) rather than trying to influence it via prompting.</td></tr>
+</table>
+
+<p>
+The one place this chapter's content becomes directly actionable code is when you are choosing <em>between</em> models exposed through Spring AI's provider-agnostic interfaces: a model card advertising "Grouped-Query Attention" and a large context window is telling you, in the vocabulary of this chapter, that it has deliberately traded some per-head independence for cheaper long-context inference — directly relevant when you are picking a model for a use case that leans heavily on long conversation history or large retrieved document sets (Volume 3).
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Treat context length as a cost lever, not a free resource.</strong> Because attention cost scales quadratically with sequence length across every head, trimming irrelevant history or retrieved context before it reaches the model has an outsized effect on latency and spend compared to almost any other optimization you can make at the application layer.</li>
+<li><strong>When comparing models, look for attention-variant details (MHA vs. GQA vs. MQA) in provider documentation.</strong> This single detail predicts a meaningful amount of the latency and long-context cost difference between otherwise similarly-sized models.</li>
+<li><strong>Do not assume every head is doing something interpretable or necessary.</strong> Research on head pruning shows real redundancy exists; this is useful context when reading papers about model compression or distillation, since removing "attention heads" is a legitimate, evidence-backed compression technique, not an arbitrary hack.</li>
+<li><strong>When teaching or explaining this mechanism to teammates, always tie head count back to d_k = d_model / num_heads.</strong> This is the detail that most self-taught explanations get vague about, and getting it precise is what separates a working understanding from a hand-wavy one.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Believing more heads always means more parameters.</strong> As Section 6.2 showed precisely, total Q/K/V parameters across all heads are independent of head count when d_k = d_model / h is held to convention — increasing heads redistributes capacity, it does not add it.</li>
+<li><strong>Assuming each head cleanly maps to one human-nameable linguistic concept.</strong> Interpretability research finds many heads with genuinely interpretable behavior, but also plenty with diffuse, redundant, or hard-to-name behavior — do not overstate the "one head = one grammatical rule" story in an interview or design review.</li>
+<li><strong>Confusing multi-head attention with running the same attention multiple times for averaging/ensembling.</strong> The heads are not redundant copies voting on the same answer — they use different learned projections and are trained to be complementary, then combined via a learned linear layer, not a simple average.</li>
+<li><strong>Forgetting that concatenation alone does not mix information across heads.</strong> Some learners assume the model's final representation naturally blends all heads' signal; it is specifically the output projection W_O that performs that mixing, and omitting it (or treating it as a formality) misses a real architectural component.</li>
+<li><strong>Assuming attention "sees" position or order for free.</strong> Multi-head attention as described in this chapter is permutation-invariant with respect to token order on its own — order information has to be injected separately, which is exactly the subject of the very next chapter on Positional Encoding.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Three performance facts about multi-head attention are worth carrying forward into every later volume of this series:
+</p>
+
+<ul>
+<li><strong>Quadratic scaling with sequence length dominates cost at long context.</strong> Doubling the number of tokens in a request roughly quadruples the raw attention computation per layer, per head — this is the single biggest reason "just send the whole document" is a poor default strategy compared to retrieval-based context construction (Volume 3).</li>
+<li><strong>Memory bandwidth, not raw compute, is often the real bottleneck during generation.</strong> During autoregressive decoding, the model must repeatedly read the growing Key/Value cache for every head at every layer for every new token generated — this is precisely why Multi-Query and Grouped-Query Attention (Section 8) exist: shrinking the number of distinct Key/Value sets reduces memory traffic even though the mathematically "pure" version would keep them fully independent per head.</li>
+<li><strong>Head count and head dimension are fixed at model architecture time, not tunable per request.</strong> You cannot ask a provider's API for "fewer heads for this request to save cost" — the only levers you actually control from the application layer are sequence length (via context/history trimming) and model selection, which is exactly why Section 10's best practices focus there.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Multi-head attention itself has limited direct security surface — it is a mathematical computation over vectors, not a place where access control or injection normally applies. Being honest about that is more useful than manufacturing a security angle that isn't really there. That said, one indirect consequence is genuinely worth knowing: because every head attends over the <em>entire</em> input sequence with no built-in notion of "trusted" versus "untrusted" text (a point first raised in Chapter 1's discussion of prompt injection), a token injected anywhere in a long context — a hidden instruction buried inside a retrieved document, for instance — is structurally just as attendable-to by any head as a token from the system prompt. Multi-head attention does not create this vulnerability, but it also does nothing to mitigate it; the defense has to be engineered at the application and guardrail layer (Volume 5), not expected to emerge from the attention mechanism itself.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. In one or two sentences, what problem does multi-head attention solve that a single attention mechanism does not?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A single attention mechanism must blend every kind of token relationship (syntax, coreference, topical similarity, position) into one shared similarity space and one softmax distribution per token. Multi-head attention runs several independent attention computations in parallel, each with its own learned projections, so different heads can specialize in different kinds of relationships simultaneously, and their results are combined afterward.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. What does "concatenation" mean in the context of multi-head attention, and where does it happen?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>After each head independently computes its attention output for every token, those per-head output vectors (each of dimension d_k) are placed side by side along the feature dimension to form one longer vector per token (num_heads × d_k = d_model). This happens after all heads finish their independent scaled dot-product attention computation, and before the final output linear projection.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. If d_model = 512 and num_heads = 8, what is d_k, and why is that specific value chosen rather than each head using the full 512 dimensions?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>d_k = d_model / num_heads = 512 / 8 = 64. Each head is given a slice of the model dimension, not the full dimension, specifically so that the total parameter count and compute across all heads' Query/Key/Value projections stays roughly equal to what a single full-size attention head would have cost. This is what allows multi-head attention to add representational diversity without a proportional increase in parameters or FLOPs.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. What role does the final output projection matrix W_O play, and what would be lost without it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>W_O is a learned linear layer applied to the concatenated output of all heads. It is the only point in the mechanism where information from different heads is actually mixed together into a unified representation; concatenation by itself just places the heads' outputs adjacent to each other without blending them. Without W_O, the layer's output would be, in effect, several independent reports stapled together rather than one integrated representation, and the model would lose the ability to learn how to weigh and combine different heads' signals per output dimension.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Do individual attention heads reliably learn interpretable, human-nameable roles (like "syntax head" or "coreference head")? What does the evidence actually show?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Partially, and unevenly. Interpretability studies on trained Transformers have found specific heads that reliably exhibit patterns like attending from a pronoun to its likely antecedent, or from a token to its immediate neighbor, which look like genuine syntactic or coreference specialization. But the same research also finds substantial redundancy — many heads can be pruned post-training with minimal performance loss, and a meaningful fraction of heads show diffuse or hard-to-interpret attention patterns rather than one clean role. The honest senior-level answer avoids overclaiming full interpretability while still crediting genuine, reproducible specialization in a subset of heads.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Bring up head pruning research unprompted — noting that models can lose a fraction of their heads with minimal accuracy degradation demonstrates you understand multi-head attention is an over-provisioned, partially redundant mechanism by design, not a minimal, fully-utilized one. This is exactly the kind of nuance that separates a memorized definition from real understanding in a senior/staff interview loop.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Explain Grouped-Query Attention (GQA) and why most modern production LLMs use it instead of the original "fully independent" multi-head design.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>In the original multi-head design, every head has its own independent Key and Value projections in addition to its own Query projection. During autoregressive generation, the model must maintain and repeatedly read a Key/Value cache for every head at every layer for every generated token, and that memory bandwidth (not raw compute) becomes the dominant bottleneck at inference time. Grouped-Query Attention keeps independent Query projections per head (preserving most of the representational diversity) but has small groups of heads share a single Key/Value projection, sharply reducing the size of the KV-cache and the memory traffic needed to read it. Multi-Query Attention is the extreme version where all heads share one Key/Value pair. Most current production-grade LLMs adopt GQA because it captures most of full multi-head attention's quality while meaningfully improving inference latency and memory efficiency, especially for long-context and high-throughput serving.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. You are choosing between two similarly-sized foundation models for a long-document summarization feature: one uses full multi-head attention, the other uses grouped-query attention with a larger advertised context window. Walk through how you would reason about this choice.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Start from the mechanism: full multi-head attention gives every head fully independent Key/Value projections, which theoretically preserves maximal representational diversity per layer but scales KV-cache memory linearly with head count, making very long contexts expensive and slower to serve. GQA sacrifices some of that per-head independence to cut memory bandwidth, which is precisely why it can more efficiently support a larger context window at comparable latency and cost. For long-document summarization specifically, context length capacity and throughput usually matter more in practice than the marginal quality difference between GQA and full MHA at comparable model scale — so the GQA model with the larger context window is very likely the stronger practical choice, assuming benchmark evaluation (not just architecture on paper) on your actual summarization task confirms output quality is comparable. The staff-level answer explicitly calls out that this must be validated empirically with your own evaluation harness (Volume 5) rather than decided from architecture diagrams alone, since attention-variant choice is only one of many factors (training data, fine-tuning, RLHF quality) that determine real-world output quality.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. A junior engineer proposes reducing latency by asking the model provider's API to "use fewer attention heads" for simple requests. How do you respond, and what would you propose instead?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Head count and head dimension are fixed architectural properties baked into a specific trained model checkpoint — they are not runtime, per-request configuration knobs exposed by any inference API, because the model's learned weights (W_Q, W_K, W_V, W_O for every head, at every layer) are specific to that architecture and would produce meaningless output if heads were arbitrarily dropped at inference time without retraining or a purpose-built pruning process. The levers actually available at the application layer are: reducing input sequence length (trimming history/context, since attention cost scales quadratically with it), choosing a smaller or GQA/MQA-based model variant suited to the task's difficulty, and batching requests efficiently at the infrastructure layer. The correct engineering response redirects the optimization effort toward those real levers rather than a non-existent API knob.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Using the "single wide-angle lens versus array of narrow lenses" analogy from Section 4.3, explain in your own words why splitting d_model across heads (rather than giving every head the full d_model) keeps the total parameter count roughly constant regardless of head count.</li>
+<li>Take the Winograd-schema example sentence from Section 7.2 ("The trophy didn't fit in the suitcase because it was too big") and construct a second sentence with the same structure but the opposite resolution (e.g., swapping "big" for "small" so "it" now refers to the other noun). Explain, using the multi-head framing, why a model needs more than one attention view to get both versions right.</li>
+<li>Explain why concatenating heads' outputs without a final output projection (W_O) would leave the model's representation "unmixed," and what kind of failure you would expect to observe in a model trained without that final projection.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Using any publicly documented model architecture (check its published model card or technical report), find its reported num_heads and d_model, compute d_k, and note whether it uses full multi-head attention, GQA, or MQA. Write two sentences on what that choice implies about its likely latency and context-length trade-offs.</li>
+<li>Sketch, in the ASCII style of Section 7.1, a 4-head version of the data flow diagram for a toy d_model=256 example (so each head would have d_k=64), labeling each stage from input through final output projection.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Multi-head attention runs several independent attention computations in parallel, each with its own learned Query/Key/Value projections, so different heads can specialize in different kinds of token relationships within the same layer.</li>
+<li>The key efficiency insight is that each head's dimension (d_k) is the model dimension <em>divided by</em> the number of heads, not the full model dimension — this keeps total parameters and compute roughly constant regardless of head count, making the diversity essentially "free."</li>
+<li>The mechanism is: independent per-head projections → independent per-head scaled dot-product attention → concatenate all heads' outputs → one final learned linear projection (W_O) that actually mixes information across heads.</li>
+<li>Head specialization is emergent, not hand-designed — some heads reliably learn interpretable roles (coreference, local syntax), but real redundancy also exists, as shown by head-pruning research.</li>
+<li>Because attention cost scales quadratically with sequence length across every head, and KV-cache memory scales with head count, production systems increasingly use efficiency variants like Grouped-Query and Multi-Query Attention, which you will encounter by name in real model documentation.</li>
+<li>As an application engineer using Spring AI's model-agnostic abstractions, you do not implement this mechanism, but you make decisions — context trimming, model selection — that are directly shaped by its cost structure.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> multi-head attention, as built in this chapter, treats the input as an unordered set of tokens — nothing in the mechanism itself tells the model that "the" came before "cat" rather than after it. Positional Encoding (Chapter 37) closes that gap, showing exactly how order information is injected into the token representations before they ever reach the attention layers you now understand in full mechanical detail.
+</p>
+
+</div>
+
+</body>
+</html>

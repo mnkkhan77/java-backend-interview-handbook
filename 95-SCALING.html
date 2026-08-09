@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>95-SCALING.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 95 — SCALING</h1>
+
+<p class="roi">Volume 5 — Enterprise AI Engineering · Chapter 8 of 12</p>
+
+<div class="callout">
+Cost Optimization (Chapter 94) taught you how to make a single request cheap — the right model for the job, caching, prompt compression, batching where it fits. Scaling is the discipline that asks the next, harder question: what happens when that carefully optimized request has to run not once, but ten thousand times a minute, from users spread across three continents, against a provider that will throttle you the instant you cross an invisible token-per-minute line? Cost tuning and scaling are not the same lever — a system can be cheap per call and still fall over under load, or expensive per call and still gracefully absorb a traffic spike. This chapter is about surviving the second kind of pressure without silently reintroducing the first.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every AI feature you have built so far in this series has almost certainly been validated against a handful of requests — a demo, a staging environment, a QA script run by two people. Scaling is the chapter where that comfortable assumption ends. The moment a feature ships to real users, three things happen simultaneously that never happened during development: request volume becomes unpredictable, requests arrive concurrently instead of one at a time, and the system's weakest link — which in an AI-augmented application is almost always the model provider call or the vector database query — becomes the thing that determines whether the whole product feels fast or feels broken.
+</p>
+
+<p>
+This matters more, and differently, for AI systems than for the REST APIs and CRUD services you have scaled before. A traditional Spring Boot service scales by adding pods and database read replicas, and the marginal cost of one more request is a few milliseconds of CPU and a database round trip measured in single-digit milliseconds. An LLM-backed request is orders of magnitude more expensive per unit: a single chat completion can take seconds, consume thousands of tokens, and — critically — is often rate-limited not by your infrastructure but by a third party you do not control. You cannot simply "add more pods" your way past a provider's tokens-per-minute ceiling the way you would scale past a database connection pool limit. Scaling AI systems means scaling two layers at once: your own infrastructure (which you fully control) and your consumption of a shared, metered, externally-throttled resource (which you only partially control). Get this wrong and the failure mode is not a slow page — it is a wall of 429 responses, runaway retry storms, and a bill that scales faster than your user base.
+</p>
+
+<p>
+For your career trajectory as an AI Engineer, this is the chapter that separates "I built a chatbot" from "I run a chatbot that serves fifty thousand daily active users without falling over on a Monday morning traffic spike." Staff and principal-level AI engineering interviews probe almost exclusively at this layer — not "can you call an LLM," but "can you make calling an LLM survive contact with real, unpredictable, concurrent demand."
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+Scaling as a discipline did not begin with AI systems — it is one of the oldest problems in distributed computing, and understanding its lineage explains why the tools available to you today look the way they do.
+</p>
+
+<h3>2.1 Vertical Scaling and Its Ceiling</h3>
+
+<p>
+The earliest answer to "the system is too slow" was to buy a bigger machine — more CPU, more RAM, faster disks. This is <strong>vertical scaling</strong>, and it is still the first lever anyone reaches for because it requires zero architectural change. It has a hard ceiling: at some point no single machine is big enough, and even if it were, a single machine is a single point of failure. Every system that ever needed to serve real internet-scale traffic eventually hit this wall.
+</p>
+
+<h3>2.2 Horizontal Scaling and Statelessness</h3>
+
+<p>
+The response was <strong>horizontal scaling</strong> — run many identical, smaller instances behind a load balancer instead of one large instance. This only works cleanly if the instances are <strong>stateless</strong>: any instance must be able to handle any request, which means session state, in-flight conversation history, and cached data must live outside the instance itself (databases, distributed caches) rather than in local memory. This single architectural constraint — statelessness — is the ancestor of nearly every scaling pattern in this chapter, and it reappears almost unchanged when you scale an LLM-backed service: conversation memory that lives in a servlet's heap variable does not survive that user's next request landing on a different pod.
+</p>
+
+<h3>2.3 Scaling Classical ML Inference</h3>
+
+<p>
+Before LLMs, scaling machine learning inference (recommendation models, fraud scoring, ad ranking) was already a mature discipline. Model-serving frameworks (TensorFlow Serving, TorchServe, NVIDIA Triton) emerged specifically to solve a problem generic web frameworks never had to: how do you keep an expensive model loaded in GPU memory, batch multiple incoming requests together to use that GPU efficiently, and still return each caller's individual result with acceptable latency? The core technique — <strong>request batching</strong> — is a direct ancestor of how modern LLM inference servers work, and understanding it is what separates engineers who can reason about LLM throughput from those who only know how to call an API.
+</p>
+
+<h3>2.4 The LLM-Specific Turn</h3>
+
+<p>
+Generative language models added two new wrinkles that older serving systems never had to fully solve. First, output length is variable and unknown in advance — a classifier returns a label in fixed time; an LLM might generate 20 tokens or 2,000, and each token requires a full forward pass conditioned on everything generated so far. Second, most engineering teams do not run the model themselves at all — they call a hosted provider (OpenAI, Anthropic, and others) over HTTP, which means "scaling the model" is not something you do — <strong>scaling how you consume a rate-limited, shared, metered API</strong> is. This gave rise to a new layer in the stack that barely existed five years ago: the <strong>LLM gateway</strong> — a piece of infrastructure whose entire job is to sit between your application and one or more model providers, pooling API keys, load-balancing across providers and regions, enforcing your own internal rate limits, and falling back gracefully when a provider throttles or degrades. Spring AI's provider-agnostic <code>ChatModel</code> abstraction (introduced in Chapter 51) is the application-code half of this pattern; the gateway is its infrastructure half.
+</p>
+
+<table>
+<tr><th>Era</th><th>Scaling Unit</th><th>Bottleneck</th><th>Surviving Technique in AI Systems</th></tr>
+<tr><td>Vertical scaling</td><td>One bigger machine</td><td>Physical hardware ceiling</td><td>GPU sizing decisions for self-hosted inference</td></tr>
+<tr><td>Horizontal scaling</td><td>Many stateless instances</td><td>Shared state, sticky sessions</td><td>Stateless orchestration layer, externalized ChatMemory</td></tr>
+<tr><td>Classical ML serving</td><td>Batched inference on a loaded model</td><td>Idle GPU cycles between requests</td><td>Continuous/dynamic batching in LLM inference servers</td></tr>
+<tr><td>Hosted LLM APIs</td><td>Metered, rate-limited external calls</td><td>Provider-side token/request quotas</td><td>LLM gateways, key pooling, provider fallback, queuing</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> every scaling technique in this chapter is a specific answer to one of four recurring bottlenecks — a single machine's limits, shared mutable state, idle compute between requests, or an external quota you don't control. When you meet a new scaling problem in production that this chapter didn't explicitly name, ask which of these four categories it falls into; the answer usually points straight at the fix.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Serve a growing, unpredictable, concurrent volume of AI-augmented requests within defined latency, availability, and cost targets — despite the fact that the most expensive step in each request is a call to a resource you do not fully control and cannot infinitely provision.</strong>
+</div>
+
+<p>
+Unpack the constraints inside that sentence, because each one rules out a naive answer:
+</p>
+
+<ul>
+<li><strong>"Growing and unpredictable"</strong> rules out fixed-capacity provisioning — you need autoscaling, not a static fleet sized for yesterday's peak.</li>
+<li><strong>"Concurrent"</strong> rules out any design that assumes one request at a time — shared mutable state, single-threaded blocking calls, and unbounded connection pools all break under concurrency.</li>
+<li><strong>"Latency, availability, and cost targets"</strong> means scaling is not "make it not crash" — a system that survives load by taking 40 seconds per response, or one that survives by silently downgrading every user to a worse model, has not solved the problem, it has relocated it.</li>
+<li><strong>"A resource you do not fully control"</strong> is the part that has no equivalent in ordinary web-service scaling. Your database can be given more read replicas on your own schedule. A model provider's rate limit is a contractual ceiling that does not move just because your traffic did.</li>
+</ul>
+
+<p>
+This reframes scaling, for an AI system, from a purely infrastructural question into a <strong>capacity allocation and traffic-shaping</strong ) problem: given a hard external ceiling on how many tokens per minute you can push through a provider, how do you decide, in real time, which requests get through immediately, which get queued, which get served from cache, and which get degraded to a cheaper model — all while your own infrastructure layer scales elastically underneath that decision-making.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 Throughput vs. Latency — Two Different Games</h3>
+
+<p>
+The single most important mental separation in this chapter is between <strong>throughput</strong> (how many requests the system completes per unit time, in aggregate) and <strong>latency</strong> (how long any one request takes, from a single user's point of view). These two goals are frequently in tension. Batching multiple requests together to a GPU-hosted model improves throughput — the hardware processes more work per second — but it can increase latency for the individual request that arrived first and had to wait for the batch to fill. Every scaling decision in this chapter is, at heart, a decision about where you sit on this throughput/latency trade-off, and the right position depends entirely on the product: a batch summarization job cares almost exclusively about throughput and cost; a live chat interface cares almost exclusively about latency, especially the first-token latency that determines whether the UI feels responsive.
+</p>
+
+<h3>4.2 Horizontal Scaling of the Orchestration Layer</h3>
+
+<p>
+The part of your system you fully own — the Spring Boot service that receives the request, assembles the prompt, calls Advisors, and talks to the model — scales the same way any stateless web service does: more instances behind a load balancer, driven by an autoscaler watching a meaningful signal (CPU is often a poor signal for AI workloads, since the pod is mostly waiting on network I/O to the model provider, not computing; queue depth and in-flight request count are usually better signals, a point returned to in Section 9).
+</p>
+
+<h3>4.3 Rate Limiting and Traffic Shaping</h3>
+
+<p>
+Because the downstream model provider imposes hard caps, your system needs its own rate limiting <em>in front of</em> that dependency — not to protect yourself from users, but to protect your aggregate traffic from ever exceeding what the provider will accept, and to make sure that when the ceiling is reached, the system degrades predictably instead of every instance independently retrying and amplifying the problem. The two classic algorithms are:
+</p>
+
+<ul>
+<li><strong>Token bucket</strong> — a bucket refills with tokens at a fixed rate; each request consumes one token; if the bucket is empty, the request waits or is rejected. This naturally allows short bursts up to the bucket's capacity while enforcing a long-run average rate — a good match for provider quotas that are themselves expressed as tokens-per-minute.</li>
+<li><strong>Leaky bucket</strong> — requests enter a queue and are processed at a strictly fixed rate regardless of arrival bursts, smoothing traffic completely but adding queuing delay during bursts.</li>
+</ul>
+
+<p>
+Layered on top of rate limiting is <strong>request prioritization</strong> — not all requests are equal. An interactive chat response a user is actively waiting for should be prioritized over a background batch summarization job competing for the same provider quota. This is the same intuition behind quality-of-service tiers in any shared-resource system, applied to token budgets instead of network bandwidth.
+</p>
+
+<h3>4.4 Batching — Static, Dynamic, and Continuous</h3>
+
+<p>
+When you self-host inference (covered architecturally in the next chapter on Kubernetes for AI workloads), batching is the single biggest throughput lever available, because GPUs are throughput machines that are wildly underutilized processing one sequence at a time. <strong>Static batching</strong> waits to accumulate a fixed batch size before running inference — simple, but it stalls the first arrival waiting for stragglers. <strong>Dynamic batching</strong> uses a time window instead of a fixed count — process whatever arrived in the last N milliseconds. <strong>Continuous batching</strong> (the technique behind modern high-throughput inference servers such as vLLM) goes further: because different sequences in a generative model finish at different token counts, continuous batching admits new requests into a running batch the instant a slot frees up, rather than waiting for the whole batch to finish — dramatically improving GPU utilization for variable-length generation.
+</p>
+
+<h3>4.5 Caching as a Scaling Technique, Not Just a Cost Technique</h3>
+
+<p>
+Cost Optimization (Chapter 94) covered caching primarily as a cost lever. Under scaling, caching is equally a <strong>capacity</strong> lever: every request served from a semantic cache or an exact-match cache is a request that never touches your rate-limited provider quota at all. At scale, cache hit rate is directly proportional to how much headroom you have before hitting a provider ceiling — this is why high-traffic AI systems invest heavily in cache warming and semantic similarity caching rather than treating cache as an afterthought optimization.
+</p>
+
+<h3>4.6 Sharding the Retrieval Layer</h3>
+
+<p>
+RAG systems (Volume 3) introduce their own scaling surface: the vector database. A single-node vector index that comfortably serves development traffic can become the bottleneck in production long before the LLM call does, particularly for large corpora with high query concurrency. Vector databases scale the same way traditional data stores do — sharding the index across nodes by collection or tenant, replicating for read throughput, and separating ingestion (writes) from query (reads) so that a bulk re-indexing job does not starve live query latency.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Trace one request through a scaled AI system end to end, including the edge cases that only appear under load.
+</p>
+
+<ol>
+<li><strong>Request arrives at the edge.</strong> A load balancer or API gateway distributes it to one of many stateless orchestration pods. No pod holds this user's conversation state in local memory — it is fetched from an external store (Redis, a relational table backing Spring AI's <code>ChatMemory</code>) keyed by conversation ID.</li>
+<li><strong>Local rate limiting / admission control.</strong> The pod checks a distributed rate limiter (backed by Redis, tracking tokens consumed globally across all pods) before proceeding. If the system-wide token budget for this minute is already spent, the request is queued, rejected with a clear retry-after signal, or — for lower-priority background work — deferred entirely. This step exists specifically to prevent a thundering herd of independent pods each unaware of the others' consumption from collectively blowing through the provider's ceiling.</li>
+<li><strong>Context assembly.</strong> The orchestration layer retrieves conversation history and, for RAG-augmented requests, queries the vector database. Under load, this query hits a specific shard/replica selected by the retrieval layer's own load balancing, not the same node every time.</li>
+<li><strong>Cache check.</strong> Before spending provider quota, an exact-match or semantic cache is checked. A hit returns immediately, consuming no provider tokens and no queue slot — this is the cheapest and fastest path through the whole system and, at scale, the one that determines your effective ceiling above the provider's raw quota.</li>
+<li><strong>LLM gateway routing.</strong> On a cache miss, the request goes to an LLM gateway component that selects which provider/API key/region to use, based on current quota consumption per key, health of each provider (recent error rates, latency), and any configured fallback policy. This is where key pooling happens: instead of one API key with one rate limit, the gateway may hold a pool of keys (or provider accounts) and spread load across them, multiplying effective throughput.</li>
+<li><strong>Streaming response.</strong> For chat interfaces, the response streams back token by token over the same connection (Server-Sent Events or a reactive stream). Under horizontal scaling this has a subtlety: the connection must stay pinned to the same orchestration pod for the duration of the stream — this is not the same as classic sticky sessions for stateful data, but it is a similar constraint on connection routing that the load balancer configuration must respect.</li>
+<li><strong>Edge case — provider throttling mid-stream.</strong> If the provider returns a 429 or degrades mid-request, the system must decide: retry with exponential backoff and jitter (to avoid synchronized retry storms across many pods), fail over to a secondary provider/model, or surface a graceful degradation to the user. A naive retry-immediately policy at scale is exactly what turns a brief provider hiccup into a self-inflicted outage.</li>
+<li><strong>Edge case — autoscaling lag.</strong> When traffic spikes faster than new pods can start (cold start of a JVM, class loading, connection pool warm-up), the existing pods absorb the surge. This is why readiness probes, connection pool pre-warming, and a queue with bounded depth in front of the orchestration layer matter — they buy the seconds an autoscaler needs to add capacity without dropping requests outright.</li>
+<li><strong>Edge case — scale-down.</strong> When traffic subsides and the autoscaler removes pods, in-flight streaming responses on a pod being terminated must be allowed to finish (connection draining) rather than being cut off mid-token-stream.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Scaling math for AI systems does not require anything exotic — the same queueing theory used for any request-driven system applies, with one added dimension: tokens, not just requests, are the unit that actually matters against a provider quota.
+</p>
+
+<h3>6.1 Little's Law</h3>
+
+<p>
+Little's Law is the single most useful formula for capacity planning of any queued system:
+</p>
+
+<pre>
+L = λ × W
+
+L = average number of requests "in the system" (queued + being processed)
+λ = average arrival rate of new requests (requests per second)
+W = average time a request spends in the system (seconds)
+</pre>
+
+<p>
+Applied here: if your orchestration layer receives 50 requests/second (λ) and each takes an average of 4 seconds end-to-end including the model call (W), then on average 200 requests (L) are in flight at any moment. That number — not raw requests-per-second — is what determines how many concurrent connections, threads, and memory buffers your fleet actually needs to hold simultaneously. Undersizing for L, not just for λ, is one of the most common capacity-planning mistakes in AI systems, precisely because W is so much larger than in a typical CRUD service.
+</p>
+
+<h3>6.2 Token Throughput as the Real Ceiling</h3>
+
+<p>
+Provider quotas are usually expressed as tokens-per-minute (TPM) and/or requests-per-minute (RPM), whichever binds first. Your effective maximum request rate is:
+</p>
+
+<pre>
+Max sustainable requests/min  =  min(
+    RPM limit,
+    TPM limit ÷ average tokens per request (input + output)
+)
+</pre>
+
+<p>
+This is why reducing average tokens per request (shorter prompts, tighter context via the techniques from Chapter 46, capped output length) is a scaling lever, not merely a cost lever — it directly raises the request-rate ceiling under a fixed TPM quota, sometimes more effectively than any amount of infrastructure autoscaling.
+</p>
+
+<h3>6.3 Capacity Planning for the Orchestration Fleet</h3>
+
+<pre>
+Required concurrent capacity ≈ Peak λ (req/sec) × Average W (sec/req) × Safety margin
+
+Example: peak 30 req/sec, average latency 3.5 sec, 30% safety margin
+        ≈ 30 × 3.5 × 1.3 ≈ 137 concurrent in-flight requests to provision for
+</pre>
+
+<p>
+This number then drives how many orchestration pod replicas you need, sized against how many concurrent in-flight calls a single pod's connection pool and thread/virtual-thread budget can sustain — the Java/Spring-specific side of this arithmetic is covered in Section 9.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Traffic Shaping Under a Hard External Ceiling</h3>
+
+<pre>
+                        Incoming requests (unpredictable, bursty)
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │   Distributed rate limiter      │   ← shared state (Redis),
+                     │   (token bucket, global view)   │      NOT per-pod, or pods
+                     └───────────────┬───────────────┘      collectively overshoot
+                                     │
+              ┌──────────────────────┼──────────────────────┐
+              ▼                      ▼                      ▼
+      under quota:            near quota:             over quota:
+      pass through            admit low-priority       queue or reject
+      immediately             requests only            with Retry-After
+              │                      │                      │
+              ▼                      ▼                      ▼
+      ┌────────────────────────────────────────────────────────┐
+      │              Semantic / exact-match cache                │
+      │   HIT → return immediately, ZERO provider tokens spent   │
+      │   MISS → continue to LLM gateway                         │
+      └───────────────────────────┬────────────────────────────┘
+                                  ▼
+                     ┌───────────────────────────────┐
+                     │         LLM Gateway              │
+                     │  key pool + provider fallback    │
+                     │  Provider A (key1, key2, key3)   │
+                     │  Provider B (fallback on 429)     │
+                     └───────────────────────────────┘
+</pre>
+
+<h3>7.2 Continuous Batching on a Shared GPU (Self-Hosted Inference)</h3>
+
+<pre>
+Time ──────────────────────────────────────────────────────────►
+
+Static batching (naive):
+ Req A ██████████████████████████ (waits for batch to fill, then runs together)
+ Req B    ██████████████████████████
+ Req C       ██████████████████████████
+             └── all three start AND finish together, A pays a big wait tax
+
+Continuous batching (modern inference servers, e.g. vLLM-style engines):
+ Req A ████████████░░ (finishes early, its GPU slot frees immediately)
+ Req B ██████████████████████
+ Req C       ██████████████████████████ ← admitted into the running batch
+                                            the instant A's slot freed up
+             GPU utilization stays high the entire time — no idle gaps
+             waiting for the slowest sequence in a fixed-size batch
+</pre>
+
+<p class="followup">
+The second diagram is the mechanical reason self-hosted inference throughput improved so dramatically once continuous batching became standard: fixed-size batching wastes GPU cycles on every sequence that finishes early but still has to "wait" for its batch-mates, while continuous batching treats the GPU as a continuously refilled pipeline. You will not implement this batching logic yourself — you consume it through the inference server you deploy — but recognizing it in a system diagram, and knowing why it beats static batching, is a frequently asked scaling interview topic.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<pre>
+                             ┌───────────────────────────┐
+                             │   Global Load Balancer /    │
+                             │   API Gateway (multi-region) │
+                             └──────────────┬───────────────┘
+                                            ▼
+               ┌─────────────────────────────────────────────────────┐
+               │       Autoscaled Spring Boot Orchestration Fleet       │
+               │   (stateless pods, HPA on queue-depth / in-flight)     │
+               │   - Distributed rate limiter (Resilience4j + Redis)    │
+               │   - Externalized ChatMemory (Redis / JDBC)             │
+               │   - WebClient pool → LLM Gateway                       │
+               └───────┬───────────────────┬───────────────┬───────────┘
+                       ▼                   ▼               ▼
+           ┌────────────────────┐ ┌─────────────────┐ ┌──────────────────┐
+           │  Semantic Cache      │ │  Vector DB        │ │  LLM Gateway       │
+           │  (Redis, sharded)    │ │  (sharded/replicas)│ │  key pool + fallback│
+           └────────────────────┘ └─────────────────┘ └─────────┬──────────┘
+                                                                 ▼
+                                              ┌───────────────────────────────┐
+                                              │  Model Provider A  │ Provider B │
+                                              │  (primary, region1) │ (fallback)│
+                                              └───────────────────────────────┘
+                       ▲
+                       │  observability feeds autoscaler decisions
+               ┌───────┴────────────────────────────────────────┐
+               │  Metrics / Tracing (queue depth, p95 latency,    │
+               │  token spend rate, provider error rate)          │
+               │  → feeds Kubernetes HPA custom metrics            │
+               └──────────────────────────────────────────────────┘
+</pre>
+
+<p>
+Notice what is <em>not</em> in this diagram: a single, monolithic "call the model" box. At scale, that single conceptual step has decomposed into a rate limiter, a cache, a gateway with a key pool, and a fallback provider — each one added specifically because a naive direct call from every orchestration pod straight to one provider endpoint is the first thing that breaks under real traffic.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring's ecosystem gives you most of the building blocks for this chapter's patterns directly, and Java 21's virtual threads change the calculus for how many concurrent, slow, I/O-bound LLM calls a single instance can sustain.
+</p>
+
+<h3>9.1 Statelessness via Spring AI's ChatMemory</h3>
+
+<p>
+As covered in the Memory chapter (Chapter 56), Spring AI's <code>ChatMemory</code> abstraction is what makes horizontal scaling possible at all for conversational features. The default in-memory implementation is fine for a single-instance prototype; a scaled deployment must back it with a shared store (Redis-backed or JDBC-backed implementations of the same interface) so that any pod can serve any conversation turn, and so a pod restart during a rolling deployment or autoscale-down event does not silently drop a user's history.
+</p>
+
+<h3>9.2 Virtual Threads for I/O-Bound Concurrency</h3>
+
+<p>
+An LLM call is almost pure I/O wait from the JVM's perspective — the thread is blocked waiting on a slow network response, not doing CPU work. Prior to Java 21, scaling the number of concurrent in-flight calls a single instance could hold meant either a large platform-thread pool (expensive in memory, roughly 1MB of stack per thread) or a fully reactive stack (<code>WebClient</code>/Reactor, high throughput but a steeper programming model). Java 21's virtual threads let a Spring Boot application handle tens of thousands of concurrent blocking-style calls to a <code>ChatModel</code> or <code>ChatClient</code> without reactive code, because the JVM multiplexes virtual threads onto a small pool of OS carrier threads and unmounts a virtual thread while it waits on I/O. Enabling <code>spring.threads.virtual.enabled=true</code> on a servlet-based Spring Boot application is now a legitimate, low-effort scaling lever for exactly this workload shape — high concurrency, low CPU-per-request, long wait times.
+</p>
+
+<h3>9.3 Resilience4j for Rate Limiting, Bulkheads, and Circuit Breakers</h3>
+
+<p>
+Resilience4j integrates cleanly with Spring Boot to implement the traffic-shaping patterns from Section 4 directly in the orchestration layer:
+</p>
+
+<ul>
+<li><strong><code>RateLimiter</code></strong> — enforce your own internal cap on calls to a given provider/model, independent of and tighter than the provider's own limit, so you fail predictably on your terms rather than reactively on theirs.</li>
+<li><strong><code>Bulkhead</code></strong> — cap the number of concurrent calls to a specific downstream (e.g., a single model provider) so a slowdown in one dependency cannot exhaust threads/connections needed by unrelated parts of the application — critical when a single pod fans out to both an LLM provider and a vector database.</li>
+<li><strong><code>CircuitBreaker</code></strong> — trip after a threshold of provider errors/timeouts, short-circuiting further calls temporarily so the system fails fast (and can fall over to a fallback provider or cached response) instead of piling up slow, doomed requests during a provider outage.</li>
+<li><strong><code>Retry</code></strong> — with exponential backoff and jitter, applied to transient provider errors (429s, 5xxs) — jitter specifically to avoid every pod retrying in lockstep and re-creating the exact spike that caused the throttling.</li>
+</ul>
+
+<h3>9.4 WebClient Connection Pooling</h3>
+
+<p>
+Spring AI's provider integrations (the concrete <code>ChatModel</code> implementations behind OpenAI, Anthropic, and others) are typically backed by <code>RestClient</code>/<code>WebClient</code> under the hood. At scale, the default connection pool sizing is rarely correct for sustained high-concurrency traffic to a single provider host — undersized pools silently serialize requests that should be running in parallel, manifesting as latency that scales with load even though CPU and memory look fine. Explicitly configuring the underlying Reactor Netty connection pool (max connections, pending acquire timeout, max idle time) is a routine part of tuning a scaled Spring AI deployment, and pool exhaustion (visible as <code>PoolAcquireTimeoutException</code>-style failures) is one of the most common "why did latency suddenly spike under load" root causes in practice.
+</p>
+
+<h3>9.5 Autoscaling Signals Beyond CPU</h3>
+
+<p>
+Kubernetes' Horizontal Pod Autoscaler defaults to CPU/memory metrics, which are poor proxies for AI orchestration workloads that spend most of their time waiting on network I/O rather than computing. Exposing custom metrics through Spring Boot Actuator/Micrometer — in-flight request count, queue depth, provider call latency percentiles — and wiring those into HPA via a metrics adapter (Prometheus Adapter or KEDA) produces autoscaling decisions that actually track the thing that determines user experience, which is set up in more depth in the next chapter on Kubernetes for AI Workloads.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Rate-limit yourself below the provider's published ceiling</strong>, not at it — a safety margin (commonly 10–20%) absorbs normal variance in token counting and avoids flapping between "fine" and "throttled."</li>
+<li><strong>Make rate limiting global, not per-pod.</strong> A local, in-memory rate limiter on each instance cannot see what every other instance is doing; use a shared store (Redis) so the limit reflects true aggregate consumption.</li>
+<li><strong>Externalize all conversational state</strong> before scaling horizontally — verify this explicitly, because it is the single most common reason a "scaled" deployment still behaves inconsistently for users whose requests land on different pods.</li>
+<li><strong>Cache aggressively and measure cache hit rate as a first-class capacity metric</strong>, not just a cost metric — a 30% hit rate is functionally a 30% increase in your effective provider quota.</li>
+<li><strong>Add jitter to every retry policy.</strong> Synchronized retries across many instances are a self-inflicted denial-of-service against your own provider quota.</li>
+<li><strong>Design for graceful degradation, not binary success/failure</strong> — a cheaper fallback model, a shorter response, or a "please try again shortly" message under load is almost always a better user experience than an unbounded queue or a hard failure.</li>
+<li><strong>Load test with realistic concurrency and realistic prompt/response lengths</strong>, not synthetic short requests — token-bound latency behaves very differently from CPU-bound latency under load.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Scaling pods without scaling the provider relationship.</strong> Adding ten more orchestration replicas does nothing if all ten are still bottlenecked on one shared, unraised provider rate limit — infrastructure scaling and quota scaling are separate conversations, and only one of them is a ticket to your cloud provider.</li>
+<li><strong>Retrying on every failure with no backoff or jitter</strong>, turning a brief provider blip into a self-amplified outage as every instance retries at the same instant.</li>
+<li><strong>Leaving conversation memory in local instance state</strong> "temporarily" during a prototype, then scaling horizontally without revisiting it — users experience random amnesia depending on which pod handles a given request.</li>
+<li><strong>Autoscaling on CPU utilization alone</strong> for an I/O-bound orchestration workload — CPU can look comfortably low while queue depth and latency are climbing sharply, because the bottleneck is waiting on the network, not computing.</li>
+<li><strong>Treating cache invalidation as an afterthought</strong> once caching is added for scale — a stale cached answer served at high volume is a correctness bug multiplied by traffic, not a minor inconvenience.</li>
+<li><strong>Sizing connection pools using default framework values</strong> and never revisiting them, then misdiagnosing the resulting latency spikes as "the model provider is slow" when the real bottleneck is requests queued waiting for a pooled connection.</li>
+<li><strong>Load testing with short, uniform prompts</strong> that do not reflect production token distributions, producing capacity numbers that look healthy in staging and collapse against real traffic shapes.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Scaling decisions are, fundamentally, performance trade-offs made explicit and systematic rather than ad hoc:
+</p>
+
+<ul>
+<li><strong>Tail latency dominates perceived quality at scale.</strong> A system with a fine median (p50) latency but a poor p99 means one in a hundred users has a bad experience — at ten thousand requests a minute, that is a constant stream of visibly unhappy users, not a rare edge case. Provider throttling, connection pool contention, and GPU batch stalls all manifest first and most visibly in the tail.</li>
+<li><strong>Streaming reduces perceived latency without reducing total cost or total compute time.</strong> Time-to-first-token is what a user actually feels; optimizing for it (smaller initial context, priority scheduling for interactive requests) is often higher-leverage under load than optimizing total completion time.</li>
+<li><strong>Throughput and cost scale together, not independently.</strong> Every technique that raises effective throughput under a fixed provider quota — caching, batching, prompt compression — is simultaneously a cost lever, which is why Chapters 94 and 95 are natural neighbors rather than separate concerns.</li>
+<li><strong>Memory pressure grows with concurrency in ways CPU-focused engineers underestimate.</strong> Buffered conversation histories, in-flight streaming buffers, and connection pool overhead all scale with concurrent in-flight requests (the "L" from Little's Law in Section 6), not with raw request rate — undersizing pod memory against peak concurrency, not average, is a frequent production surprise.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Scaling's security surface is narrower than topics like prompt injection or data governance, but it is real and worth stating honestly rather than padding. The primary concern is <strong>resource exhaustion as an attack vector</strong>: because a single AI request can be made arbitrarily expensive (a user crafting an unusually long prompt, or requesting maximum-length output repeatedly), a system without per-tenant and per-user rate limiting is vulnerable to a small number of malicious or simply careless clients consuming an entire shared provider quota and degrading service for every other user — a denial-of-service that costs the attacker almost nothing and costs you real money and availability simultaneously. This makes <strong>per-tenant quota isolation</strong>, not just global rate limiting, a necessary control in any multi-tenant scaled deployment — without it, one noisy or abusive tenant can starve every other tenant sharing the same provider key pool.
+</p>
+
+<p>
+A secondary concern is <strong>API key sprawl</strong>: scaling by pooling multiple provider API keys across an LLM gateway multiplies the number of secrets that must be securely stored, rotated, and audited — a scaling technique that, if implemented carelessly, quietly increases your secret-management attack surface. Beyond these two points, scaling itself does not introduce the deeper security concerns (prompt injection, data leakage, model output validation) covered in earlier Volume 5 chapters — those risks exist regardless of scale and are not meaningfully worsened or improved by the techniques in this chapter, beyond the observation that a successful attack now has a larger, more valuable blast radius simply because more traffic flows through the same system.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is the difference between horizontal and vertical scaling, and why is horizontal scaling generally preferred for AI-augmented web services?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Vertical scaling means making a single instance bigger (more CPU/RAM); it has a hard physical ceiling and remains a single point of failure. Horizontal scaling means running many smaller, identical instances behind a load balancer; it scales further and provides redundancy, but requires the service to be stateless so any instance can handle any request. AI-augmented services are preferred to scale horizontally because request volume is unpredictable and per-request latency is high (waiting on the model call), so elastically adding instances handles bursts better than one larger machine ever could.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why can't you just "add more servers" to get past a model provider's rate limit?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A provider's rate limit (requests-per-minute or tokens-per-minute) is enforced against your account/API key at the provider, not against any single server you run. Adding more of your own servers increases how many requests you can generate concurrently, but all of them still funnel through the same metered quota — so beyond a point, more servers just means more requests queuing up against the same ceiling or getting throttled with 429 responses, unless you also raise the quota, pool multiple keys, or add additional providers.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain Little's Law and how you would use it for capacity planning of an LLM-backed service.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Little's Law states L = λ × W: the average number of requests in the system equals the arrival rate multiplied by the average time each request spends in the system. For an LLM service where average latency (W) might be several seconds rather than milliseconds, even a modest arrival rate (λ) produces a surprisingly large number of concurrent in-flight requests (L). You use this to size connection pools, thread/virtual-thread budgets, and memory for buffered state, planning against peak concurrent load (L) rather than naively against requests-per-second alone.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. What is continuous batching, and why does it improve GPU utilization compared to static batching for LLM inference?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Static batching groups a fixed set of requests together and waits for the entire batch to finish before starting a new one, wasting GPU cycles on sequences that finish early but must wait for the slowest one in the batch. Continuous batching admits new requests into a running batch the instant a slot frees up (as soon as any sequence finishes generating), keeping the GPU continuously fed with work rather than idling between fixed-size batches — this is why modern high-throughput inference engines dramatically outperform naive fixed-batch serving for variable-length generative output.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q5. Why is CPU utilization often a poor autoscaling signal for a Spring Boot service that orchestrates LLM calls?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>An orchestration service spends most of its time waiting on network I/O for a slow model provider response rather than performing CPU-bound work, so CPU usage can remain low even as queue depth, in-flight request count, and latency climb sharply under load. Better autoscaling signals for this workload shape are in-flight request count, request queue depth, and provider call latency percentiles, exposed via Actuator/Micrometer and wired into the autoscaler through custom metrics rather than relying on default CPU-based rules.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Design the traffic-shaping strategy for a Spring AI-based chat service that must stay under a strict provider tokens-per-minute limit during a viral traffic spike. What layers would you add, in what order?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>First, a semantic/exact-match cache in front of the provider call to remove repeat traffic entirely from the token budget. Second, a distributed (Redis-backed, not per-pod) token-bucket rate limiter enforcing an internal ceiling somewhat below the provider's actual limit, with request prioritization so interactive requests are admitted ahead of background/batch work. Third, an LLM gateway with a pool of API keys and/or a fallback provider so throttling on one key or provider does not stall the whole system. Fourth, Resilience4j-style bulkheads and circuit breakers around the provider call itself so a degraded provider doesn't exhaust threads/connections needed elsewhere. Finally, graceful degradation for anything still over capacity — queueing with a clear retry-after, or serving a cheaper/faster fallback model — rather than an unbounded queue or hard failure. Order matters: cache first because it's free capacity, rate limiting second because it prevents self-inflicted overshoot, gateway/fallback third because it multiplies effective quota, resilience patterns fourth because they contain the blast radius of remaining failures.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly say the internal rate limit must sit strictly below the provider's published limit and must be enforced with shared, cross-instance state — a per-pod local limiter cannot see aggregate consumption across the fleet and will overshoot the real ceiling the moment you have more than one instance. Interviewers listen for this specific detail because it is the most common gap in candidates who understand rate limiting only in single-instance terms.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q7. A team reports that latency to their LLM provider spikes badly under load even though CPU, memory, and the provider's own status page all look healthy. What would you investigate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The most likely culprit is connection pool exhaustion in the HTTP client (WebClient/RestClient backing the ChatModel implementation) — if the pool's max connections is undersized relative to concurrent in-flight requests, additional requests queue waiting to acquire a pooled connection, and that queuing delay is indistinguishable from provider slowness unless you specifically instrument pool acquisition time. I would check connection pool metrics (active/pending/idle connections), compare in-flight request count against Little's Law expectations for the observed arrival rate and latency, and check whether virtual threads or a reactive stack are being blocked/starved by an undersized carrier thread configuration.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. A stakeholder proposes solving scaling problems entirely by switching to the largest available compute tier and paying for a higher provider rate limit, rather than investing engineering time in caching, batching, and traffic shaping. How do you respond?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Paying for more headroom is a legitimate short-term lever and sometimes the right call under time pressure, but it does not remove the underlying scaling risks — a higher quota is still finite, and a system with no caching, no traffic shaping, and no graceful degradation will eventually hit the new ceiling too, usually at a worse moment and a much higher run-rate cost, since raw capacity typically scales linearly with spend while caching and batching can multiply effective capacity for a fixed spend. The right framing for the stakeholder is total cost and risk over the growth curve: buying headroom buys time, not a solution, and the engineering investment in this chapter's techniques changes the slope of the cost curve, not just the current ceiling. I would propose doing both — raise quota/tier as an immediate safety margin, while shipping caching, distributed rate limiting, and provider fallback as the durable fix — and would insist on load testing with realistic traffic before declaring either one sufficient on its own.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q9. How would you decide, architecturally, whether a growing AI product should scale by adding more hosted-provider capacity/keys versus moving to self-hosted inference?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>This is fundamentally a build-versus-buy trade-off restated in scaling terms. Hosted providers give elastic capacity with no operational burden but bound you to their rate limits, pricing, and latency characteristics, and key pooling/fallback only stretches that ceiling so far. Self-hosting shifts the scaling problem to owning GPU capacity, inference-serving infrastructure (batching, autoscaling GPU pools — the subject of the next chapter), and the operational expertise to run it reliably, in exchange for removing the external quota ceiling entirely and potentially much lower marginal cost at very high, sustained volume. The decision hinges on sustained volume and predictability: bursty, moderate-volume traffic usually favors staying hosted with strong traffic-shaping engineering; consistently high, predictable volume at a scale where the economics and control benefits outweigh the operational burden is when self-hosting starts to justify itself — and it is rarely an all-or-nothing choice, since a hybrid approach (self-hosted for baseline load, hosted provider fallback for bursts) is common in mature systems.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why "add more Spring Boot pods" alone does not solve every scaling problem in an LLM-backed system, using the four-bottleneck framework from Section 2's history table (single-machine limits, shared state, idle compute, external quota).</li>
+<li>Using Little's Law, explain why a system with the same requests-per-second but a higher average latency per request needs meaningfully more concurrent capacity, and connect this to why LLM services need larger connection pools and thread budgets than typical CRUD services at the same request rate.</li>
+<li>Describe a scenario where prioritizing throughput over latency is the correct engineering choice, and a scenario where the opposite is correct, referencing a specific AI product feature for each.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Using Resilience4j in a Spring Boot service, sketch the configuration (rate limiter, bulkhead, circuit breaker, retry with jitter) you would apply around a Spring AI <code>ChatClient</code> call, and write two sentences justifying the order in which these decorators should be applied to the call.</li>
+<li>Take a real or hypothetical chat feature you have designed. Using the capacity planning formula from Section 6.3, calculate the required concurrent capacity for a peak of 40 requests/second at an average latency of 2.5 seconds with a 25% safety margin, and state how many orchestration pod replicas you would provision if each pod can safely sustain 60 concurrent in-flight requests.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Scaling an AI system means scaling two layers at once: the infrastructure you fully control, and your consumption of a rate-limited, metered provider dependency you only partially control.</li>
+<li>Throughput and latency are distinct, often competing goals — batching improves throughput at the potential cost of individual request latency, and the right trade-off depends entirely on the product.</li>
+<li>Statelessness in the orchestration layer, achieved via externalized conversation memory, is the non-negotiable precondition for horizontal scaling, exactly as it has always been for web services.</li>
+<li>Distributed (not per-instance) rate limiting, caching, and an LLM gateway with key pooling and provider fallback are what let a system extract more effective throughput from a fixed external quota, rather than simply colliding with it faster.</li>
+<li>Little's Law and token-throughput arithmetic turn capacity planning from guesswork into a calculable exercise, and both point at planning for peak concurrent in-flight load, not just average request rate.</li>
+<li>Java 21 virtual threads and Spring's Resilience4j integration give you concrete, low-effort tools to implement this chapter's patterns without a full rewrite to a reactive stack.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> everything in this chapter assumed you have somewhere elastic to run your orchestration fleet and, increasingly, your own inference workloads. Kubernetes for AI Workloads (Chapter 96) makes that assumption concrete — how pod autoscaling, GPU scheduling, resource requests/limits, and readiness/liveness probes are configured specifically for AI services, where a single pod's resource profile and startup behavior look meaningfully different from a typical stateless microservice.
+</p>
+
+</div>
+
+</body>
+</html>

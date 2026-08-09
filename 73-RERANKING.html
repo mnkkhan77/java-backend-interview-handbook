@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>73-RERANKING.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 73 — RERANKING</h1>
+
+<p class="roi">Volume 3 — Embeddings & RAG · Chapter 9 of 13</p>
+
+<div class="callout">
+Hybrid Search (Chapter 72) taught you how to fuse dense vector similarity with sparse lexical matching to pull a wide, high-recall candidate set out of your index. But a candidate set is not an answer — it is a shortlist, and shortlists ranked by embedding cosine similarity or RRF fusion scores are only <em>approximately</em> ordered by actual relevance to the user's real question. Reranking is the precision layer that sits after retrieval and before generation: a second, more expensive, more accurate model that looks at the query and each candidate together and re-sorts them so the context you actually hand to the LLM is the best possible context, not merely the fastest-to-fetch one. Skip this chapter and you will spend the next several chapters debugging "the model gave a wrong answer" bugs that are actually "the model was never given the right chunk" bugs.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+By this point in the volume you have built a retrieval pipeline that can, given a user query, return a ranked list of candidate chunks from a vector store, possibly blended with keyword search via reciprocal rank fusion. It works. Demos look good. Then it goes to production, real users ask real questions, and you notice a specific, maddening failure pattern: the chunk that actually answers the question is <em>in the retrieved set</em> — you can see it, sitting at position 7 or 12 — but it never makes it into the top-k slice that gets stuffed into the prompt, because something less relevant but more "embedding-similar" sat above it. The LLM then answers confidently and wrong, not because it hallucinated, but because it was never shown the right evidence. This is arguably the single most common root cause of poor RAG quality in real systems, more common than bad chunking and more common than a weak generation model.
+</p>
+
+<p>
+The reason this happens is structural, not accidental, and understanding why is the whole point of this chapter. Vector similarity search and hybrid fusion are both built for <strong>speed at scale</strong> — they need to compare a query against millions or billions of candidates in milliseconds, which forces them to use cheap, independent representations (an embedding is computed for a chunk once, in isolation, without ever "looking at" the specific query it will later be compared against). That efficiency has a real cost: the model computing similarity never gets to reason jointly about the query and the document together. Reranking exists specifically to buy back that lost accuracy on a much smaller candidate set, where you can afford a slower, jointly-reasoning model because you are only scoring dozens of candidates instead of millions.
+</p>
+
+<p>
+For your journey toward production AI Engineering, this chapter marks a mental shift you will use for the rest of the book: <strong>retrieval quality is not one number, it is a pipeline of successively more expensive, more accurate filters</strong> — cheap-and-wide first, expensive-and-narrow last. Reranking is your first hands-on example of this "funnel" architecture, and the same shape reappears later when you tune retrieval for agents (Volume 4) and when you build evaluation harnesses for RAG quality (Volume 5). Get comfortable with the idea now: the retriever's job is not to find THE answer, it is to make sure the answer is <em>somewhere in the candidate set</em>, cheaply. The reranker's job is to find it inside that set, precisely.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+Reranking is not an invention of the RAG era — it is a much older idea from information retrieval (IR) and web search, repurposed almost unchanged for LLM pipelines. Understanding where it came from clarifies exactly what problem it was designed to solve, and why that problem reappears identically inside a vector database.
+</p>
+
+<h3>2.1 The Two-Stage Search Engine (1990s–2000s)</h3>
+
+<p>
+Classical web search engines like early Google faced an identical constraint to today's vector databases: they had to search billions of documents in a fraction of a second. The solution then, as now, was a <strong>two-stage retrieval architecture</strong>. Stage one used a cheap, index-friendly scoring function — usually TF-IDF or, later, BM25 (the same lexical scoring you met conceptually in the Hybrid Search chapter) — to prune billions of documents down to a few hundred or few thousand plausible candidates using an inverted index that could be queried in milliseconds. Stage two took that much smaller candidate set and applied a far more expensive scoring function, one that could look at dozens of fine-grained signals (click-through history, page authority, term proximity, freshness, personalization signals) that would have been computationally impossible to compute for every document in the entire index. This second stage was, functionally, a reranker, decades before the term became common in AI Engineering circles.
+</p>
+
+<h3>2.2 Learning to Rank (2000s–2010s)</h3>
+
+<p>
+The next evolution replaced hand-tuned scoring formulas in stage two with machine-learned ranking models — a discipline called <strong>Learning to Rank (LTR)</strong>. Models like RankNet, LambdaMART, and gradient-boosted tree rankers were trained directly on human relevance judgments and click data to predict a relevance score, or even directly optimize ranking-quality metrics like NDCG (Normalized Discounted Cumulative Gain). This is the direct academic ancestor of the neural rerankers you use today: the core idea — train a model whose entire job is to say "given this query and this specific candidate, how relevant is it?" — has not changed. What changed is the model class: gradient-boosted trees over hand-engineered features gave way to deep neural networks that consume raw text directly.
+</p>
+
+<h3>2.3 Cross-Encoders and the BERT Era (2019–present)</h3>
+
+<p>
+The arrival of Transformer-based encoder models (covered in the Transformers and Attention chapters) enabled a new architecture called the <strong>cross-encoder</strong>: feed the query and a candidate document into the same Transformer <em>together</em>, as a single concatenated input, and let self-attention let every token in the query attend to every token in the document (and vice versa) before producing a single relevance score. This is dramatically more accurate than comparing two independently-computed embeddings (the "bi-encoder" approach used for the vector search itself), because the model can directly reason about term-level interactions between query and document — but it is also dramatically slower, since it requires a full forward pass through the Transformer for every single query-document pair, with no possibility of precomputing anything. This speed-accuracy trade-off is precisely why cross-encoders are used as rerankers on a small candidate set rather than as the primary retrieval mechanism over an entire corpus — you cannot run a cross-encoder against a billion documents per query, but you can easily run it against fifty.
+</p>
+
+<h3>2.4 Reranking-as-a-Service (2023–present)</h3>
+
+<p>
+Most recently, reranking has been productized as a standalone API: Cohere's Rerank API, Voyage AI's rerankers, open-weight cross-encoder models (the <code>ms-marco</code> and <code>bge-reranker</code> families being widely used defaults), and LLM-as-reranker approaches where you simply ask a capable chat model to score or reorder candidates directly. This is the landscape you will plug into from Spring AI: reranking today is rarely something you train yourself, it is a component you call, similar to how you call an embedding model or a chat model.
+</p>
+
+<table>
+<tr><th>Era</th><th>Mechanism</th><th>Constraint It Solved</th><th>Modern Equivalent</th></tr>
+<tr><td>Inverted index + BM25</td><td>Cheap lexical scoring over the whole corpus</td><td>Cannot afford expensive scoring at full corpus scale</td><td>Vector / hybrid search (stage 1 retrieval)</td></tr>
+<tr><td>Learning to Rank (LambdaMART etc.)</td><td>ML model scoring a pruned candidate set</td><td>Hand-tuned formulas can't capture complex relevance signals</td><td>Neural cross-encoder rerankers</td></tr>
+<tr><td>BERT cross-encoders</td><td>Joint query-document attention</td><td>Bi-encoders can't model fine-grained term interaction</td><td>Cohere Rerank, bge-reranker, ms-marco cross-encoders</td></tr>
+<tr><td>LLM-as-reranker</td><td>Prompt a chat model to score/reorder</td><td>Domain-specific relevance judgment without training data</td><td>ChatModel-based reranking advisors in RAG pipelines</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you as an engineer:</strong> reranking is not a hack bolted onto RAG — it is the direct continuation of a decades-old, well-validated pattern from production search engines that predate LLMs entirely. When you add a reranking stage to your Spring AI RAG pipeline, you are not doing something exotic; you are applying the same two-stage architecture that has powered every major search engine since the early 2000s, just with a Transformer cross-encoder in the second stage instead of a gradient-boosted tree.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Strip away the history, and reranking exists to solve one precise engineering problem:
+</p>
+
+<div class="callout">
+<strong>Given a query and a candidate set of documents ordered by a cheap, scalable similarity measure, produce a re-ordering of that same set (or a smaller subset of it) that more accurately reflects true relevance to the query — using a model expensive enough that it could never have scored the entire corpus in the first place.</strong>
+</div>
+
+<p>
+Two properties of this statement deserve to be unpacked, because they are exactly where engineers get the design wrong.
+</p>
+
+<p>
+First: reranking operates <strong>only on candidates the first-stage retriever already found</strong>. If the correct chunk was never retrieved into the candidate set at all — a recall failure in Hybrid Search or the vector index itself — no reranker, however good, can fix it. Reranking improves <strong>precision within recall</strong>; it cannot manufacture recall it wasn't given. This is why reranking is always deployed as a second stage on top of a retrieval stage tuned for reasonably high recall (often deliberately over-fetching — retrieving top-50 or top-100 candidates instead of top-5 — specifically to give the reranker enough raw material to work with).
+</p>
+
+<p>
+Second: the "cheap, scalable similarity measure" from stage one and the "expensive model" from stage two are solving genuinely different computational problems, not just the same problem at different quality levels. Bi-encoder embedding similarity (dot product or cosine similarity between two independently-computed vectors) is a compressed, query-agnostic representation of each document — the document's embedding was computed once, before your query even existed, and stored in the index. A cross-encoder reranker, by contrast, computes a fresh, query-specific representation for every single candidate, at request time, because it processes the query and document jointly. This is why reranking cannot be precomputed or cached across different queries the way embeddings can — it is inherently a query-time cost, and understanding this cost model correctly is the difference between an architecture that scales and one that silently becomes your system's latency bottleneck (a theme this chapter returns to in Performance Considerations).
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 Bi-Encoders vs. Cross-Encoders — the Core Mental Model</h3>
+
+<p>
+Everything in this chapter reduces to one distinction you must be able to explain crisply: the difference between a <strong>bi-encoder</strong> and a <strong>cross-encoder</strong>.
+</p>
+
+<p>
+A <strong>bi-encoder</strong> is what you have been using since the embeddings chapters: it maps the query and each document into vectors <em>independently</em>, in completely separate forward passes that never see each other, and then compares those two fixed vectors with a cheap operation like cosine similarity. The critical property is that the document's vector can be computed once, offline, and stored — it does not know or care what query will eventually be compared against it. This is what makes vector search fast enough to run over millions of documents: you precompute everything expensive ahead of time, and the query-time cost is just one embedding call plus a fast nearest-neighbor lookup.
+</p>
+
+<p>
+A <strong>cross-encoder</strong> throws that efficiency away on purpose, in exchange for accuracy. It concatenates the query and a single candidate document into one input sequence (something like <code>[CLS] query tokens [SEP] document tokens [SEP]</code>) and runs the whole thing through a single Transformer, letting every token attend to every other token — query tokens can attend to document tokens and vice versa, at every layer (recall the Attention and Multi-Head Attention chapters). The output is typically a single relevance score, not a vector. Because the representation is computed jointly, the model can pick up on interactions no bi-encoder can see: whether a specific number in the document actually matches a specific number implied by the question, whether a negation in the query is satisfied or contradicted by the document, whether an entity mentioned in the query is the specific entity discussed (versus a same-named but different entity).
+</p>
+
+<p>
+Think of it like hiring for a job. A bi-encoder is like screening resumes by keyword-matching them against a job description independently, in bulk, before any interview happens — fast, scalable, but blunt. A cross-encoder is like an actual interview: the interviewer and candidate are in the same room, the interviewer can ask a follow-up based on what the candidate just said, and the assessment is far more accurate — but you obviously cannot interview every applicant in the world for every job opening, only the shortlist that survived the resume screen.
+</p>
+
+<h3>4.2 Relevance Is Not Similarity</h3>
+
+<p>
+A second, equally important theoretical point: embedding similarity and true relevance are correlated but not identical, and reranking exists precisely in the gap between them. Two sentences can be embedding-similar because they share vocabulary and topic, while one directly answers the question and the other merely discusses the same subject. Consider the query "What is the maximum retry count for the payment webhook?" A chunk that says "Payment webhooks are configured with retry policies in the gateway module" is topically similar and will likely score well on cosine similarity — but it does not contain the actual number the user needs. A chunk buried lower in the ranked list that says "the webhook retries a maximum of 5 times before moving to the dead-letter queue" is the one that actually answers the question, even though it may share less surface vocabulary with the query. Bi-encoder embeddings, trained largely on general semantic similarity, systematically under-rank this second kind of chunk relative to a cross-encoder that can directly assess "does this text answer this specific question."
+</p>
+
+<h3>4.3 Pointwise, Pairwise, and Listwise Reranking</h3>
+
+<p>
+There are three families of approaches to producing a reranked order, and it helps to know all three exist even though pointwise dominates practice today:
+</p>
+
+<table>
+<tr><th>Approach</th><th>What It Scores</th><th>Trade-off</th></tr>
+<tr><td>Pointwise</td><td>Each (query, document) pair independently gets one relevance score; sort by score</td><td>Simple, parallelizable, but ignores relationships between candidates</td></tr>
+<tr><td>Pairwise</td><td>Model predicts which of two documents is more relevant, for many pairs</td><td>Captures relative ordering better but is O(n²) pair comparisons</td></tr>
+<tr><td>Listwise</td><td>Model considers the entire candidate list at once and outputs a full ordering</td><td>Most information-rich, but expensive and less standardized as an API shape; LLM-as-reranker prompts often approximate this</td></tr>
+</table>
+
+<p>
+Nearly every production reranking API you will call from Spring AI — Cohere Rerank, cross-encoder models like bge-reranker — is pointwise under the hood: it independently scores each candidate against the query and returns a sorted list. LLM-as-reranker approaches, where you prompt a chat model with the full candidate list and ask it to output a ranked order, are effectively attempting a listwise approach, with the trade-offs that implies (better contextual judgment, but higher cost and less deterministic output shape).
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through what actually happens, end to end, when a reranking stage runs inside a RAG pipeline.
+</p>
+
+<h3>5.1 Step-by-Step Mechanism</h3>
+
+<ol>
+<li><strong>Over-fetch at retrieval time.</strong> Instead of asking the vector store (or hybrid search fusion, from Chapter 72) for exactly the top-5 chunks you intend to use, you deliberately request a wider net — commonly top-25, top-50, or top-100 — because the reranker needs raw material to sift through, and the whole value of reranking depends on the correct answer being <em>somewhere</em> in this wider set even if it wasn't in the naive top-5.</li>
+<li><strong>Pair construction.</strong> For each candidate chunk in that wider set, the reranking component constructs a (query, chunk) pair. If you are calling a cross-encoder API, this is literally the query text and the chunk text sent together in one request (batched, typically — you send all candidates for a single query in one API call rather than one call per candidate, to amortize network overhead).</li>
+<li><strong>Scoring.</strong> The cross-encoder model runs a forward pass over each pair and produces a single scalar relevance score, typically not bounded in an intuitive range (some rerankers output raw logits, others a 0–1 probability after a sigmoid). What matters for your code is the score's <em>relative</em> ordering, not its absolute scale — comparing scores across different reranker models or different queries is not meaningful, only comparing scores across candidates for the <em>same</em> query and reranker call is.</li>
+<li><strong>Re-sort.</strong> The candidates are sorted descending by this new score. This produces a fresh ordering that can look substantially different from the original retrieval order — it is common and expected for a chunk that was ranked 20th by vector similarity to jump to 1st after reranking, and for a chunk that was ranked 1st to drop out of the top-10 entirely.</li>
+<li><strong>Truncate to final top-k.</strong> Only now do you slice down to the small number of chunks (commonly 3–8) that will actually be inserted into the LLM's context window. This final top-k is what should have been your original top-k all along, had cosine similarity alone been able to identify it correctly.</li>
+<li><strong>Assemble the prompt.</strong> The reranked, truncated chunks are handed to the generation stage exactly as any other retrieved context would be — the LLM itself is unaware that a reranking stage even ran; it only ever sees the final, curated context.</li>
+</ol>
+
+<h3>5.2 Edge Cases Worth Reasoning Through</h3>
+
+<ul>
+<li><strong>What if the candidate set is smaller than the requested top-k after reranking?</strong> If retrieval returns fewer chunks than your target final count (e.g., a narrow knowledge base only has 3 relevant chunks total), reranking simply reorders what exists; your pipeline should not fail, and you should not pad with irrelevant filler just to hit a target count.</li>
+<li><strong>What if every candidate scores low?</strong> A reranker score, unlike a hard database lookup, does not guarantee any candidate is actually relevant — it only tells you the <em>relative</em> order among what you gave it. A production pipeline should apply an absolute score threshold in addition to top-k truncation, so that when none of the retrieved candidates are genuinely relevant (an out-of-domain question, for instance), the system can recognize "I don't have a good answer" rather than confidently feeding the LLM the least-bad of several bad options.</li>
+<li><strong>What if reranking latency competes with a strict SLA?</strong> Because cross-encoder scoring cannot be precomputed, it adds real query-time latency proportional to the number of candidates scored. Systems with tight latency budgets often cap the candidate set fed to the reranker (e.g., only rerank the top-30 from retrieval, not the top-500) precisely to bound this cost — a trade-off explored further in Section 12.</li>
+<li><strong>What if the reranker and the retriever disagree wildly and consistently?</strong> Persistent, large disagreement between first-stage ranking and reranked order across many queries is a signal worth monitoring — it may indicate your embedding model is poorly suited to your domain (a signal to revisit embedding model choice, back in the Introduction to RAG and Vector Mathematics chapters) rather than something to just paper over with reranking forever.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Reranking does not require new mathematical machinery beyond what the Transformers and Attention chapters already gave you — a cross-encoder is simply a Transformer encoder (structurally similar to the encoder side of the original architecture, or a BERT-style model) with a classification/regression head on top. The mathematics worth making explicit here is not a new formula, but the <strong>cost model</strong>, because that cost model is what drives every production decision in this chapter.
+</p>
+
+<p>
+For a bi-encoder over a corpus of <code>N</code> documents, the query-time cost to retrieve candidates is roughly one embedding computation for the query (constant cost) plus an approximate nearest-neighbor search over <code>N</code> precomputed vectors, which with a good index (HNSW, IVF — covered in the vector database chapters) scales sub-linearly, often close to <code>O(log N)</code>. Document embeddings themselves cost nothing at query time because they were computed once, offline, ahead of the query ever existing.
+</p>
+
+<p>
+For a cross-encoder reranking <code>k</code> candidates, the query-time cost is <code>k</code> full Transformer forward passes, because each (query, candidate) pair requires its own complete pass through the model — there is no precomputation possible, since the representation is a joint function of both texts. If a Transformer forward pass over a typical chunk length costs roughly <code>c</code> milliseconds, reranking <code>k</code> candidates costs approximately <code>k × c</code> milliseconds (batching on a GPU reduces this constant significantly but does not remove the linear dependence on <code>k</code>).
+</p>
+
+<pre>
+Bi-encoder (retrieval):     cost ≈ O(log N)      — N can be millions, cost barely grows
+Cross-encoder (reranking):  cost ≈ O(k)           — k is small (tens), but EVERY candidate
+                                                      costs a full model forward pass, always
+</pre>
+
+<p>
+This is the mathematical reason reranking is architected as a narrow second stage rather than a replacement for retrieval: a linear cost in <code>k</code> is completely fine when <code>k</code> is 25–100, but would be catastrophic if <code>k</code> were the full corpus size <code>N</code>. The entire two-stage design in Section 3's problem statement is, at its root, a direct consequence of this asymmetric cost model — sub-linear at wide scale, linear but small at narrow scale.
+</p>
+
+<p>
+One more useful piece of light formalism: reranking quality is typically evaluated with the same ranking metrics used in classical IR and Learning-to-Rank — <strong>NDCG@k</strong> (Normalized Discounted Cumulative Gain, which rewards placing relevant documents near the top of the list, discounted logarithmically by position) and <strong>MRR</strong> (Mean Reciprocal Rank, the average of 1/rank-of-first-relevant-result across queries). You do not need to derive these formulas to use reranking effectively, but knowing they exist matters for Section 14 and for the Evaluation chapters later in the series — "did reranking help?" is an empirical, measurable question, not a vibe.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Two-Stage Funnel</h3>
+
+<pre>
+                         USER QUERY
+                             │
+                             ▼
+              ┌───────────────────────────────┐
+              │   STAGE 1 — RETRIEVAL           │
+              │   Bi-encoder / hybrid search     │
+              │   (cheap, scales to millions)    │
+              └───────────────┬───────────────┘
+                               │
+                 top-50 candidates, ranked by
+                 cosine similarity / RRF fusion
+                 (approximately right, noisy)
+                               │
+                               ▼
+              ┌───────────────────────────────┐
+              │   STAGE 2 — RERANKING            │
+              │   Cross-encoder scores EVERY      │
+              │   (query, candidate) pair jointly │
+              │   (expensive, scales to dozens)   │
+              └───────────────┬───────────────┘
+                               │
+                 top-5 candidates, re-sorted by
+                 true joint relevance score
+                 (precise, low-noise)
+                               │
+                               ▼
+              ┌───────────────────────────────┐
+              │   GENERATION                     │
+              │   LLM answers using only the      │
+              │   reranked, truncated context      │
+              └───────────────────────────────┘
+</pre>
+
+<h3>7.2 Bi-Encoder vs. Cross-Encoder Internals, Side by Side</h3>
+
+<pre>
+BI-ENCODER (used for retrieval — independent, precomputable)
+
+   Query text                 Document text
+       │                            │
+       ▼                            ▼
+  [Transformer]               [Transformer]     ← computed separately,
+       │                            │              document side done
+       ▼                            ▼              OFFLINE, long before
+   Query vector               Document vector      the query ever exists
+       │                            │
+       └───────────┬────────────────┘
+                    ▼
+          cosine_similarity(qv, dv)
+          (one cheap dot product)
+
+
+CROSS-ENCODER (used for reranking — joint, computed only at query time)
+
+   [CLS] query tokens [SEP] document tokens [SEP]
+                    │
+                    ▼
+         [ single Transformer, self-attention
+           lets EVERY query token attend to
+           EVERY document token, and vice versa ]
+                    │
+                    ▼
+           relevance_score (one scalar)
+
+   ← must be recomputed fresh for every single
+     (query, candidate) pair — nothing here can
+     be precomputed ahead of time
+</pre>
+
+<p class="followup">
+The second diagram is the one to keep mentally pinned for this entire chapter. Every design decision in Sections 8 through 12 — over-fetching, capping candidate counts, batching, latency budgets — is a direct engineering response to the fact that the bottom half of that diagram cannot be precomputed, while the top half can.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a deployed RAG system, reranking sits as a discrete, swappable stage between retrieval and prompt assembly — architecturally, it should be treated as its own service boundary, not inlined logic buried inside a retrieval class, because its latency and cost profile are different enough from both retrieval and generation to warrant independent monitoring, timeouts, and fallback behavior.
+</p>
+
+<pre>
+┌──────────────┐   ┌───────────────────┐   ┌──────────────────┐   ┌─────────────┐
+│   User Query   │──►│  Retrieval Service  │──►│  Reranking Service │──►│  Generation   │
+│                │   │  (Vector DB +       │   │  (Cross-encoder or  │   │  (ChatModel)  │
+│                │   │   Hybrid Search,     │   │   LLM-as-reranker)  │   │               │
+│                │   │   over-fetch top-50) │   │   truncate to top-5 │   │               │
+└──────────────┘   └───────────────────┘   └──────────────────┘   └─────────────┘
+                                                     │
+                                     ┌───────────────┴───────────────┐
+                                     │  Reranker failure/timeout path  │
+                                     │  → fall back to stage-1 order    │
+                                     │    (degrade gracefully, never     │
+                                     │     block the whole request)      │
+                                     └───────────────────────────────┘
+</pre>
+
+<p>
+A few production realities shape how this box is actually built:
+</p>
+
+<ul>
+<li><strong>Reranking is usually a hosted API call or a dedicated inference microservice</strong>, not something you run inline in your application JVM — cross-encoder models are typically GPU-hosted, and calling one from a Spring Boot service looks like calling any other external ML inference endpoint (an HTTP call with request/response DTOs, exactly the shape covered in the REST API chapter).</li>
+<li><strong>It must have its own timeout and circuit breaker</strong>, independent of the retrieval and generation stages, and a defined fallback: if the reranker times out or errors, the pipeline should fall back to the original stage-1 ranking rather than failing the entire request — a degraded answer beats no answer.</li>
+<li><strong>It is a natural place for observability</strong> — logging the pre-rerank and post-rerank ordering for a sample of production queries is one of the highest-leverage debugging tools available to a RAG team, because it directly answers "is retrieval or generation the weak link?" (a question covered more formally in the Observability chapter later in the series).</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI does not currently ship a single canonical <code>RerankModel</code> interface with the same first-class status as <code>ChatModel</code> or <code>EmbeddingModel</code> across every provider, so in practice you will integrate reranking one of two ways: calling a reranking provider's REST API directly with a lightweight HTTP client (Spring's <code>RestClient</code> or <code>WebClient</code>), or implementing reranking as a custom step inside your retrieval pipeline using Spring AI's <code>VectorStore</code> abstraction plus your own post-processing logic. Where a provider does expose a Spring AI integration for reranking, it will typically follow the same idiom as the rest of the library: an interface you call with a query and a list of documents, returning a reordered list — model this yourself even where no official binding exists yet, because it keeps your calling code provider-agnostic, exactly the same discipline the <code>ChatModel</code> abstraction teaches you elsewhere in this series.
+</p>
+
+<p>
+Conceptually, treat reranking the same way you would treat any other <code>Advisor</code>-shaped concern in a Spring AI <code>ChatClient</code> pipeline (Advisors were introduced in Chapter 55): it is a cross-cutting step that intercepts the retrieved context between the retrieval call and the model call, transforms it, and passes it along. A reranking step can be implemented as logic that runs inside a custom retrieval-augmentation component before the prompt is ever assembled, structurally parallel to how a <code>QuestionAnswerAdvisor</code>-style component injects retrieved documents into the prompt.
+</p>
+
+<pre>
+public interface RerankModel {
+
+    List&lt;ScoredDocument&gt; rerank(String query, List&lt;Document&gt; candidates);
+}
+
+public record ScoredDocument(Document document, double relevanceScore) {}
+
+@Service
+public class CohereRerankModel implements RerankModel {
+
+    private final RestClient restClient;
+
+    public CohereRerankModel(RestClient.Builder builder,
+                              @Value("${rerank.api-key}") String apiKey) {
+        this.restClient = builder
+                .baseUrl("https://api.cohere.com/v2/rerank")
+                .defaultHeader("Authorization", "Bearer " + apiKey)
+                .build();
+    }
+
+    @Override
+    public List&lt;ScoredDocument&gt; rerank(String query, List&lt;Document&gt; candidates) {
+        var request = new RerankRequest(
+                "rerank-english-v3.0",
+                query,
+                candidates.stream().map(Document::getContent).toList(),
+                candidates.size()
+        );
+
+        RerankResponse response = restClient.post()
+                .body(request)
+                .retrieve()
+                .body(RerankResponse.class);
+
+        return response.results().stream()
+                .map(r -&gt; new ScoredDocument(
+                        candidates.get(r.index()), r.relevanceScore()))
+                .sorted(Comparator.comparingDouble(
+                        ScoredDocument::relevanceScore).reversed())
+                .toList();
+    }
+}
+
+@Service
+public class RerankingRetriever {
+
+    private final VectorStore vectorStore;
+    private final RerankModel rerankModel;
+
+    public RerankingRetriever(VectorStore vectorStore, RerankModel rerankModel) {
+        this.vectorStore = vectorStore;
+        this.rerankModel = rerankModel;
+    }
+
+    public List&lt;Document&gt; retrieveAndRerank(String query, int finalTopK) {
+        // Stage 1: over-fetch with the cheap bi-encoder search
+        List&lt;Document&gt; wideCandidates = vectorStore.similaritySearch(
+                SearchRequest.query(query).withTopK(50));
+
+        // Stage 2: expensive, precise cross-encoder rerank
+        List&lt;ScoredDocument&gt; reranked =
+                rerankModel.rerank(query, wideCandidates);
+
+        return reranked.stream()
+                .filter(sd -&gt; sd.relevanceScore() &gt;= 0.2) // absolute-score floor
+                .limit(finalTopK)
+                .map(ScoredDocument::document)
+                .toList();
+    }
+}
+</pre>
+
+<p>
+Note the two habits baked into this code that this chapter has been building toward: the retrieval call deliberately over-fetches (<code>topK 50</code>) rather than requesting the final count directly, and the final assembly applies both a relevance-score floor <em>and</em> a top-k limit, rather than trusting top-k truncation alone — directly reflecting the "what if every candidate scores low" edge case from Section 5.2. Wrapping the reranker call itself in a timeout and a fallback (e.g., via Spring's <code>Resilience4j</code> integration) is what turns this from a demo into something you would actually deploy — if <code>rerankModel.rerank(...)</code> times out, catch it and fall back to returning <code>wideCandidates</code> truncated to <code>finalTopK</code> unranked, rather than failing the whole request.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Always over-fetch before reranking.</strong> Reranking a top-5 list you already truncated to defeats the purpose entirely — the reranker can only fix ordering among candidates it is given, so give it a genuinely wide net (top-25 to top-100 depending on latency budget).</li>
+<li><strong>Apply an absolute relevance-score floor in addition to top-k truncation.</strong> A reranker's job is relative ordering; it will happily tell you the "best" of several irrelevant candidates unless you also check the score is high enough in absolute terms to trust.</li>
+<li><strong>Measure reranking's actual contribution with an evaluation set, not intuition.</strong> Build a small labeled set of (query, correct chunk) pairs and compute retrieval-only vs. retrieval-plus-reranking hit rate / NDCG before committing to the extra latency and cost in production — reranking helps enormously in some domains and marginally in others, and you should know which is true for your data.</li>
+<li><strong>Treat the reranker as a first-class, independently swappable component,</strong> just like the <code>ChatModel</code> and embedding model abstractions elsewhere in this series — different reranker providers vary meaningfully in quality and latency, and coupling your pipeline tightly to one vendor's API shape will cost you later.</li>
+<li><strong>Cap the candidate count fed to the reranker deliberately,</strong> and treat that cap as a tunable, monitored parameter — it is your primary lever for trading latency against recall-within-precision quality.</li>
+<li><strong>Log pre-rerank and post-rerank rankings for a sampled percentage of production traffic.</strong> This single practice is the fastest way to catch a misconfigured or underperforming reranker before users notice quality regressions.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Reranking a candidate set that was already truncated too aggressively at retrieval time.</strong> If stage 1 only ever returns the top-5, reranking has nothing meaningful to work with — this is the single most common way teams "add reranking" and see zero improvement, then wrongly conclude reranking doesn't work for their use case.</li>
+<li><strong>Treating reranker scores as comparable across different queries or different reranker models.</strong> A score of 0.6 for one query is not "the same relevance" as a score of 0.6 for a different query with a different reranker call — scores are only meaningfully comparable within a single reranking call for a single query.</li>
+<li><strong>Ignoring reranking latency until it shows up in a production p99 alert.</strong> Because cross-encoder scoring cannot be precomputed, it is pure added query-time latency; teams that treat it as a free quality upgrade during prototyping are often surprised when it becomes the dominant contributor to end-to-end response time at scale.</li>
+<li><strong>Skipping the fallback path.</strong> Treating the reranker call as if it can never fail or time out, with no graceful degradation to stage-1 ordering, turns an optional quality enhancement into a new single point of failure for the entire RAG pipeline.</li>
+<li><strong>Using an LLM-as-reranker approach with no output format constraints,</strong> then parsing free-form text to recover a ranked order — this is fragile and should instead use Spring AI's structured output support (Chapter 58) to force a reliable, parseable ranking response.</li>
+<li><strong>Assuming reranking is a substitute for fixing poor chunking or a mismatched embedding model.</strong> Reranking improves precision within whatever recall retrieval already achieved; if the fundamental chunking strategy (from earlier chapters) buries the answer across multiple disconnected fragments, no reranker can reassemble what was never retrieved together.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Reranking is the step in a RAG pipeline where latency, cost, and quality trade off most visibly against each other, because — as Section 6 established mathematically — its cost scales linearly with the number of candidates scored, and none of that cost can be amortized ahead of time the way embedding computation can.
+</p>
+
+<ul>
+<li><strong>Latency:</strong> Expect each cross-encoder scoring call to add somewhere from tens to a few hundred milliseconds to end-to-end request latency, depending on candidate count, chunk length, and whether the provider batches scoring efficiently on GPU. This is on top of the retrieval and generation stages, so a reranking stage that isn't budgeted for can quietly push a system past its latency SLA.</li>
+<li><strong>Candidate count is your primary tuning lever.</strong> Reranking 100 candidates costs roughly 2–4x reranking 25–50, with rapidly diminishing quality returns beyond a certain point — most production systems settle on reranking somewhere between 20 and 50 candidates as the practical sweet spot.</li>
+<li><strong>Cost:</strong> Hosted reranking APIs typically bill per document scored (not per query), so the over-fetch width you choose for stage 1 directly multiplies your per-query reranking bill — this needs to be modeled explicitly in cost projections, the same way token costs are modeled for generation (Volume 5 covers this in depth for the full pipeline).</li>
+<li><strong>Throughput under concurrent load:</strong> A self-hosted cross-encoder reranker running on a GPU has finite batching capacity; under high concurrent query volume, reranking requests can queue, and this queueing latency compounds with the per-call latency above — capacity planning for a reranking service should be treated with the same rigor as capacity planning for the generation model itself.</li>
+<li><strong>Caching has limited applicability.</strong> Unlike embeddings, reranking scores are query-specific and cannot generally be cached across different queries; the only meaningful caching opportunity is for exact repeat queries, which is a much smaller win than embedding caching typically provides.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Reranking has a narrower security surface than retrieval or generation, but it is not zero, and it is worth stating honestly rather than padding. The main consideration is that reranking sends the full text of every candidate chunk — including potentially sensitive internal document content — to whatever service performs the scoring. If you use a third-party hosted reranking API, this is functionally identical to the data-exfiltration consideration you would apply to any third-party API call carrying sensitive text (the same concern that applies to sending chunks to an external embedding or chat model provider) — verify data handling and retention policies before routing regulated or confidential content through an external reranker, and prefer a self-hosted cross-encoder model when data residency requirements demand it.
+</p>
+
+<p>
+A second, more subtle consideration connects back to prompt injection (introduced in the "What Is Intelligence" chapter and covered fully in Volume 5): if you use an LLM-as-reranker approach where a chat model is prompted with the candidate documents and asked to rank them, those documents are untrusted text flowing into a model's context — the same injection risk that applies to retrieval-augmented generation in general applies here, since a maliciously crafted document could in principle attempt to manipulate the reranking model's stated relevance judgment rather than the final answer generation itself. Cross-encoder rerankers that output only a numeric score (not free-form text) are structurally less susceptible to this than LLM-as-reranker prompting, which is one more reason to prefer a dedicated scoring model over a general chat model for this stage where feasible.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What problem does reranking solve that vector similarity search alone does not?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Vector similarity search ranks documents using embeddings computed independently of the query (bi-encoder), which is fast but approximate — it can rank a topically-similar-but-non-answering chunk above the chunk that actually answers the question. Reranking uses a more expensive model that looks at the query and each candidate jointly, producing a more accurate relevance ordering, applied only to the small candidate set retrieval already narrowed down.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why can't we just always use a cross-encoder for retrieval instead of embeddings, if it's more accurate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A cross-encoder must process the query and a candidate document together, jointly, in a single forward pass — nothing about it can be precomputed ahead of time. Running it against every document in a corpus of millions would require millions of full Transformer forward passes per query, which is computationally infeasible at that scale. Bi-encoder embeddings can be precomputed once, offline, and compared cheaply at query time, which is why they are used for retrieval over the full corpus, with cross-encoders reserved for reranking a much smaller candidate set.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain the difference between a bi-encoder and a cross-encoder architecturally.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A bi-encoder runs the query and a document through the same (or a paired) Transformer separately, producing two independent embedding vectors that are compared afterward with a cheap operation like cosine similarity — the document embedding never depends on the query. A cross-encoder concatenates the query and document into a single input and runs them through one Transformer together, allowing self-attention to let every query token attend to every document token and vice versa, producing a single joint relevance score rather than two separate vectors. This joint attention captures fine-grained interactions a bi-encoder cannot see, at the cost of requiring a fresh forward pass for every query-document pair.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why should you over-fetch a wide candidate set at retrieval time before reranking, rather than reranking only the final top-k?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Reranking can only reorder candidates it is given — it cannot recover a relevant document that was excluded from the candidate set entirely. If retrieval already truncated to the final desired count (e.g., top-5) before reranking runs, and the correct chunk ranked 12th by embedding similarity, reranking never sees it and cannot fix the omission. Over-fetching (e.g., top-50) gives the reranker enough raw material to correct ordering errors within a set wide enough to likely contain the right answer, then truncating to the final top-k happens only after reranking.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. How would you decide, quantitatively, whether adding a reranking stage is worth the added latency and cost for a specific RAG application?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Build a labeled evaluation set of realistic queries paired with the chunk(s) known to correctly answer them, then measure retrieval-only ranking quality (e.g., hit rate@k, MRR, or NDCG@k) against the same metrics computed after adding reranking on top of a wider retrieved candidate set. Compare the quality delta against the measured added latency (typically tens to hundreds of milliseconds) and added per-query cost (rerankers are commonly billed per document scored). If the quality improvement is small relative to the domain's existing embedding model fit — e.g., a narrow, well-curated knowledge base where bi-encoder ranking is already strong — the added cost/latency may not be justified; if queries are complex, candidate chunks are lexically similar but semantically distinct, or the corpus is broad and noisy, reranking's improvement is typically large and clearly worth the cost. This should be an empirical decision backed by an evaluation harness, not an assumption.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. A production RAG system's reranking API call is timing out intermittently under load. What is your remediation strategy, both immediate and structural?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Immediately: ensure the reranker call has an explicit timeout and a circuit breaker (e.g., via Resilience4j) with a defined fallback path that returns the original stage-1 retrieval ordering, truncated to the target count, rather than failing the entire request — a degraded but present answer is almost always better than a hard failure for an optional quality-enhancement stage. Structurally: investigate whether the candidate count sent to the reranker can be reduced (fewer documents scored per call directly reduces latency), whether the reranking service needs additional capacity or better batching under concurrent load, and whether a self-hosted, horizontally-scalable cross-encoder deployment would give more predictable latency than a shared third-party API under your specific traffic patterns. Long term, this should be monitored with dedicated latency and error-rate dashboards for the reranking stage specifically, separate from retrieval and generation metrics.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly state that reranking should be architected as an optional, gracefully-degradable enhancement rather than a hard dependency in the critical path — this single design principle (fail open to stage-1 ordering, never fail the whole request) is exactly the kind of production-reliability instinct that distinguishes a senior answer from a mid-level one, and it directly parallels the resilience patterns Java engineers already apply to any unreliable downstream dependency.</div>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. Design the reranking stage for a multi-tenant RAG platform that serves both a latency-sensitive real-time chat product and an offline batch document-analysis product, sharing the same retrieval infrastructure. What would you do differently for each?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>For the latency-sensitive chat product, cap the candidate count fed to the reranker tightly (e.g., top-20 to top-30), enforce an aggressive timeout with fallback to stage-1 ordering, and consider a smaller/faster reranker model or even a distilled cross-encoder to keep p99 latency bounded, accepting a modest precision trade-off for reliability under interactive SLAs. For the offline batch analysis product, where responses are not returned synchronously to a waiting user, latency constraints relax substantially — allow much wider candidate sets (top-100+), use the highest-quality available reranker (potentially even an LLM-as-reranker listwise approach for maximum contextual judgment), and prioritize recall and precision over speed, since batch jobs can tolerate seconds of added processing per document that a real-time chat turn cannot. Architecturally, expose reranking as a shared, configurable service with tenant/product-level policy (candidate count, model choice, timeout, score floor) rather than hardcoding one configuration, so the same retrieval and reranking infrastructure serves both product's differing cost/latency/quality trade-off curves without duplicating the underlying pipeline.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How does reranking interact with hybrid search's reciprocal rank fusion from a system design perspective — are they redundant, complementary, or does order of application matter?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>They are complementary, not redundant, and the order matters. Hybrid search with reciprocal rank fusion (Chapter 72) combines two independent, cheap, corpus-scale signals — dense vector similarity and sparse lexical (BM25) matching — to improve first-stage <strong>recall</strong>, ensuring more of the truly relevant documents make it into the candidate set at all, especially for queries with rare terms, exact identifiers, or code symbols that dense embeddings alone handle poorly. Reranking then operates strictly downstream, on the fused candidate set that hybrid search already produced, to improve <strong>precision</strong> within that set using a jointly-reasoning cross-encoder that neither BM25 nor vector similarity alone can replicate. Applying them in the reverse order — reranking a narrow set before fusing in lexical results — would defeat the purpose, since reranking cannot recover candidates that fusion never included. The correct pipeline is always: fuse widely for recall first, rerank narrowly for precision second, and this ordering should be treated as an architectural invariant when designing the retrieval pipeline.</p>
+</div>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain in your own words why a cross-encoder cannot precompute document representations ahead of time the way a bi-encoder can, tracing the explanation back to how self-attention works (refer to the Attention chapter's mechanism).</li>
+<li>A colleague proposes reranking the entire vector index (millions of documents) directly with a cross-encoder, skipping bi-encoder retrieval altogether, to "get the best possible ranking every time." Explain, using the cost model from Section 6, exactly why this does not scale, and what would happen to query latency if attempted.</li>
+<li>Describe a realistic query and candidate chunk pair where embedding similarity would rank the chunk highly but a cross-encoder reranker would correctly rank it low (or vice versa). What property of the chunk causes the disagreement?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Using any hosted reranking API (or a locally runnable open-weight cross-encoder such as a bge-reranker model), take a set of 10 queries against a small document set you have already indexed for vector search. For each query, record the top-5 order from vector similarity alone and the top-5 order after reranking a top-25 candidate set. Note how often the two orderings disagree in their top-1 result, and write two sentences on what this tells you about your embedding model's fit for this domain.</li>
+<li>Implement, in Spring Boot, the <code>RerankingRetriever</code> pattern shown in Section 9, wrapping the reranker call with a Resilience4j timeout and circuit breaker that falls back to returning the unranked stage-1 candidates truncated to the target count. Write a test that simulates a reranker timeout and asserts the fallback path returns a non-empty result rather than propagating the failure.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Reranking is a second-stage precision layer that re-sorts a retrieval-stage candidate set using a more expensive, jointly-reasoning model — it cannot manufacture recall it wasn't given, so it depends on a first stage tuned to retrieve widely.</li>
+<li>The core mechanism is the bi-encoder vs. cross-encoder distinction: bi-encoders compute query and document representations independently and precomputably (fast, used for retrieval at scale); cross-encoders compute a joint representation of the query and document together (slow, accurate, used for reranking a small candidate set).</li>
+<li>Embedding similarity and true relevance are correlated but not identical — reranking exists specifically to close that gap by letting a model directly assess whether a candidate answers the query, not just whether it shares topic and vocabulary.</li>
+<li>The reranking stage's cost scales linearly with the number of candidates scored and cannot be precomputed or cached across different queries, which makes candidate-count capping and timeout/fallback design the primary levers for keeping it production-viable.</li>
+<li>In a real architecture, reranking should be its own swappable, independently monitored service boundary with a graceful degradation path to stage-1 ordering — never a hard dependency that can take down the whole RAG pipeline if it times out.</li>
+<li>Whether reranking is worth its added latency and cost is an empirical question, answerable with the same evaluation-set methodology (hit rate, MRR, NDCG) used throughout classical information retrieval — measure it, don't assume it.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> reranking sharpens the ordering of the candidates you already retrieved, but it does nothing to narrow <em>which</em> candidates were eligible in the first place based on structured facts you already know about the data — the tenant a document belongs to, its date, its access permissions, its category. That is the job of Metadata Filtering (Chapter 74), which shows you how to combine structured, exact-match constraints with the similarity-based and reranked retrieval this chapter and the last one built, so that "relevant" also means "allowed" and "in scope."
+</p>
+
+</div>
+
+</body>
+</html>

@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>60-MULTI-MODEL-SUPPORT.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 60 — MULTI-MODEL SUPPORT</h1>
+
+<p class="roi">Volume 2 — Spring AI · Chapter 11 of 15</p>
+
+<div class="callout">
+Tool Calling (Chapter 59) taught your application to reach outward — to let a single model invoke functions, hit databases, and call other services on your behalf. But a single model calling many tools is still architecturally a one-model system, and one model is never the right answer for every job in a real product: it is either too expensive for trivial requests, too slow for latency-sensitive ones, too weak for the hardest ones, or simply unavailable when its provider has an outage. This chapter is where your application stops depending on <em>a</em> model and starts depending on a <strong>portfolio</strong> of models, selected and swapped deliberately, through an abstraction you control rather than one a vendor controls for you.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every production AI system you have built so far in this volume has quietly made a simplifying assumption: there is one model, it is configured once in <code>application.yml</code>, and every request in the system talks to it. That assumption survives exactly until the system has to serve more than one kind of request, at more than one price point, with more than one latency budget — which is to say, it survives until the demo ends and real usage begins.
+</p>
+
+<p>
+Consider a single, realistic support-ticket triage feature. Classifying a ticket's urgency and routing it to a queue is a task a small, cheap, fast model handles perfectly well. Drafting a full, empathetic reply that references the customer's order history needs a stronger model with better instruction-following. Summarizing a six-month thread of prior tickets for a human agent might benefit from a model with an unusually large context window. And if your primary provider has a regional outage at 2 a.m., you need <em>something</em> to answer, even if it is a lesser model, rather than a hard failure. That is four different model requirements inside one feature, and most real products have dozens of features, not one. Hardcoding a single model choice into your business logic is the AI-era equivalent of hardcoding a single database vendor's SQL dialect directly into your service layer — it works, right up until it doesn't, and by then it is expensive to undo.
+</p>
+
+<p>
+There is also a cost dimension that becomes unavoidable at scale, covered in depth later in this volume but worth naming now: state-of-the-art frontier models can cost ten to fifty times more per token than smaller, task-appropriate models. An application that routes every request — including "yes/no" classifications and short lookups — through its most capable, most expensive model is not being safe, it is burning budget on tasks that do not need that capability. Multi-model support is the architectural discipline that lets you match model capability to task difficulty, the way a well-designed backend already matches compute tier to workload (you do not run a health-check endpoint on the same GPU instance class as your training pipeline).
+</p>
+
+<p>
+Finally, there is a strategic reason that matters even if you only ever use one provider today: the foundation-model market is the fastest-moving layer of this entire stack. A model that is state-of-the-art this quarter is routinely surpassed, deprecated, or re-priced within months. An application architected so that "which model answers this request" is a runtime, configuration-driven decision — rather than a compile-time, code-level one — is an application that survives that churn without a rewrite. This chapter is where you build that architecture properly, in Java, using Spring AI's actual abstractions.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 The Single-SDK Era</h3>
+
+<p>
+When commercial LLM APIs first became widely available, every provider shipped its own client library with its own request/response shape, its own authentication scheme, and its own vocabulary for the same underlying concepts — one provider's "system message" was another's "preamble," one provider's function-calling JSON schema was subtly incompatible with another's. Application code written directly against, say, the OpenAI Python or Node SDK was inseparably coupled to OpenAI. Switching providers, or even just adding a second one for a specific use case, meant rewriting request-construction and response-parsing code from scratch. This is precisely the situation Java engineers experienced with database drivers before <strong>JDBC</strong> existed: every vendor had its own proprietary connectivity library, and application code was welded to one database vendor by accident of history rather than by deliberate design.
+</p>
+
+<h3>2.2 The Emergence of Abstraction Layers</h3>
+
+<p>
+As teams began needing more than one model — for cost, for redundancy, for capability — the pattern that emerged across the industry (first in Python-ecosystem frameworks, then as reverse-proxy "LLM gateways" that speak one unified API in front of many providers, and eventually as native abstractions in application frameworks) was structurally identical every time: define one vendor-neutral interface for "send a chat request, get a chat response," and push every provider's quirks behind an adapter that implements that interface. This is not a novel invention specific to AI — it is the <strong>Adapter</strong> and <strong>Strategy</strong> design patterns, applied to a new kind of unreliable, heterogeneous dependency, the exact same patterns Java engineers have used for decades to isolate business logic from payment gateways, message brokers, and cloud storage providers.
+</p>
+
+<h3>2.3 Spring AI's Answer</h3>
+
+<p>
+Spring AI arrived at this problem with the instinct you would expect from the Spring ecosystem: rather than inventing a new abstraction philosophy, it extended patterns Spring engineers already trust. Just as <code>DataSource</code> abstracts over JDBC drivers and <code>JmsTemplate</code> abstracts over message broker clients, Spring AI defines the <code>ChatModel</code> interface (and its siblings — <code>EmbeddingModel</code>, <code>ImageModel</code>, and others) as the vendor-neutral contract, with a growing set of starter modules — OpenAI, Anthropic, Azure OpenAI, Amazon Bedrock, Google Vertex AI (Gemini), Mistral AI, Ollama for local models, and more — each providing a concrete implementation. Multi-model support in Spring AI is therefore not a bolt-on feature; it falls directly out of the framework's foundational decision to model "a language model" as an interface rather than a concrete client from day one.
+</p>
+
+<table>
+<tr><th>Era</th><th>Pattern</th><th>Analogous Java/Spring Precedent</th></tr>
+<tr><td>Single-vendor SDKs</td><td>Business logic coupled directly to one provider's client library</td><td>Application code calling a proprietary JDBC driver's non-standard API directly</td></tr>
+<tr><td>External LLM gateways / proxies</td><td>A separate network hop normalizes many providers behind one API</td><td>An API gateway or ESB normalizing many backend protocols</td></tr>
+<tr><td>Framework-native abstraction (Spring AI)</td><td>A first-class interface (<code>ChatModel</code>) with pluggable implementations, in-process</td><td><code>DataSource</code>, <code>JmsTemplate</code>, <code>CacheManager</code> abstracting vendor-specific drivers</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you as an engineer:</strong> the fact that Spring AI's multi-model support looks so familiar is not a coincidence — it is proof that "isolate business logic from a volatile, vendor-specific dependency" is a solved problem in software engineering generally, and the AI industry simply had to rediscover it under new vocabulary. You are not learning a fundamentally new architectural skill in this chapter; you are learning where Spring AI put the seams.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Enable a single application to invoke multiple, independently-configured language models — potentially from different providers, of different capability tiers, and for different purposes within the same request lifecycle — without coupling business logic to any single provider's SDK, request format, or option set.</strong>
+</div>
+
+<p>
+Unpack what that sentence actually demands, because each clause maps to a distinct engineering requirement:
+</p>
+
+<ul>
+<li><strong>"Multiple, independently-configured models"</strong> — the application must be able to hold more than one live model configuration simultaneously (different API keys, different base URLs, different default parameters), not just one global setting.</li>
+<li><strong>"Different providers"</strong> — request construction and response parsing must not assume one vendor's JSON shape; the abstraction has to normalize the parts that are common (a prompt, a list of messages, a temperature) while still allowing access to provider-specific extras when genuinely needed.</li>
+<li><strong>"Different capability tiers for different purposes"</strong> — the system needs a <em>selection mechanism</em>: something has to decide, per request, which configured model actually handles it. This can be static (this endpoint always uses model X) or dynamic (a router inspects the request and chooses).</li>
+<li><strong>"Without coupling business logic to any single provider's SDK"</strong> — this is the non-negotiable constraint. If swapping or adding a model requires touching the service classes that contain your actual product logic, the abstraction has failed at its one job.</li>
+</ul>
+
+<p>
+Note what this problem statement deliberately does <em>not</em> claim to solve: it does not promise that every model will behave identically given identical input (they will not — this is explored in Section 5's edge cases), and it does not promise that switching a model is risk-free from a quality standpoint (prompts tuned for one model's quirks may need retuning for another, a topic that returns in the Best Practices and Common Mistakes sections). Multi-model support solves the <em>architectural</em> problem of being able to swap and combine models cheaply. It does not, by itself, solve the <em>evaluation</em> problem of knowing whether a swap improved or degraded quality — that discipline belongs to the Evaluation chapters later in this series.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Axes of Model Heterogeneity</h3>
+
+<p>
+Before you can design a multi-model system, you need a vocabulary for <em>why</em> models differ, because "just use a better model" is not an engineering decision — it is six or seven different decisions bundled together. Think of every model your application might call as a point in a multi-dimensional space:
+</p>
+
+<table>
+<tr><th>Axis</th><th>What Varies</th><th>Why It Matters Operationally</th></tr>
+<tr><td>Capability</td><td>Reasoning depth, instruction-following fidelity, coding/math ability</td><td>Determines whether a task can be trusted to this model at all</td></tr>
+<tr><td>Cost per token</td><td>Input and output token pricing, sometimes 10–50x apart between tiers</td><td>Directly drives per-request and monthly spend</td></tr>
+<tr><td>Latency / throughput</td><td>Time-to-first-token, tokens/second, especially under load</td><td>User-facing responsiveness; batch jobs vs. interactive chat have opposite tolerances</td></tr>
+<tr><td>Context window</td><td>Maximum tokens the model can accept as input</td><td>Determines whether a document or conversation history fits without truncation or chunking</td></tr>
+<tr><td>Modality</td><td>Text-only vs. vision, audio, or multi-modal input/output</td><td>Some tasks (reading a screenshot, transcribing audio) are impossible on a text-only model</td></tr>
+<tr><td>Feature surface</td><td>Native tool/function calling, structured output modes, streaming support</td><td>Determines what Chapter 59's tool-calling patterns and structured output actually work as expected</td></tr>
+<tr><td>Deployment locality</td><td>Hosted API vs. self-hosted/local (e.g., via Ollama) vs. private cloud (Bedrock, Vertex, Azure)</td><td>Drives data residency, compliance, and offline-availability decisions</td></tr>
+</table>
+
+<p>
+A "model" is not a single scalar of "how smart." It is a bundle of trade-offs across all seven axes above, and different tasks in your application have different requirements along each axis. A background batch-summarization job cares enormously about cost and context window and barely at all about latency. An interactive chat reply cares enormously about latency and barely at all about context window. Multi-model support exists precisely because no single point in this seven-dimensional space is optimal for every task your application performs.
+</p>
+
+<h3>4.2 The Mental Model: A Model Registry, Not a Model</h3>
+
+<p>
+The single biggest mindset shift this chapter asks for is this: stop thinking of "the LLM" as a singular dependency, the way you might think of "the database." Start thinking of it as a <strong>registry of interchangeable strategies</strong>, the same mental model you already use for, say, a payment system that must support multiple payment providers behind one <code>PaymentGateway</code> interface, selected per transaction based on currency, region, or fee structure. In that world, no single line of checkout logic ever says "call Stripe." It says "call the configured gateway for this transaction," and a separate, isolated piece of configuration or routing logic decides which concrete gateway that is. Multi-model support asks you to apply the exact same discipline to language models: no business logic ever says "call GPT" or "call Claude." It says "call the model configured — or selected — for this task," full stop.
+</p>
+
+<h3>4.3 Static Assignment vs. Dynamic Routing</h3>
+
+<p>
+There are two fundamentally different strategies for deciding which model handles a given request, and conflating them is a common source of over-engineering:
+</p>
+
+<ul>
+<li><strong>Static assignment</strong> — a given feature or endpoint is wired, at configuration time, to a specific model. The ticket-classification endpoint always uses the fast/cheap model; the drafting endpoint always uses the strong model. This is simple, predictable, cheap to reason about, and correct for the majority of real applications.</li>
+<li><strong>Dynamic routing</strong> — a router component inspects properties of the incoming request at runtime (estimated complexity, detected language, required modality, current provider health, even a first-pass classification by a small model) and chooses the target model per request. This is more powerful and more complex, and it introduces its own failure modes (a broken router silently sends everything to the wrong model) — it should be reached for only when static assignment genuinely cannot express the requirement.</li>
+</ul>
+
+<p>
+Both strategies are covered concretely in Sections 5, 8, and 9. The theoretical point to internalize now is that "multi-model support" is an umbrella term covering a spectrum from "three constant, named model beans" all the way to "a learned or rule-based router making a fresh decision per request" — and most production systems live much closer to the simple end of that spectrum than marketing materials for agentic frameworks would suggest.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through, mechanically, what happens from the moment a request enters a multi-model-aware application to the moment a response comes back, and what has to be true at each step for the abstraction to hold.
+</p>
+
+<h3>5.1 Step-by-Step Request Lifecycle</h3>
+
+<ol>
+<li><strong>Request arrives</strong> at a service method that needs a model-backed answer — say, "classify this support ticket" or "draft a reply."</li>
+<li><strong>Model selection happens</strong> — either implicitly, because this service was constructed with a specific model dependency injected at startup (static assignment), or explicitly, because a routing component evaluates the request and picks a target (dynamic routing). Either way, by this point, exactly one concrete model implementation has been chosen for this call.</li>
+<li><strong>The request is translated into the vendor-neutral shape</strong> — a list of messages (system/user/assistant roles), plus a set of portable options (temperature, max tokens, and so on) that the abstraction knows how to express in every supported provider's format.</li>
+<li><strong>The concrete implementation adapts the neutral request into the provider's wire format</strong> — this is where an OpenAI-backed implementation serializes the request into OpenAI's JSON schema and calls OpenAI's endpoint, while an Anthropic-backed implementation serializes the same logical request into Anthropic's schema and calls Anthropic's endpoint. Crucially, the calling code never sees this step — it operates purely against the neutral abstraction.</li>
+<li><strong>The provider responds</strong>, in its own format, with its own metadata (token usage fields, finish reasons, provider-specific extras).</li>
+<li><strong>The concrete implementation normalizes the response back into the vendor-neutral shape</strong> — a uniform response object exposing the generated content, usage metadata, and finish reason in a consistent way regardless of which provider produced it.</li>
+<li><strong>Calling code consumes the normalized response</strong>, unaware of which provider, or even which specific model version, actually produced it.</li>
+</ol>
+
+<h3>5.2 Where the Abstraction Leaks — And Why You Must Plan For It</h3>
+
+<p>
+A conscientious engineer should distrust any abstraction claiming to make heterogeneous providers <em>perfectly</em> interchangeable, because several real differences cannot be fully hidden without losing information you sometimes need:
+</p>
+
+<ul>
+<li><strong>Prompt sensitivity differs by model.</strong> The exact same system prompt and user message can produce meaningfully different quality, tone, or format across models, because each was trained (and instruction-tuned) differently. Swapping a model is not purely a plumbing change — it is a behavior change that needs re-validation, a theme returned to heavily in Best Practices and Common Mistakes.</li>
+<li><strong>Feature parity is not guaranteed.</strong> Native tool/function calling, JSON-mode structured output, vision input, and streaming are not uniformly supported, or are supported with different constraints (max number of tools, whether parallel tool calls are allowed, how strictly a JSON schema is enforced) across providers. An abstraction can expose a uniform <em>request</em> shape without guaranteeing uniform <em>behavior</em> underneath it.</li>
+<li><strong>Token accounting differs.</strong> Tokenization is model-specific — the same text costs a different number of tokens on different models, which affects both context-window budgeting and cost calculations and cannot be reasoned about with a single universal number.</li>
+<li><strong>Rate limits and error semantics differ.</strong> HTTP 429s, retry-after headers, and content-filtering rejections are shaped differently per provider, which matters directly for the fallback/circuit-breaker patterns covered in Section 8.</li>
+</ul>
+
+<p>
+The correct engineering response to these leaks is not to abandon the abstraction — it is to keep the abstraction for the 90% of logic that genuinely is common (message construction, basic options, response consumption) while deliberately, explicitly dropping down to provider-specific option types only at the narrow points where a real difference must be expressed. Spring AI's design, covered concretely in Section 9, supports exactly this: a portable options type for the common case, and provider-specific option types you opt into by name when you need them.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Multi-model support is primarily an architectural, not a mathematical, topic — but two lightweight quantitative models are genuinely useful for making routing and cost decisions defensible rather than intuition-based.
+</p>
+
+<h3>6.1 Cost as a Function of Routing Policy</h3>
+
+<p>
+For a given request classified into difficulty tier <code>t</code>, routed to model <code>m(t)</code>, the expected per-request cost is:
+</p>
+
+<pre>
+cost(request) = tokens_in  × price_in(m(t))
+              + tokens_out × price_out(m(t))
+</pre>
+
+<p>
+Summed and averaged across a representative traffic mix, this becomes the single most persuasive number in any conversation about introducing tiered routing: if 80% of requests are simple classification tasks that a cheap model handles at near-identical quality to an expensive one, routing that 80% away from the expensive model can cut blended cost dramatically without materially changing the aggregate user-facing quality — because the 20% of genuinely hard requests still get the strong model. This is the same reasoning behind tiered compute pricing and cache-hit-ratio economics you already apply elsewhere in backend engineering; only the units (tokens instead of CPU-seconds) are new.
+</p>
+
+<h3>6.2 Fallback Availability as Combined Reliability</h3>
+
+<p>
+If a primary model has independent availability (uptime probability) <code>p</code>, and a fallback model with independent availability <code>q</code> is invoked whenever the primary fails, the probability that a request is served by <em>either</em> model successfully is:
+</p>
+
+<pre>
+P(served) = 1 − (1 − p)(1 − q)
+</pre>
+
+<p>
+This is the standard reliability-of-redundant-systems formula you already know from distributed systems, and it is the quantitative justification for the fallback-chain pattern in Section 8: two independently-operated providers, each with 99.5% availability, combine (assuming true independence, which real-world correlated outages only approximate) to a theoretical availability closer to 99.9975% — a meaningful reliability gain purchased simply by having a second, independent model configured and ready.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Abstraction Boundary — Business Logic to Provider</h3>
+
+<pre>
+┌───────────────────────────────────────────────────────────────────┐
+│                        Business Logic Layer                          │
+│   TicketTriageService, ReplyDraftingService, SummaryService, ...     │
+│   — never imports an OpenAI/Anthropic/Bedrock class directly —       │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                ▼
+                 ┌──────────────────────────────┐
+                 │   ChatClient  (per model)      │
+                 │   fluent request builder       │
+                 └───────────────┬────────────────┘
+                                ▼
+                 ┌──────────────────────────────┐
+                 │   ChatModel  (interface)       │   ◄── the seam:
+                 │   prompt() → ChatResponse       │       ONE contract,
+                 └───────────────┬────────────────┘      MANY backers
+             ┌────────────────────┼────────────────────┐
+             ▼                    ▼                    ▼
+   ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+   │ OpenAiChatModel    │ │ AnthropicChatModel │ │ OllamaChatModel    │
+   │ (adapts to OpenAI's │ │ (adapts to          │ │ (adapts to a        │
+   │  wire format)       │ │  Anthropic's format)│ │  local runtime)     │
+   └──────────────────┘ └──────────────────┘ └──────────────────┘
+             │                    │                    │
+             ▼                    ▼                    ▼
+      OpenAI API            Anthropic API         Local Ollama server
+</pre>
+
+<h3>7.2 Static Assignment vs. Dynamic Routing — Decision Flow</h3>
+
+<pre>
+ STATIC ASSIGNMENT                          DYNAMIC ROUTING
+ ──────────────────                         ────────────────
+
+ TicketTriageService                        IncomingRequest
+        │                                          │
+        │  (constructor-injected                    ▼
+        │   with @Qualifier("fastModel"))    ┌───────────────────┐
+        ▼                                    │  Router / Classifier │
+ ChatClient(fastModel)                        │  - task type?        │
+        │                                    │  - complexity score?  │
+        ▼                                    │  - provider healthy?  │
+     Response                                └─────────┬───────────┘
+                                                         │
+                                     ┌───────────────────┼───────────────────┐
+                                     ▼                   ▼                   ▼
+                             ChatClient(cheap)   ChatClient(strong)  ChatClient(fallback)
+                                     │                   │                   │
+                                     ▼                   ▼                   ▼
+                                  Response            Response            Response
+
+ Simple, predictable,                        Powerful, but the router itself
+ zero routing logic to debug.                becomes a component you must test,
+                                              monitor, and keep from silently
+                                              misrouting traffic.
+</pre>
+
+<p class="followup">
+The second diagram's right-hand side is exactly where the fallback chains discussed in Section 8 live: "provider healthy?" is not a one-time configuration check, it is a live, per-request (or per-window) decision informed by recent error rates and circuit-breaker state.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a real deployed system, multi-model support is rarely just "two beans in a Spring context." It typically grows into a small set of cooperating responsibilities, each independently testable:
+</p>
+
+<pre>
+                     ┌───────────────────────────────────────┐
+                     │           Spring Boot Application        │
+                     └───────────────────┬─────────────────────┘
+                                        ▼
+        ┌───────────────────────────────────────────────────────────┐
+        │                      Model Router / Selector                  │
+        │  - static config (per-feature model bean names)               │
+        │  - OR dynamic rules (task type, size, region, cost budget)    │
+        └───────┬───────────────────────┬──────────────────┬───────────┘
+                ▼                       ▼                  ▼
+      ┌──────────────────┐   ┌───────────────────┐  ┌────────────────┐
+      │  Fast/Cheap Tier    │   │   Strong/Frontier   │  │  Local/Fallback  │
+      │  (classification,    │   │   Tier (drafting,   │  │  Tier (Ollama,   │
+      │   short extraction)  │   │   complex reasoning)│  │   on outage)     │
+      └────────┬─────────┘   └─────────┬─────────┘  └────────┬────────┘
+               ▼                       ▼                      ▼
+      ┌────────────────────────────────────────────────────────────────┐
+      │      Resilience Layer — per model: timeout, retry, circuit       │
+      │      breaker, rate-limit backoff (Resilience4j / Spring Retry)   │
+      └────────────────────────────────┬─────────────────────────────────┘
+                                       ▼
+      ┌────────────────────────────────────────────────────────────────┐
+      │   Observability — per-model latency, token usage, cost, error    │
+      │   rate, exported as metrics/traces (Micrometer, OpenTelemetry)   │
+      └────────────────────────────────────────────────────────────────┘
+</pre>
+
+<p>
+Two production concerns deserve explicit callouts because they are easy to underestimate:
+</p>
+
+<ul>
+<li><strong>Independent failure domains matter more than raw capability when choosing a fallback model.</strong> A fallback hosted by the same underlying provider as your primary is not a real hedge against that provider's regional outage; a genuinely resilient fallback chain deliberately spans providers, or includes a locally-hosted model (via Ollama) that has zero dependency on any external network call at all.</li>
+<li><strong>Per-model observability is not optional once more than one model is in play.</strong> Aggregate latency and cost dashboards hide which model is actually driving a regression; you need latency, error rate, token usage, and cost broken out by model identity from day one, or a slow/expensive model silently degrades the whole system while looking invisible in an aggregate chart.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+This is where the theory becomes code. Spring AI's core abstraction for chat-style interaction is the <code>ChatModel</code> interface, and every supported provider ships a starter that auto-configures a concrete <code>ChatModel</code> bean (<code>OpenAiChatModel</code>, <code>AnthropicChatModel</code>, <code>OllamaChatModel</code>, <code>VertexAiGeminiChatModel</code>, <code>BedrockProxyChatModel</code>, <code>MistralAiChatModel</code>, and others). The fluent, higher-level <code>ChatClient</code> is built on top of a specific <code>ChatModel</code> via <code>ChatClient.builder(chatModel)</code>, and it is the type your service classes should actually depend on.
+</p>
+
+<h3>9.1 Registering Multiple Models Side by Side</h3>
+
+<p>
+When more than one provider starter is on the classpath, or when you need two differently-configured instances of the same provider (for example, one tuned for short/cheap completions and one for long/expensive ones), you disable a single auto-configured bean and define named beans explicitly, then disambiguate injection points with <code>@Qualifier</code>:
+</p>
+
+<pre>
+@Configuration
+public class ModelConfig {
+
+    @Bean
+    @Primary
+    public ChatClient fastChatClient(OpenAiChatModel openAiChatModel) {
+        // Cheap, low-latency tier — classification, extraction, routing decisions
+        return ChatClient.builder(openAiChatModel)
+                .defaultOptions(OpenAiChatOptions.builder()
+                        .model("gpt-4o-mini")
+                        .temperature(0.0)
+                        .maxTokens(256)
+                        .build())
+                .build();
+    }
+
+    @Bean
+    public ChatClient strongChatClient(AnthropicChatModel anthropicChatModel) {
+        // High-capability tier — drafting, complex reasoning, customer-facing text
+        return ChatClient.builder(anthropicChatModel)
+                .defaultOptions(AnthropicChatOptions.builder()
+                        .model("claude-opus-4")
+                        .temperature(0.4)
+                        .maxTokens(2048)
+                        .build())
+                .build();
+    }
+
+    @Bean
+    public ChatClient localFallbackChatClient(OllamaChatModel ollamaChatModel) {
+        // Zero-external-dependency fallback for provider outages
+        return ChatClient.builder(ollamaChatModel).build();
+    }
+}
+</pre>
+
+<p>
+Business logic then depends only on the <code>ChatClient</code> type, disambiguated by qualifier or by constructor parameter name matching the bean name — never on a provider-specific class:
+</p>
+
+<pre>
+@Service
+public class TicketTriageService {
+
+    private final ChatClient fastChatClient;
+
+    public TicketTriageService(@Qualifier("fastChatClient") ChatClient fastChatClient) {
+        this.fastChatClient = fastChatClient;
+    }
+
+    public Urgency classify(String ticketBody) {
+        String result = fastChatClient.prompt()
+                .user(u -> u.text("Classify urgency as LOW, MEDIUM, or HIGH:\n{ticket}")
+                             .param("ticket", ticketBody))
+                .call()
+                .content();
+        return Urgency.valueOf(result.trim());
+    }
+}
+</pre>
+
+<h3>9.2 A Minimal Router for Dynamic Selection</h3>
+
+<p>
+When static wiring is not enough — for example, choosing a model based on a runtime cost budget or a feature flag — a small router service centralizes the decision instead of scattering <code>if</code> statements across every caller:
+</p>
+
+<pre>
+@Service
+public class ModelRouter {
+
+    private final Map&lt;String, ChatClient&gt; clientsByTier;
+
+    public ModelRouter(Map&lt;String, ChatClient&gt; clientsByTier) {
+        this.clientsByTier = clientsByTier; // Spring injects a Map keyed by bean name
+    }
+
+    public ChatClient select(TaskProfile profile) {
+        if (profile.requiresLongContext() || profile.estimatedDifficulty() == Difficulty.HIGH) {
+            return clientsByTier.get("strongChatClient");
+        }
+        return clientsByTier.get("fastChatClient");
+    }
+}
+</pre>
+
+<p>
+Two Spring AI details worth internalizing: first, <code>ChatOptions</code> is the portable, provider-agnostic option type (temperature, model name, max tokens) accepted by <code>ChatClient</code>, while <code>OpenAiChatOptions</code>, <code>AnthropicChatOptions</code>, and their siblings extend it to expose provider-specific extras — reach for the specific type only when you genuinely need a feature the portable type does not expose, exactly as Section 5.2 warned. Second, streaming works uniformly across models through the same <code>ChatClient</code> API — calling <code>.stream()</code> instead of <code>.call()</code> returns a <code>Flux&lt;String&gt;</code> (or <code>Flux&lt;ChatResponse&gt;</code> for the full response object) regardless of which concrete model is behind the client, which is exactly the kind of uniformity the abstraction exists to provide.
+</p>
+
+<h3>9.3 Configuration-Driven Model Identity</h3>
+
+<p>
+Provider credentials and default model identifiers belong in externalized configuration, never in code, so that swapping a model version is a deployment/configuration change rather than a recompile:
+</p>
+
+<pre>
+spring:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o-mini
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY}
+      chat:
+        options:
+          model: claude-opus-4
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        options:
+          model: llama3.1
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Depend on <code>ChatClient</code>/<code>ChatModel</code>, never on a provider-specific class, anywhere in business logic.</strong> Treat any import of <code>OpenAiChatModel</code> outside of a <code>@Configuration</code> class as a code-review flag.</li>
+<li><strong>Name beans and qualifiers by role, not by vendor.</strong> Prefer <code>fastChatClient</code>/<code>strongChatClient</code> over <code>openAiClient</code>/<code>anthropicClient</code> — the role survives a future provider swap, the vendor name does not.</li>
+<li><strong>Re-validate prompts whenever you change the model behind a role.</strong> A prompt tuned against one model's instruction-following style is not guaranteed to transfer; treat a model swap as a behavior change requiring the evaluation techniques covered later in this series, not a transparent infrastructure change.</li>
+<li><strong>Build fallback chains across independent failure domains.</strong> A fallback on the same provider as your primary does not protect you from that provider's own outage; prefer a genuinely independent provider or a self-hosted model for the fallback tier.</li>
+<li><strong>Track cost and latency per model identity from the start.</strong> Retrofit-adding per-model observability after a cost overrun is far more painful than building it in alongside the router itself.</li>
+<li><strong>Keep the routing decision itself simple and testable.</strong> A router is ordinary business logic — write unit tests asserting "this task profile routes to this tier" the same way you would test any other conditional dispatch code.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Assuming feature parity across providers.</strong> Tool-calling formats, structured-output strictness, and maximum tool counts differ; code that works flawlessly against one provider can silently misbehave against another if this assumption goes unchecked.</li>
+<li><strong>Treating a model swap as a zero-risk infrastructure change.</strong> Swapping the model behind a role changes real product behavior — tone, format adherence, hallucination rate — and shipping a swap without re-running your evaluation suite (Volume 3/5) is a quality regression waiting to happen.</li>
+<li><strong>Building an elaborate dynamic router before static assignment has been tried and found insufficient.</strong> Most applications need two or three named, statically-wired tiers, not a learned classifier deciding per request — added complexity should be justified by a concrete requirement, not built speculatively.</li>
+<li><strong>Letting provider-specific option types leak into shared business logic.</strong> Constructing an <code>OpenAiChatOptions</code> object deep inside a generic service method defeats the entire purpose of the abstraction the moment that service needs to support a second provider.</li>
+<li><strong>Ignoring token-accounting differences when budgeting context.</strong> A prompt that safely fits one model's context window can silently overflow another's, because tokenization is model-specific, not universal.</li>
+<li><strong>Hardcoding a single fallback that shares infrastructure with the primary.</strong> Falling back from one hosted endpoint of a provider to another hosted endpoint of the <em>same</em> provider often fails simultaneously during that provider's incidents.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Multi-model support is, in large part, a performance and cost optimization technique disguised as an architectural pattern, so its performance implications deserve direct treatment:
+</p>
+
+<ul>
+<li><strong>Latency floors differ by tier.</strong> A fast/cheap model can often respond in a fraction of the time a frontier model needs for the same prompt length, purely due to model size and provider infrastructure — routing latency-sensitive interactive paths to the fast tier is frequently the single highest-leverage latency optimization available, cheaper than any amount of prompt or infrastructure tuning on a slower model.</li>
+<li><strong>Blended cost drops sharply with tiered routing.</strong> As shown quantitatively in Section 6.1, routing the majority of "easy" traffic to a cheap tier while reserving an expensive tier for genuinely hard requests can cut aggregate spend substantially without a proportional quality loss — provided the routing/classification step itself is cheap and reliable.</li>
+<li><strong>Local models trade latency variance for infrastructure cost.</strong> A self-hosted model (via Ollama or similar) removes network round-trip and third-party rate-limit variance but shifts cost to compute infrastructure you must provision and scale yourself — appropriate for fallback tiers or for workloads with strict data-locality requirements, less often appropriate as a primary tier for capability-sensitive tasks.</li>
+<li><strong>Context-window mismatches cause hidden truncation costs.</strong> Routing a long-context task to a model with a smaller window forces chunking or summarization strategies (Volume 3) that add their own latency and cost — factor context-window size into routing decisions, not just raw capability.</li>
+<li><strong>Streaming behavior should be tested per model, not assumed uniform.</strong> Time-to-first-token and chunk granularity during streaming can differ meaningfully between providers even when both expose the same <code>Flux</code>-based streaming API in Spring AI, which matters directly for perceived responsiveness in chat UIs.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Multi-model support does not introduce a fundamentally new attack surface the way tool calling does, but it does multiply an existing one: every additional provider configured in your application is an additional destination that receives some slice of your users' data, under that provider's own data-handling, retention, and jurisdictional terms. A routing decision that sends a request containing sensitive customer data to a self-hosted fallback model is a very different compliance posture than sending that same data to a third-party hosted API, and a router built purely for latency/cost reasons can accidentally make that choice with no awareness of the difference. Two concrete practices matter:
+</p>
+
+<ul>
+<li><strong>Treat data sensitivity as a routing input, not an afterthought.</strong> If certain data classes must never leave your infrastructure, the router (or the static wiring) must guarantee those requests are only ever eligible for locally-hosted or contractually-compliant models — this constraint should be enforced structurally, not left to convention.</li>
+<li><strong>Apply guardrails uniformly across every configured model, not just the primary.</strong> It is easy to invest heavily in input validation, prompt-injection defenses, and output filtering around your primary model and forget that a fallback tier, invoked rarely and therefore under-tested, receives the exact same untrusted input and needs the exact same protections (Volume 5 covers this discipline in full).</li>
+</ul>
+
+<p>
+Beyond those two points, this chapter's security surface is genuinely limited — the deeper concerns (prompt injection, credential handling for tool calls, data exfiltration via tool outputs) belong to the Tool Calling chapter you have already completed and the Guardrails chapters still ahead, and multi-model support mainly changes their scope from "one model to defend" to "every configured model to defend identically."
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. Why shouldn't business logic in a Spring AI application import a provider-specific class like <code>OpenAiChatModel</code> directly?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Because doing so couples business logic to one vendor's SDK, defeating the purpose of Spring AI's <code>ChatModel</code>/<code>ChatClient</code> abstraction. If the provider needs to change — for cost, outage, or capability reasons — every place that imported the concrete class must be found and rewritten, instead of a single configuration or bean-wiring change.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. What is the practical difference between <code>ChatModel</code> and <code>ChatClient</code> in Spring AI?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><code>ChatModel</code> is the low-level, vendor-neutral interface that concrete provider implementations satisfy. <code>ChatClient</code> is the higher-level, fluent API built on top of a <code>ChatModel</code> that application code typically depends on directly, offering a builder-style interface for constructing prompts, attaching advisors, and consuming responses.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. How would you configure a Spring Boot application to use two different models — a cheap one for classification and a strong one for drafting — without duplicating configuration logic across services?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Define two named <code>ChatClient</code> beans in a <code>@Configuration</code> class, each built from a different provider's <code>ChatModel</code> (or the same provider with different default options), and inject the appropriate one into each service using <code>@Qualifier</code> matched to the bean name. Business logic depends only on the injected <code>ChatClient</code>, unaware of which provider or model version backs it.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. What real differences between model providers can an abstraction like <code>ChatModel</code> not fully hide, and why does that matter?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Prompt sensitivity (the same prompt behaves differently across models), feature parity (tool calling, structured output, and vision support differ), tokenization (the same text costs different token counts per model), and rate-limit/error semantics all differ genuinely between providers. This matters because it means swapping a model behind the abstraction is not risk-free — it requires re-validating quality and re-checking any provider-specific option usage, not just a configuration change.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Design a fallback strategy for a customer-facing chat feature so that a primary model provider outage does not take down the feature. What would make your fallback genuinely resilient rather than a false sense of safety?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Wrap the primary model call in a circuit breaker (e.g., Resilience4j) with sensible timeout and error-rate thresholds, and configure a fallback <code>ChatClient</code> to invoke when the breaker opens. The fallback must sit in an independent failure domain from the primary — a different provider entirely, or a self-hosted model via Ollama — because a fallback hosted by the same provider as the primary will often fail simultaneously during that provider's own incidents, which is a false sense of safety rather than real resilience. Additionally, the fallback tier needs the same input validation and guardrails as the primary, since it receives identical untrusted input but is exercised far less often and is therefore easier to under-test.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly invoke the reliability-of-redundant-systems math — P(served) = 1 − (1−p)(1−q) — and note it only holds under an <em>independence</em> assumption between the two providers' failure modes; correlated outages (e.g., both depending on the same underlying cloud region) break the formula and the safety it implies. Naming this assumption out loud is exactly the kind of rigor that separates senior from mid-level answers.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. A team wants to build a dynamic router that classifies every incoming request and picks a model per request. What are the risks of this approach compared to static, per-feature model assignment, and when is it actually justified?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Risks: the router itself becomes an untested, unmonitored point of failure — a bug in the classifier can silently misroute traffic to the wrong tier with no obvious error, the classification step adds its own latency and cost, and debugging becomes harder because "which model handled this request" is no longer visible from the code path alone. It is justified when task difficulty genuinely varies unpredictably within a single feature (not across features, which static assignment already handles cleanly), and when the cost or quality gain from correct routing measurably outweighs the added complexity and the router's own error rate — this should be demonstrated with data, not assumed, before building it.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. As a platform lead, how would you justify to leadership the engineering investment in a proper multi-model abstraction layer, versus just calling one provider's SDK directly and dealing with a migration later if needed?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Frame it in terms of optionality under a fast-moving market: the foundation-model layer is the most commoditized and quickest-changing part of the stack — pricing, capability leadership, and even provider viability shift on a timescale of months, not years. An abstraction layer converts what would otherwise be a large, risky, all-at-once migration (rewriting every call site when a provider becomes too expensive, gets deprecated, or has a prolonged outage) into a small, incremental configuration or bean-wiring change. The upfront cost is modest — a handful of configuration classes and a discipline of depending on interfaces, not vendor SDKs — while the avoided cost is a full-team, high-risk rewrite under time pressure at the worst possible moment (mid-outage or mid-price-hike). This is the same argument that justified <code>DataSource</code> over vendor-specific JDBC calls, and it has already played out historically in this exact codebase pattern.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How should per-model cost and latency observability change the way a platform team reasons about adding a new, more capable model to production?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Without per-model observability, "add the new stronger model" is a blind, all-or-nothing decision made on vendor benchmarks alone. With it, a platform team can run the new model on a small, real traffic slice, compare its cost, latency, and (via the evaluation harnesses covered later in this series) quality directly against the existing tier it would replace or augment, and make a data-driven call about which specific task categories genuinely benefit from the upgrade versus which are already well served by the cheaper tier. This turns "adopt a new frontier model" from a wholesale replacement decision into an incremental, per-role, evidence-based rollout — the same discipline used for canary deployments and feature flags elsewhere in the stack, applied to model selection.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Using the seven axes of model heterogeneity from Section 4.1, describe a single application feature (real or hypothetical) and identify which two or three axes actually matter for it, explaining why the others are close to irrelevant for that specific feature.</li>
+<li>Explain, using the reliability formula from Section 6.2, why a fallback model hosted by the same provider as your primary model provides a weaker resilience guarantee than the formula's face value suggests. What assumption does the formula make that a same-provider fallback violates?</li>
+<li>A colleague proposes building a dynamic, per-request routing classifier for a brand-new feature with only two distinct task types before any production traffic has been observed. Argue for or against building the router immediately, using the trade-offs discussed in Section 4.3 and Common Mistakes.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Sketch (in the ASCII style of Section 7) a Spring configuration exposing three named <code>ChatClient</code> beans — a fast tier, a strong tier, and a local fallback — and one service class that depends on exactly one of them via <code>@Qualifier</code>. Identify precisely which lines would need to change if the strong tier's underlying provider were swapped for a different one.</li>
+<li>Pick any two publicly available chat models from different providers. Send each the identical prompt for a moderately complex task (e.g., summarizing a paragraph into three bullet points with a strict word limit). Compare the two outputs for format adherence and tone, and write two sentences connecting any difference you observe to Section 5.2's discussion of prompt sensitivity across models.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Multi-model support exists because no single model is optimal across cost, latency, capability, context window, modality, feature surface, and deployment locality simultaneously — different tasks in the same application need different points in that trade-off space.</li>
+<li>Spring AI solves this the way Spring has always solved vendor heterogeneity: a stable interface (<code>ChatModel</code>, consumed through <code>ChatClient</code>) with pluggable, provider-specific implementations behind it — directly analogous to <code>DataSource</code> abstracting JDBC drivers.</li>
+<li>Model selection can be static (per-feature, constructor-injected via <code>@Qualifier</code>) or dynamic (a router evaluating request properties at runtime); static assignment should be the default, with dynamic routing reserved for demonstrated, data-backed need.</li>
+<li>The abstraction is powerful but not perfect — prompt sensitivity, feature parity, tokenization, and error semantics genuinely differ across providers, so a model swap is a behavior change requiring re-validation, not a risk-free infrastructure change.</li>
+<li>Resilient fallback chains require independent failure domains — a same-provider fallback does not protect against that provider's own outage — and every configured model needs the same guardrails and observability as the primary, not just the one used most often.</li>
+<li>Tiered routing is simultaneously an architecture pattern and a direct cost/latency optimization: matching cheap, fast models to easy tasks and reserving expensive, capable models for hard ones is often the single highest-leverage lever available in a production AI system.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> having built the ability to route intelligently across many models, the next step is standardizing how those models — and the agents built on top of them — discover and use external tools, context, and resources consistently. MCP Integration (Chapter 61) introduces the Model Context Protocol as a portable, vendor-neutral way to expose tools and data sources to any model your application routes to, extending the same "don't couple to one vendor's shape" discipline this chapter applied to models onto the tools and context those models consume.
+</p>
+
+</div>
+
+</body>
+</html>

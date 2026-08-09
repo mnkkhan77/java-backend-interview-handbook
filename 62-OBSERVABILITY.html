@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>62-OBSERVABILITY.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 62 — OBSERVABILITY</h1>
+
+<p class="roi">Volume 2 — Spring AI · Chapter 13 of 15</p>
+
+<div class="callout">
+The MCP Integration chapter gave your application the ability to reach out — through a standard protocol — to tools, resources, and other agents it does not own. That is a strict increase in the number of moving parts between a user's question and a final answer: a model call, a tool discovery round trip, one or more remote tool invocations, and a synthesis step, potentially chained across several MCP servers you do not control. The moment you have that many hops, "it worked in my local test" stops being useful information, because you cannot know <em>which</em> hop was slow, wrong, expensive, or silently degraded without instrumenting the system to tell you. Observability is the discipline that turns "the agent gave a bad answer" from a mystery into a five-minute investigation.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every earlier chapter in this volume has been about making your Spring Boot application <em>do</em> more with AI — call a model, hold a conversation, retrieve context, call tools, talk to MCP servers. This chapter is about something different and, for anyone who intends to run this in production, more important: knowing <em>what actually happened</em> after it happened. Traditional backend observability was built around a comfortable assumption you have relied on for years — a request either succeeds or throws, and when it throws, a stack trace tells you exactly which line of code is at fault. AI-infused systems break that assumption in a specific, uncomfortable way: the most expensive, most damaging failures are the ones that return HTTP 200 with a perfectly well-formed, confident, wrong answer.
+</p>
+
+<p>
+Concretely, once your application is calling a foundation model, you now have a component whose behavior can drift across model provider updates you did not request, whose cost varies token-by-token with every user's phrasing, whose latency is dominated by a network call to infrastructure you don't operate, and whose correctness cannot be checked with a simple equality assertion. If you cannot answer, for any given production request, questions like "which model version answered this," "how many tokens did this cost," "how long did the retrieval step take versus the generation step," "did a tool call fail and get silently retried," and "is this week's average response quality worse than last week's" — you are not running an AI system, you are running a black box with a Spring Boot label on it. Observability is what converts the box back into an inspectable system.
+</p>
+
+<p>
+There is a second, more strategic reason this chapter sits here, right before Testing (Chapter 63) and the closing chapters of this volume. Testing an LLM-backed feature with pre-production test suites alone was already shown, in earlier chapters, to be necessary but insufficient — the space of real user inputs is larger than any test suite you will write. Observability is the mechanism that closes that gap: it is testing that never stops, running continuously against real traffic, catching the failure modes your test suite never imagined because it is watching the actual distribution of what users say, not the distribution you guessed at design time.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 From Log Files to the Three Pillars</h3>
+
+<p>
+Backend observability did not arrive fully formed. Early systems had exactly one tool: the log file, grepped by hand after something broke. As systems grew distributed, this stopped scaling — a single user request might touch a dozen services, and no single log file contained the whole story. The industry converged, over roughly two decades, on what became known as the <strong>three pillars of observability</strong>: <strong>logs</strong> (discrete, timestamped events, good for "what exactly happened at this moment"), <strong>metrics</strong> (aggregated numeric time series, good for "how is the system behaving on average, right now, and is it trending"), and <strong>traces</strong> (the causal chain of spans showing how a single request propagated across services, good for "where did the time and the failure actually happen inside this one request"). Tools like Prometheus (metrics), the ELK stack (logs), and Zipkin/Jaeger (traces) each grew up to serve one pillar, and Micrometer emerged in the Java ecosystem specifically to give Spring Boot applications a single, vendor-neutral instrumentation API that could export to any of these backends.
+</p>
+
+<h3>2.2 OpenTelemetry: One Instrumentation Standard</h3>
+
+<p>
+The next major shift was consolidation. Each observability vendor originally shipped its own proprietary instrumentation agent, which meant switching vendors meant re-instrumenting your entire codebase. <strong>OpenTelemetry (OTel)</strong>, formed by merging two earlier projects (OpenTracing and OpenCensus), became the industry-standard, vendor-neutral specification and SDK for producing traces, metrics, and logs, with a well-defined wire protocol (OTLP) that any backend can ingest. Spring's own observability story — Micrometer for metrics and Micrometer Tracing for distributed traces — is designed to bridge cleanly into OpenTelemetry, so a Spring Boot application can be instrumented once and shipped to Prometheus, Grafana, Zipkin, Jaeger, Datadog, or any OTLP-compatible backend without touching business code.
+</p>
+
+<h3>2.3 The Missing Fourth Pillar: LLM-Specific Observability</h3>
+
+<p>
+None of the three pillars above were designed with "a single request can cost a variable amount of money depending on how many tokens the model decided to generate" in mind, nor with "the same input can legitimately produce a different output on every call" in mind. As LLM-backed applications went into production starting around 2022–2023, teams discovered that standard APM dashboards — request count, latency, error rate — were necessary but silent on the questions that actually mattered for AI features: token consumption and cost per request, prompt and completion content for debugging quality regressions, which retrieved documents fed into a given answer, and whether a chain of tool calls terminated correctly or looped. This gap produced a new category of purpose-built tooling (LangSmith, Langfuse, Traceloop/OpenLLMetry, Arize Phoenix, among others) built specifically to capture prompts, completions, token usage, and evaluation scores as first-class observability data — and it produced a standardization effort inside OpenTelemetry itself: the <strong>GenAI semantic conventions</strong>, a set of standard span and attribute names (prefixed <code>gen_ai.*</code>) so that "which model," "how many input tokens," and "how many output tokens" are captured the same way regardless of vendor. Spring AI's own observability support, covered in depth later in this chapter, is built directly on top of this convention.
+</p>
+
+<table>
+<tr><th>Era</th><th>What Was Observed</th><th>Representative Tooling</th></tr>
+<tr><td>Log files</td><td>Discrete events, manually grepped</td><td>Flat files, <code>syslog</code></td></tr>
+<tr><td>Three pillars</td><td>Logs + metrics + traces, per-service</td><td>ELK, Prometheus/Grafana, Zipkin/Jaeger</td></tr>
+<tr><td>Unified instrumentation</td><td>Vendor-neutral traces/metrics/logs, one SDK</td><td>OpenTelemetry, Micrometer + Micrometer Tracing</td></tr>
+<tr><td>LLM / GenAI observability</td><td>Prompts, completions, tokens, cost, tool calls, quality scores</td><td>Spring AI Observation API, GenAI semantic conventions, LangSmith, Langfuse</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you as an engineer:</strong> Spring AI did not invent a parallel observability universe for AI. It deliberately plugged its instrumentation into the same Micrometer Observation API that already powers Spring Boot Actuator's metrics and traces for your database calls, your HTTP clients, and your message queues. This means an AI-specific request shows up in the exact same Grafana dashboard, the exact same trace waterfall in Zipkin, and the exact same alerting pipeline as everything else your platform team already operates — you are extending existing infrastructure, not standing up a second one.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Given a production system whose core component (a foundation model call) is non-deterministic, has variable and non-trivial per-request cost, and can fail silently by returning a plausible-but-wrong answer — instrument that system so that engineers can, after the fact and in real time, reconstruct exactly what happened, how much it cost, how long each stage took, and whether the output was trustworthy, without re-running the request.</strong>
+</div>
+
+<p>
+Unpack the constraints in that statement, because each one rules out an approach that would work fine for ordinary CRUD services. "Non-deterministic" means you cannot debug by simply re-running the same request in a debugger and expecting the same trace — you must capture enough context <em>at the time of the original call</em> that you never need to reproduce it. "Variable, non-trivial per-request cost" means cost itself becomes a first-class metric you must track per request, per user, and per feature, the same way you would track latency — this did not exist as a concern for a typical REST endpoint. "Fails silently with a plausible-but-wrong answer" means your instrumentation cannot rely purely on exceptions and HTTP status codes as the failure signal; you need to capture the actual prompt and response content (subject to the privacy constraints covered in Section 13) so a human, or an automated evaluator, can judge quality after the fact.
+</p>
+
+<p>
+There is a second, structural half of this problem that is easy to under-scope: a real AI feature, as built across this volume, is a <em>pipeline</em> — retrieval, prompt construction, advisor chain, the model call itself, possibly one or more tool invocations, and response post-processing. Observability must attribute latency and cost to the correct <em>stage</em> of that pipeline, not just to the endpoint as a whole, or you will be staring at "this request took 4 seconds" with no way to tell whether 3.8 of those seconds were the vector search, the model, or a flaky downstream tool.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Three Pillars, Refreshed for This Domain</h3>
+
+<p>
+You already know logs, metrics, and traces conceptually from ordinary backend work — the theory does not change, only the payload does.
+</p>
+
+<ul>
+<li><strong>Logs</strong> in an AI context capture discrete events with rich, often large payloads: the exact prompt sent, the exact completion received, which advisor modified the request, which tool was invoked with what arguments. Spring AI's <code>SimpleLoggerAdvisor</code> exists specifically to produce this kind of log entry for every <code>ChatClient</code> call.</li>
+<li><strong>Metrics</strong> capture numeric time series you aggregate and alert on: request count, latency percentiles, token counts (prompt and completion, tracked separately because they are priced and behave differently), error rate, and cost. These are cheap to store and query at high volume precisely because they are aggregated — you lose the individual request's content, in exchange for being able to ask "is p95 latency degrading this week" cheaply across millions of requests.</li>
+<li><strong>Traces</strong> capture the causal, hierarchical shape of a single request as a tree of <strong>spans</strong> — one span for the incoming HTTP request, a child span for retrieval, a child span for the model call, a child span for each tool invocation. A trace answers "where, inside this one specific slow or failed request, did the time actually go," which no amount of aggregated metrics can answer on its own.</li>
+</ul>
+
+<h3>4.2 The Fourth Pillar: Evaluation Signal</h3>
+
+<p>
+An AI-specific addition sits alongside the three classical pillars: <strong>quality/evaluation telemetry</strong> — a numeric or categorical signal representing "was this response good," produced either by an automated judge (an LLM-as-judge pattern, covered in depth in the Evaluation chapters of this series), a heuristic (did the response contain a refusal, did structured output parse successfully), or explicit user feedback (a thumbs up/down button). This is not optional polish; without it, your logs and traces can tell you the system was <em>fast and cheap</em> while it was quietly producing wrong answers, because "fast, cheap, and 200 OK" says nothing about correctness. Mature AI observability platforms treat this evaluation signal as a metric you can slice by model version, prompt version, or retrieval configuration — the same way you would slice error rate by deployment version in ordinary APM.
+</p>
+
+<h3>4.3 Spans, Traces, and Context Propagation — Mental Model</h3>
+
+<p>
+A <strong>span</strong> is a single named, timed unit of work with a start time, an end time, a set of key-value attributes ("tags"), and a parent-child relationship to other spans. A <strong>trace</strong> is simply the full tree of spans that share one root — the entire life of one incoming request, end to end, across every internal hop. The mechanism that makes this tree assembleable after the fact, even across network calls to other services, is <strong>context propagation</strong>: a trace ID and the current span ID are carried along — inside the current thread via a context object, and across process boundaries via HTTP headers (typically the <code>traceparent</code> header defined by the W3C Trace Context standard) — so that a span created deep inside a tool call, in a different service, still knows which trace it belongs to and which span is its parent. Micrometer Tracing and OpenTelemetry both implement this propagation automatically for common transports (Spring's <code>RestClient</code>/<code>WebClient</code>, message brokers, and so on), which is precisely why Spring AI's instrumentation "just works" as part of an existing trace rather than starting an unconnected trace of its own.
+</p>
+
+<h3>4.4 Cardinality — the Concept That Will Bite You If You Skip It</h3>
+
+<p>
+<strong>Cardinality</strong> is the number of distinct values a given tag/attribute can take. A tag like <code>http.status</code> has low cardinality (a handful of values); a tag like <code>user.id</code> or, critically for this chapter, <code>the full prompt text</code>, has effectively unbounded cardinality. Metrics backends like Prometheus create a new, separately-stored time series for every unique combination of tag values, so attaching a high-cardinality value (a full prompt, a user ID, a session ID) as a <em>metric</em> tag can silently multiply your storage and query cost by orders of magnitude or crash your metrics backend outright — this single concept explains why Spring AI's Observation API deliberately separates <strong>low-cardinality key values</strong> (safe for metrics: model name, operation type, provider) from <strong>high-cardinality key values</strong> (safe only for traces/logs, never for metrics: the actual prompt content, token-level detail).
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through what actually happens, mechanically, when a Spring AI application configured with observability makes one <code>ChatClient</code> call inside a request that already has tracing enabled (the default in a Spring Boot application with the Actuator and Micrometer Tracing starters on the classpath).
+</p>
+
+<ol>
+<li><strong>A trace is already in flight.</strong> The incoming HTTP request was intercepted by Spring's tracing instrumentation, which created a root span and stored the current <code>Observation</code>/trace context in a thread-local (or reactor context, for WebFlux) so that anything called from within this request can find it.</li>
+<li><strong>Your controller calls <code>chatClient.prompt().user(question).call().content()</code>.</strong> Internally, Spring AI's <code>ChatClient</code> does not call the model directly — it goes through an <strong>Advisor chain</strong> (the same Advisor abstraction covered in the Advisors chapter). Each advisor in the chain — memory, retrieval augmentation, logging, your own custom advisors — gets a chance to inspect or modify the request before it reaches the model, and the response before it returns to the caller.</li>
+<li><strong>An <code>Observation</code> is opened for the chat client call.</strong> Spring AI wraps the call in a Micrometer <code>Observation</code>, using a purpose-built <code>ChatClientObservationConvention</code> that knows how to translate a chat request/response pair into observation key-values — this is the integration point that makes the AI-specific call look, to Micrometer, like any other observed operation (a database query, an HTTP client call) that your existing tracing and metrics backends already know how to render.</li>
+<li><strong>The underlying <code>ChatModel</code> call is separately observed.</strong> Because the Advisor chain can retry, branch, or call the model more than once (for example, during tool-calling loops), the actual model invocation gets its own nested <code>Observation</code>/span via <code>ChatModelObservationConvention</code>, distinct from the outer <code>ChatClient</code> span. This nesting is what lets a trace waterfall show "the ChatClient call took 2.1s, of which the underlying model call took 1.9s, and the memory-advisor lookup took 0.2s" as separate, attributable spans.</li>
+<li><strong>Low-cardinality attributes are attached as tags on both the span and any generated metrics</strong> — <code>gen_ai.system</code> (the provider, e.g. <code>openai</code>), <code>gen_ai.request.model</code>, <code>gen_ai.response.model</code> (these can differ if the provider silently routes to a different underlying model version), and the operation name. <strong>High-cardinality attributes</strong> — the actual prompt and completion text, if you have opted in to capturing them — are attached only to the trace span's detailed view or to a log record, never to the metrics time series, for the cardinality reason explained in Section 4.4.</li>
+<li><strong>Token usage is read off the model response's metadata</strong> — every <code>ChatResponse</code> carries a <code>ChatResponseMetadata</code> object with a <code>Usage</code> object exposing prompt tokens, generation (completion) tokens, and total tokens, as reported by the provider. Spring AI's observation support surfaces these as observation key-values (<code>gen_ai.usage.input_tokens</code>, <code>gen_ai.usage.output_tokens</code>) so a Micrometer meter can aggregate them into token-consumption metrics without you writing any counting code yourself.</li>
+<li><strong>The Observation closes, emitting to every registered <code>ObservationHandler</code>.</strong> A <code>TracingObservationHandler</code> turns it into a span exported via OTLP (to Zipkin, Jaeger, or an OpenTelemetry Collector); a <code>MeterObservationHandler</code> turns it into Micrometer counters/timers exported to Prometheus or another metrics backend. Both happen from the exact same instrumentation call site — you do not write separate code for "log this" and "trace this" and "meter this."</li>
+<li><strong>If the model call throws</strong> (timeout, rate limit, malformed response), the Observation is marked as an error, the exception is attached to the span, and standard Micrometer error-count metrics increment — this is the one failure mode that behaves exactly like ordinary APM, because it is an actual exception, not a silent wrong answer.</li>
+</ol>
+
+<p>
+The edge case worth reasoning through yourself: what happens during <strong>streaming</strong> responses (<code>ChatClient.stream()</code>)? The Observation's span cannot close until the last chunk has been emitted, because token counts and final response metadata are only known once the stream completes — this means a streaming call's span duration reflects "time to fully drain the stream," not "time to first token," and if you care about perceived latency (a UX metric that matters a great deal for chat interfaces) you need a <em>separate</em, custom-instrumented measurement for time-to-first-token, since the standard span will not give it to you for free.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Observability for AI systems needs very little formal mathematics, but the handful of ideas it does need are used constantly and are worth being precise about.
+</p>
+
+<h3>6.1 Percentiles, Not Averages</h3>
+
+<p>
+The average (mean) latency of your model calls is one of the least useful numbers you can report, because LLM latency distributions are heavily right-skewed: most calls finish quickly, but a meaningful tail takes far longer (provider-side queuing, longer generations, retries). Reporting only the mean hides that tail completely. Instead, observability systems report <strong>percentiles</strong>: p50 (median — half of requests are faster than this), p95 and p99 (95%/99% of requests are faster than this — these numbers surface the tail your users actually experience during the worst moments). Micrometer computes these via histogram-based <code>Timer</code> instruments attached to each Observation, and the formula intuition is simple: sort all observed latencies, and the p-th percentile is the value at position <code>p/100 × N</code> in that sorted list (implementations approximate this with bounded-memory histograms rather than storing every raw value, since storing every raw value at production scale is not memory-feasible).
+</p>
+
+<h3>6.2 Cost as a Linear Function of Tokens</h3>
+
+<p>
+Per-request cost is not mysterious — it is a simple linear function most providers price directly:
+</p>
+
+<pre>
+cost(request) = (prompt_tokens  × price_per_input_token)
+              + (completion_tokens × price_per_output_token)
+</pre>
+
+<p>
+The reason this belongs in an observability chapter rather than a pure finance spreadsheet is that <code>prompt_tokens</code> and <code>completion_tokens</code> are exactly the two numbers your instrumentation is already capturing per request via <code>Usage</code> metadata (Section 5). Once you are emitting those two numbers as metrics tagged by model and by feature/endpoint, computing running cost is a Grafana query, not a new engineering effort — this is the single highest-leverage dashboard most teams build in their first week of running an AI feature in production, because it is the earliest warning of a runaway agent loop or an unexpectedly verbose system prompt.
+</p>
+
+<h3>6.3 Sampling Math for Traces</h3>
+
+<p>
+Tracing every single request in full detail (especially with high-cardinality prompt/completion content attached) is expensive to store and, at high volume, unnecessary. <strong>Sampling</strong> trades completeness for cost: if you sample at rate <em>r</em> (say, 10% = 0.1), you retain full traces for a random <em>r</em> fraction of requests while still counting <em>all</em> requests toward aggregate metrics (metrics and traces are typically decoupled for exactly this reason — you never want to lose your error-rate metric just because you are only tracing 1 in 10 requests). A common refinement is <strong>tail-based sampling</strong>: buffer a trace's spans temporarily and decide whether to keep it only after seeing whether it errored or exceeded a latency threshold — guaranteeing that the requests most worth debugging are never the ones a flat random sample happened to drop.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 One Request as a Trace Waterfall</h3>
+
+<pre>
+Trace: POST /api/support/ask   (trace_id = 8f3a...)
+│
+├─ span: http.server.request                          [0ms ───────────────── 2140ms]
+│   │
+│   ├─ span: chat.client                               [40ms ──────────── 2100ms]
+│   │   (spring.ai.chat.client — outer Observation, includes advisor chain)
+│   │   │
+│   │   ├─ span: advisor.retrieval-augmentation          [40ms ── 310ms]
+│   │   │     tags: vector.store=pgvector, top_k=5
+│   │   │     (query embedding + similarity search happened here)
+│   │   │
+│   │   ├─ span: advisor.chat-memory                     [310ms ── 340ms]
+│   │   │     tags: conversation.id=conv-88213
+│   │   │
+│   │   ├─ span: chat.model  (first call — model requests a tool)   [345ms ── 1120ms]
+│   │   │     tags: gen_ai.system=openai, gen_ai.request.model=gpt-4o
+│   │   │     tags: gen_ai.usage.input_tokens=812, gen_ai.usage.output_tokens=41
+│   │   │
+│   │   ├─ span: tool.call  (getOrderStatus)                        [1125ms ── 1810ms]
+│   │   │     tags: tool.name=getOrderStatus, tool.error=false
+│   │   │     ⚠ this span is 685ms — the slowest single step in the trace
+│   │   │
+│   │   └─ span: chat.model  (second call — final answer synthesis) [1815ms ── 2095ms]
+│   │         tags: gen_ai.usage.input_tokens=940, gen_ai.usage.output_tokens=118
+│   │
+│   └─ (advisor chain unwinds, response returned to controller)
+│
+└─ total: 2140ms  |  total tokens: 1911  |  estimated cost: $0.0142
+</pre>
+
+<p>
+Notice what this single diagram makes visible that an aggregate "average latency: 1.8s" metric never could: the bottleneck in <em>this specific slow request</em> was not the model, it was a downstream tool call, and it happened only after the model decided, on its own, to invoke a tool — a decision that is itself only visible because the trace shows two separate <code>chat.model</code> spans rather than one.
+</p>
+
+<h3>7.2 The Instrumentation and Export Pipeline</h3>
+
+<pre>
+ Spring Boot Application
+ ┌───────────────────────────────────────────────────────────────┐
+ │  ChatClient.call()                                              │
+ │        │                                                        │
+ │        ▼                                                        │
+ │  Micrometer Observation  ──creates──►  Observation.Context      │
+ │        │                                (holds low + high        │
+ │        │                                 cardinality key-values)  │
+ │        ▼                                                        │
+ │  ObservationRegistry ── notifies each registered handler ──►    │
+ │        │                              │                          │
+ │        ▼                              ▼                          │
+ │  TracingObservationHandler     MeterObservationHandler           │
+ │        │                              │                          │
+ └────────┼──────────────────────────────┼──────────────────────────┘
+          ▼                              ▼
+   OTLP exporter                  Micrometer registry
+          │                              │
+          ▼                              ▼
+  OpenTelemetry Collector          Prometheus (scrape)
+          │                              │
+    ┌─────┴─────┐                        ▼
+    ▼           ▼                    Grafana dashboards
+ Zipkin /    Langfuse /                 + alerting rules
+ Jaeger      LLM-specific
+ (traces)    eval platform
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a real deployment, observability is not a feature bolted onto one service — it is a cross-cutting layer that every service, AI-calling or not, feeds into.
+</p>
+
+<pre>
+┌───────────────────────────────────────────────────────────────────┐
+│                    Spring Boot AI Service (this volume)            │
+│  ChatClient + Advisors + Tools + MCP clients                        │
+│  - Micrometer Observation instrumentation (built-in, Section 5)     │
+│  - Custom business metrics (cost budget, feature-level usage)        │
+└───────────────────────────┬───────────────────────────────────────┘
+                             │  OTLP (traces + metrics)
+                             ▼
+              ┌───────────────────────────────┐
+              │   OpenTelemetry Collector       │
+              │   - batches, redacts PII        │
+              │   - fans out to multiple sinks  │
+              └───────┬───────────────┬─────────┘
+                       ▼               ▼
+        ┌─────────────────────┐  ┌─────────────────────────┐
+        │  Metrics backend      │  │  Tracing backend           │
+        │  (Prometheus / Cloud   │  │  (Zipkin / Jaeger / Cloud  │
+        │   Monitoring)          │  │   Trace)                    │
+        └──────────┬───────────┘  └─────────────┬──────────────┘
+                   ▼                             ▼
+            ┌─────────────────────────────────────────┐
+            │      Grafana / dashboard + alerting        │
+            │  - latency p50/p95/p99 by model & feature   │
+            │  - token cost per feature, per day           │
+            │  - error rate, tool-call failure rate         │
+            │  - quality/eval score trend (Section 4.2)     │
+            └─────────────────────────────────────────┘
+
+  Alongside this, a separate, slower-moving pipeline:
+  Sampled prompts/completions ──► LLM-specific eval platform
+  (Langfuse / LangSmith / in-house) ──► automated quality scoring,
+  regression detection across prompt/model versions
+</pre>
+
+<p>
+Two design decisions in this architecture recur across almost every real deployment. First, PII redaction happens at the Collector, not in every individual service — centralizing it means you enforce one redaction policy instead of trusting every team to remember to scrub before exporting. Second, the "quality" pipeline on the bottom is deliberately decoupled from the real-time metrics pipeline: automated LLM-as-judge evaluation is itself a model call, with its own latency and cost, so it runs asynchronously against a sampled subset of production traffic rather than blocking the user-facing request.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI's observability is not a bolt-on — it is built directly on the same <code>io.micrometer.observation</code> API that Spring Boot Actuator already uses for HTTP server requests, <code>RestClient</code> calls, and R2DBC/JDBC queries. If your application already has <code>spring-boot-starter-actuator</code> plus a Micrometer Tracing bridge (<code>micrometer-tracing-bridge-otel</code>, typically) and a metrics registry (<code>micrometer-registry-prometheus</code>) on the classpath, Spring AI's <code>ChatClient</code> and <code>ChatModel</code> calls are observed automatically the moment you inject an <code>ObservationRegistry</code> bean — no extra annotation is required on your own code.
+</p>
+
+<pre>
+// build.gradle / pom.xml dependencies (conceptually):
+//   spring-boot-starter-actuator
+//   micrometer-tracing-bridge-otel
+//   micrometer-registry-prometheus
+//   opentelemetry-exporter-otlp   (or a Zipkin exporter)
+
+@Configuration
+class ObservabilityConfig {
+
+    // ObservationRegistry is auto-configured by Spring Boot when Actuator
+    // + Micrometer are on the classpath; injecting it here is enough for
+    // Spring AI's ChatClient/ChatModel beans to pick it up automatically.
+
+    @Bean
+    ObservationRegistryCustomizer&lt;ObservationRegistry&gt; addTraceIdLogging() {
+        // Example customizer: attach any cross-cutting handler you need,
+        // e.g. a handler that copies trace/span IDs into MDC for log
+        // correlation, so every log line for a request carries the same
+        // trace_id a Zipkin/Jaeger trace uses.
+        return registry -> registry.observationConfig()
+            .observationHandler(new ObservationTextPublisher());
+    }
+}
+
+@Service
+class SupportAssistant {
+
+    private final ChatClient chatClient;
+
+    SupportAssistant(ChatClient.Builder builder) {
+        this.chatClient = builder
+            .defaultAdvisors(new SimpleLoggerAdvisor()) // logs request/response
+            .build();
+    }
+
+    public String answer(String question) {
+        ChatResponse response = chatClient.prompt()
+            .user(question)
+            .call()
+            .chatResponse();
+
+        Usage usage = response.getMetadata().getUsage();
+        log.info("model={} promptTokens={} completionTokens={} totalTokens={}",
+            response.getMetadata().getModel(),
+            usage.getPromptTokens(),
+            usage.getGenerationTokens(),
+            usage.getTotalTokens());
+
+        return response.getResult().getOutput().getText();
+    }
+}
+</pre>
+
+<p>
+A few Spring AI-specific mechanics worth naming precisely, because interviewers and code reviewers will expect the correct vocabulary:
+</p>
+
+<ul>
+<li><strong><code>SimpleLoggerAdvisor</code></strong> is a ready-made Advisor (from the Advisors chapter's family of <code>CallAdvisor</code>/<code>StreamAdvisor</code> implementations) that logs the outbound request and inbound response of every <code>ChatClient</code> call it wraps — the fastest way to get human-readable request/response logs without writing a custom advisor.</li>
+<li><strong><code>ChatClientObservationConvention</code></strong> and <strong><code>ChatModelObservationConvention</code></strong> are the extension points that decide which key-values get attached to the <code>ChatClient</code>-level and the underlying <code>ChatModel</code>-level Observations respectively — implement a custom convention when you need to add your own low-cardinality tags (for example, a <code>feature.name</code> tag identifying which product feature triggered the call) without touching every call site.</li>
+<li><strong><code>ChatResponseMetadata</code> / <code>Usage</code></strong> (in <code>org.springframework.ai.chat.metadata</code>) is the standard, provider-agnostic surface for reading token counts and the actual model identifier that answered — because Spring AI normalizes this across providers, your dashboards and cost calculations don't need provider-specific branches.</li>
+<li><strong>Actuator's <code>/actuator/metrics</code> and <code>/actuator/prometheus</code> endpoints</strong> expose everything above without you writing a controller — the same endpoints you already use for JVM heap and HTTP metrics now also expose <code>gen_ai.*</code>-derived counters and timers.</li>
+</ul>
+
+<p>
+This is the same design philosophy this series keeps returning to: Spring AI treats "observing a model call" as a specialization of "observing any external dependency," using the exact same <code>Observation</code> abstraction Spring Boot already applies to your database and HTTP clients — you are not learning a second observability stack, you are learning what tags a familiar one now carries.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Always tag metrics and traces with model name, model version, and prompt/feature version.</strong> Without this, you cannot answer "did the provider's silent model update at 3am cause this week's quality drop" or "did prompt v14 regress cost versus v13" — both are routine production questions.</li>
+<li><strong>Track token usage and cost as first-class metrics from day one</strong>, not as an afterthought computed from a billing invoice at month-end. Per-feature, per-user cost attribution is the earliest and cheapest warning system for a runaway agent loop or a prompt regression that suddenly triples token usage.</li>
+<li><strong>Separate low-cardinality tags (safe for metrics) from high-cardinality payloads (safe only for traces/logs)</strong>, exactly as Spring AI's Observation conventions do — never let a full prompt string become a metric tag.</li>
+<li><strong>Correlate logs, traces, and metrics via a shared trace ID</strong> propagated into your logging MDC, so a single click from a trace waterfall takes you straight to the exact log lines for that request.</li>
+<li><strong>Sample intelligently, not uniformly</strong> — keep 100% of error and high-latency traces (tail-based sampling), and only randomly downsample the "boring," fast, successful traffic.</li>
+<li><strong>Instrument time-to-first-token separately from total response time</strong> for any streaming/chat UX, since users perceive the former, not the latter, and standard span duration measures the latter.</li>
+<li><strong>Build a continuous, sampled evaluation pipeline</strong> (Section 4.2) alongside classical observability — a system can be fast, cheap, and error-free while still being wrong, and only quality telemetry catches that.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Logging or tagging with raw prompt/completion text as a metrics label.</strong> This explodes cardinality (Section 4.4) and can crash or bankrupt a metrics backend; prompt/completion content belongs in traces or dedicated log storage, never in a Prometheus label.</li>
+<li><strong>Treating "no exception thrown" as "the request succeeded."</strong> A malformed structured-output response, a hallucinated fact, or a tool call that silently returned stale data all complete without throwing — this is precisely why quality/evaluation telemetry (Section 4.2) is not optional.</li>
+<li><strong>Only monitoring the outer request latency, not per-stage latency.</strong> Without child spans for retrieval, each model call, and each tool call, "this endpoint is slow" gives you no actionable next step — as the trace waterfall in Section 7.1 demonstrated.</li>
+<li><strong>Shipping full prompts and completions to a third-party trace/log backend without redaction.</strong> This is both a security issue (Section 13) and, in regulated industries, a compliance violation if the prompt contains customer PII or regulated data.</li>
+<li><strong>Forgetting that streaming responses distort duration-based metrics.</strong> A naive span-duration metric for a streamed chat response measures "time to fully drain the stream," which can look artificially slow compared to perceived UX, misleading whoever is reading the dashboard.</li>
+<li><strong>Ignoring provider-side model drift because dashboards only track your own deploys.</strong> If you don't tag and monitor <code>gen_ai.response.model</code>, a provider's silent version bump behind a stable model alias can change behavior with no corresponding entry in your own deployment history to investigate.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Observability itself has a cost, and it is worth being honest about the trade-offs rather than instrumenting everything unconditionally.
+</p>
+
+<ul>
+<li><strong>Tracing overhead is small but non-zero</strong> — creating spans, propagating context, and serializing/exporting them consumes CPU and adds a small amount of latency per request, which is why high-throughput systems sample rather than trace every request at 100%.</li>
+<li><strong>Capturing full prompt/completion payloads multiplies storage cost fast.</strong> A chat feature at meaningful scale can generate gigabytes of prompt/completion text per day; decide deliberately what fraction of traffic gets full-payload capture versus metrics-only visibility, and set retention windows accordingly (you rarely need full-text traces older than a few weeks).</li>
+<li><strong>Synchronous evaluation adds latency you usually cannot afford.</strong> Running an LLM-as-judge quality check inline, before responding to the user, doubles your model-call latency and cost for every request — this is why quality evaluation, as shown in Section 8's architecture, almost always runs asynchronously against sampled traffic rather than in the request's critical path.</li>
+<li><strong>Token/cost metrics are nearly free to compute</strong> because the numbers are already present in the response metadata (Section 5) — there is essentially no performance argument against tracking them, only an implementation-effort one, which is small.</li>
+<li><strong>Batching and buffering exporters matters at scale.</strong> Sending one network call per span/metric to your Collector will itself become a bottleneck; production exporters batch spans and metrics before sending, trading a small amount of export latency for a large reduction in network overhead.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Observability data is, itself, a security and privacy surface that is easy to overlook because it feels like "internal engineering plumbing" rather than user data — but a trace that captures a full prompt containing a customer's account number, medical detail, or an internal system prompt with embedded credentials is exactly as sensitive as the request that produced it, and it is now duplicated into a third-party observability backend with its own access controls, retention policy, and export logs.
+</p>
+
+<ul>
+<li><strong>Redact before export, not after.</strong> PII scrubbing should happen as close to the source as possible — ideally in an OpenTelemetry Collector processor or a custom <code>ObservationFilter</code> — so raw sensitive content never leaves your infrastructure boundary in the first place.</li>
+<li><strong>Treat system prompts as secrets in traces, the same way you treat API keys as secrets in logs.</strong> A system prompt often encodes business logic, guardrail instructions, or proprietary process detail — leaking it through an over-permissive trace viewer is a real, if underappreciated, information-disclosure risk, and it directly enables the prompt-injection and prompt-extraction attacks covered in earlier chapters.</li>
+<li><strong>Apply the same access control to your observability backend that you apply to production databases.</strong> A trace viewer with prompt/completion capture enabled is, functionally, a searchable archive of everything users have told your AI feature — it deserves the same RBAC and audit logging as any datastore holding user content.</li>
+<li><strong>Watch for injected content surfacing in your own telemetry.</strong> If an attacker's prompt-injection payload gets logged verbatim and later rendered unescaped in an internal observability dashboard, you have created a second-order injection surface (e.g., stored XSS in a web-based trace viewer) — treat observability tooling as untrusted-content-rendering surfaces too.</li>
+<li><strong>Be honest that this is a moderate, not extreme, security surface.</strong> Observability data is a confidentiality and compliance concern, not typically a direct remote-code-execution vector — the bulk of the security burden in an AI system still sits with input validation, guardrails, and sandboxing covered in dedicated later chapters; this chapter's job is narrowly to make sure your telemetry pipeline doesn't become the leak.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What are the three classical pillars of observability, and what does each one answer?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Logs (discrete timestamped events — "what exactly happened"), metrics (aggregated numeric time series — "how is the system behaving on average, and is it trending"), and traces (the causal tree of spans for one request — "where inside this specific request did time/failure occur"). Each is optimized for a different question and a different storage/query trade-off.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why isn't "the request returned HTTP 200 with no exception" sufficient evidence that an AI feature worked correctly?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Because an LLM can produce a fluent, well-formatted, confident answer that is factually wrong or based on a misread of retrieved context — this completes successfully at the HTTP and exception-handling level while still being a functional failure. Standard error-rate monitoring cannot catch this; it requires a separate quality/evaluation signal.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. What is cardinality, and why does it matter specifically when instrumenting LLM calls?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Cardinality is the number of distinct values an attribute/tag can take. Metrics backends like Prometheus create a separate stored time series per unique tag-value combination, so attaching a high-cardinality value — a full prompt string, a user ID, a session ID — as a metric tag can multiply storage/query cost by orders of magnitude or crash the backend. This is why prompt/completion content belongs only in traces or logs, never as a metric label, and why Spring AI's Observation conventions explicitly separate low-cardinality and high-cardinality key-values.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. How would you compute the cost of a given LLM request from telemetry alone, without calling the provider's billing API?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Cost is a linear function of token usage: (prompt_tokens × price_per_input_token) + (completion_tokens × price_per_output_token). Since token counts are already reported per response via the model's usage metadata (Spring AI exposes this as a <code>Usage</code> object on <code>ChatResponseMetadata</code>, with prompt, generation, and total token counts), you multiply by the known per-token pricing for that model and tag the result by model/feature to get per-request and aggregate cost, no billing API call required.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Design the observability strategy for a production RAG + tool-calling agent. What would you trace, what would you meter, and what would you sample?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Trace the full request as a span tree: retrieval (with vector store and top-k as tags), each advisor in the chain, each model call as its own span (since tool-calling can trigger multiple sequential model calls), and each tool invocation with success/failure and latency. Meter, per feature and per model: request count, latency percentiles (p50/p95/p99, not mean), token usage split into input/output, error rate, and tool-call failure rate — all tagged with low-cardinality values only (model name, model version, feature name), never raw prompt content. Sample with a tail-based strategy: retain 100% of error and high-latency traces, and randomly downsample fast, successful traffic to control storage cost, while keeping metrics unsampled (all requests counted) since metrics are cheap regardless of volume.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Add that you would run a separate, asynchronous quality-evaluation pipeline against a sampled subset of production traffic (LLM-as-judge or rubric-based scoring) precisely because a fast, cheap, error-free trace tells you nothing about correctness — and that this evaluation pipeline must not sit in the user-facing request's critical path, since it is itself a model call with its own latency and cost.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. A user reports that an agent-based feature "felt slow" yesterday around 3pm, but your average latency dashboard shows nothing unusual. How do you investigate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Averages hide right-skewed tail latency, which is exactly the kind of distribution LLM and tool-call latency produces — a handful of very slow requests can be invisible in a mean while being exactly what one specific user experienced. Pivot to p95/p99 latency around 3pm, filter traces by time window and, if you have user/session tagging on traces (not metrics, to avoid cardinality blowup), find that user's specific trace. Walk the span waterfall for that trace to identify which stage — retrieval, a specific model call, or a specific tool invocation — accounted for the outlier duration, then check whether it correlates with a provider-side incident, a tool dependency timeout, or an unusually long generation (high output token count).</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A platform team wants to standardize AI observability across a dozen microservices, some using different model providers. What architecture and standards would you push for, and why?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Push for OpenTelemetry as the wire-level standard and the GenAI semantic conventions (<code>gen_ai.*</code> attribute names) as the attribute schema, so every service — regardless of provider or even language — emits comparable telemetry that a single set of dashboards and alerting rules can consume. In the Spring/Java services specifically, standardize on Spring AI's Observation-based instrumentation (via a shared, organization-wide <code>ChatClientObservationConvention</code>/<code>ChatModelObservationConvention</code> customization) so every team gets consistent low-cardinality tagging (feature name, model, prompt version) without re-inventing it per service. Route all telemetry through a central OpenTelemetry Collector that performs PII redaction once, centrally, rather than trusting a dozen teams to redact correctly and independently. Keep token/cost metrics and quality-evaluation scores as first-class, cross-team-comparable metrics from day one, since these become the basis for capacity planning and vendor/model comparisons across the whole platform, not just per-service debugging.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How does observability change the way you would think about testing an AI feature (previewing the relationship to the next chapter)?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Pre-production test suites can only exercise inputs someone anticipated writing a test for, but the real distribution of user inputs to an LLM-backed feature is unbounded — so testing alone is necessarily incomplete for this class of system. Observability, especially the quality/evaluation telemetry pillar, functions as continuous testing against the real, live input distribution: it catches regressions and failure modes a static test suite never imagined, feeds real production failures back into the test suite (turning "surprises in production" into "regression tests going forward"), and gives you the evidence needed to know whether a prompt or model change actually improved things rather than just feeling like it did. A staff engineer treats testing and observability as one continuous feedback loop, not two separate disciplines owned by two separate teams.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why "average latency" is a misleading metric for an LLM-backed endpoint, and what percentile-based reporting fixes that averages cannot.</li>
+<li>A teammate proposes tagging every trace with the full raw prompt text as a Prometheus label "so we can search by prompt content later." Explain, using the concept of cardinality, exactly what will go wrong and what you would propose instead.</li>
+<li>Describe, for a RAG-plus-tool-calling agent you design yourself, which pipeline stages you would give their own span, and what low-cardinality tags you would attach to each.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Take a Spring Boot application with Spring AI's <code>ChatClient</code> already wired up, add <code>spring-boot-starter-actuator</code>, a Micrometer Tracing bridge, and a Prometheus registry, then attach a <code>SimpleLoggerAdvisor</code> to your <code>ChatClient</code>. Make several chat calls and inspect <code>/actuator/prometheus</code> for the token-usage and latency metrics that appear automatically.</li>
+<li>Instrument a small service method that computes estimated per-request cost from a <code>ChatResponse</code>'s <code>Usage</code> metadata and a hard-coded per-token price table for two different models. Log the computed cost alongside the trace ID, then write two sentences on how you would turn this into a per-feature daily cost dashboard.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>AI systems fail differently from ordinary services — the costliest failures are confident, well-formed, wrong answers that never throw an exception — so observability must go beyond the classical logs/metrics/traces trio to include a fourth pillar: quality/evaluation telemetry.</li>
+<li>Cardinality discipline is the single most important operational rule in this chapter: low-cardinality values (model name, provider, feature) belong on metrics; high-cardinality payloads (prompts, completions) belong only in traces and logs.</li>
+<li>Spring AI's observability is not a parallel system — it is built directly on Micrometer's <code>Observation</code> API already powering Spring Boot Actuator, using <code>ChatClientObservationConvention</code> and <code>ChatModelObservationConvention</code> to emit standard, OpenTelemetry-GenAI-aligned <code>gen_ai.*</code> attributes and metrics automatically.</li>
+<li>Token usage, exposed uniformly across providers via <code>ChatResponseMetadata</code>'s <code>Usage</code> object, is the foundation for near-free, real-time cost tracking — no billing API call required.</li>
+<li>Tracing overhead, storage cost, and synchronous evaluation latency are real trade-offs; production systems sample intelligently (100% of errors/tail latency, downsampled routine traffic) rather than capturing everything unconditionally.</li>
+<li>Observability data is itself sensitive — prompts, completions, and system prompts routed through third-party observability backends deserve the same redaction discipline and access control as the production data they represent.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Testing (Chapter 63) picks up exactly where this chapter's Staff-level closing question pointed — because a foundation model cannot be pinned down with exact-match assertions, and because observability alone can only tell you what already happened in production, you need a deliberate, statistical, rubric- and regression-based testing discipline built specifically for non-deterministic systems, one that turns real production failures surfaced by this chapter's telemetry into permanent, automated regression coverage going forward.
+</p>
+
+</div>
+
+</body>
+</html>

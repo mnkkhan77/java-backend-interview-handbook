@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>64-PERFORMANCE-OPTIMIZATION.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 64 — PERFORMANCE OPTIMIZATION</h1>
+
+<p class="roi">Volume 2 — Spring AI · Chapter 15 of 15</p>
+
+<div class="callout">
+Testing (Chapter 63) gave you confidence that your Spring AI application produces <em>correct</em> and <em>consistent-enough</em> results under a rubric you trust. This chapter asks the next question a production owner will ask the moment traffic arrives: is it <em>fast enough, cheap enough, and stable enough under load</em>? An LLM-backed endpoint that passes every evaluation but takes eleven seconds and costs four cents per call will still get paged at 2 a.m. and still get cut from the budget next quarter. Performance Optimization is where correctness meets economics, and it closes out Volume 2 because everything you have built — <code>ChatClient</code>, Advisors, memory, tools, structured output, testing — now has to survive contact with real concurrency, real latency budgets, and real bills.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every chapter so far in this volume has optimized for one thing: getting a Spring AI feature to work correctly. This chapter optimizes for the thing that determines whether that feature survives in production: whether it works correctly <strong>fast enough, for a low enough cost, at the concurrency your users actually generate</strong>. These are not cosmetic concerns you bolt on afterward. In AI-backed systems specifically, performance and correctness are entangled in a way traditional CRUD services rarely experience — a poorly tuned retry policy can silently double your token spend; a naive memory strategy can grow your prompt until latency and hallucination both spike together; a synchronous blocking call to a model provider can quietly starve your entire Tomcat thread pool during a traffic burst that a normal REST dependency would have shrugged off.
+</p>
+
+<p>
+There is also a blunt financial reality that does not exist in most backend work: <strong>every millisecond of thinking time and every token of context you send is a metered, billed resource.</strong> A database query that is twice as slow costs you nothing extra per call — it just costs latency. An LLM call that processes twice as many input tokens because you forgot to trim conversation history (covered in the Memory chapter) costs you real money, on every single request, forever, until someone notices the bill. Performance optimization for AI systems is therefore simultaneously a latency problem, a throughput problem, and a cost-engineering problem, and the techniques for each overlap more than they do in traditional systems.
+</p>
+
+<p>
+Finally, this is the last chapter of Volume 2 for a reason: performance is the dimension along which every previous chapter's decisions get graded together. The Advisor chain you built for logging and memory, the retrieval you wired for grounding, the structured output parser you added for reliability — each one added correctness and each one added latency. This chapter teaches you to see that trade-off explicitly, measure it, and make it deliberately instead of by accident.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Performance Engineering Before LLMs</h3>
+
+<p>
+Backend performance engineering has a long, well-understood toolbox: index your database, cache expensive reads, batch small writes, use connection pooling instead of opening a socket per request, move blocking I/O off the request thread, and measure with percentiles (p50/p95/p99) instead of averages because averages hide the tail latency that actually causes user complaints. If you have ever tuned a HikariCP pool size, added a Redis cache in front of a slow query, or moved an email send onto a message queue instead of the request thread, you already own most of the vocabulary this chapter needs. None of that knowledge is wasted here — it is the majority of what still applies.
+</p>
+
+<h3>2.2 Performance Engineering for Classical Machine Learning Serving</h3>
+
+<p>
+Before LLMs, the "serve a model efficiently" problem had already been solved once, for classical ML and early deep learning: systems like TensorFlow Serving, TorchServe, and NVIDIA Triton pioneered <strong>dynamic request batching</strong> (grouping many small inference requests into a single larger GPU batch to amortize fixed overhead), <strong>model quantization</strong> (representing weights in lower precision — 16-bit or 8-bit instead of 32-bit — to trade a small amount of accuracy for large gains in memory and speed), and <strong>model distillation</strong> (training a smaller, faster model to imitate a larger one). These three ideas — batch aggressively, reduce precision, reduce model size — are the direct ancestors of the levers you now pull as an application engineer, except that as a Spring AI developer you usually do not implement them yourself; you <em>choose</em> a provider or a hosted model tier that has already made these trade-offs, and your job shifts to using that choice wisely.
+</p>
+
+<h3>2.3 The LLM-Specific Turn: Autoregression Changes Everything</h3>
+
+<p>
+Large language models introduced a performance characteristic that classical ML serving never had to deal with at the same scale: <strong>autoregressive, token-by-token generation</strong>. A classical model produces one output in one forward pass. An LLM must run one forward pass <em>per output token</em>, because each new token depends on every token generated before it (this mechanism is covered fully in the Transformers chapter). This single fact explains almost every LLM-specific optimization technique that emerged between 2020 and today: <strong>KV-caching</strong> (avoiding recomputation of earlier tokens' internal representations during decoding), <strong>speculative decoding</strong> (using a small, fast "draft" model to guess several tokens ahead and having the large model verify them in one pass instead of generating them one at a time), <strong>continuous batching</strong> (dynamically merging in-flight requests at the token level rather than the request level, because requests finish at wildly different times), and <strong>prompt/context caching</strong> (letting a provider reuse the already-processed representation of a prompt prefix across multiple calls, so you are not billed or delayed for re-reading the same system prompt or document on every request). Providers like OpenAI, Anthropic, and Google have all shipped prompt-caching features precisely because of this cost structure. As an application engineer, you rarely implement KV-caching or speculative decoding yourself, but you are the one who decides whether your request pattern is <em>shaped</em> to take advantage of them — a stable, reused prompt prefix benefits enormously from provider-side caching; a prompt that is reshuffled or re-ordered on every call gets none of that benefit.
+</p>
+
+<table>
+<tr><th>Era</th><th>Core Optimization</th><th>Who Implements It</th><th>What You Control Today</th></tr>
+<tr><td>Classical backend</td><td>DB indexing, HTTP caching, connection pooling</td><td>You, directly</td><td>Fully — same techniques still apply around your AI calls</td></tr>
+<tr><td>Classical ML serving</td><td>Batching, quantization, distillation</td><td>Model host / MLOps team</td><td>Indirectly — choice of model size/tier</td></tr>
+<tr><td>LLM serving</td><td>KV-cache, continuous batching, speculative decoding, prompt caching</td><td>The model provider's infrastructure</td><td>Indirectly — you shape requests to be cache- and batch-friendly</td></tr>
+<tr><td>Application layer (this chapter)</td><td>Streaming, request shaping, concurrency control, application-level caching, cost-aware routing</td><td>You, directly, in Spring AI</td><td>Fully — this is the chapter's actual subject matter</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> most of the deepest LLM performance tricks (KV-cache, speculative decoding) are invisible to you as a Spring AI developer — they happen inside the provider's serving stack, and you cannot tune them directly. Your leverage sits one layer up: in how you shape prompts, structure requests, cache at the application boundary, and control concurrency. Confusing these two layers is the single most common reason engineers new to AI performance work look in the wrong place first.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Strip away the vocabulary and the problem this chapter solves is:
+</p>
+
+<div class="callout">
+<strong>Given a Spring AI application whose dominant cost is an external, metered, high-latency, and only partially controllable model call, minimize end-to-end latency and monetary cost per request while maximizing sustainable throughput under real concurrency — without silently degrading output quality.</strong>
+</div>
+
+<p>
+Every clause in that sentence rules out a naive solution. "External and only partially controllable" rules out classical solutions like just making your own code faster — for most requests, the model call itself dominates total latency, so optimizing your surrounding Java code first is optimizing the wrong 5%. "Metered and monetary" means the fastest possible solution (always call the biggest, most capable model, always send maximum context) is usually also the most expensive one, so latency and cost pull in the same direction only sometimes — often they trade off against each other and against quality. "Real concurrency" means a solution that looks fine in a single-user demo (Chapter 63's territory) can collapse the moment fifty users hit it simultaneously, because thread pools, connection limits, and provider rate limits all behave differently under load than in isolation. "Without silently degrading output quality" is the guardrail that stops this chapter from being a race to the cheapest, fastest, worst possible answer — trimming context too aggressively or routing every request to the cheapest model can "optimize" your way into an unusable product.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Three Metrics You Are Actually Trading Off</h3>
+
+<p>
+Before touching a single knob, fix three definitions in your head, because engineers new to this space routinely conflate them:
+</p>
+
+<table>
+<tr><th>Metric</th><th>Definition</th><th>Who Feels It</th></tr>
+<tr><td>Latency</td><td>Time from request sent to (final) response received, for one request</td><td>The user waiting for an answer</td></tr>
+<tr><td>Throughput</td><td>Number of requests a system can sustain per unit time across many concurrent users</td><td>The platform, under load</td></tr>
+<tr><td>Cost</td><td>Money spent per request (tokens billed) and per unit time (infrastructure)</td><td>Finance, at the end of the month</td></tr>
+</table>
+
+<p>
+These three are not independent. Sending less context lowers cost and often lowers latency, but if it removes information the model needed, it can lower <em>effective</em> throughput by increasing retries or follow-up questions. Using a bigger, smarter model can raise per-call cost and latency but lower total cost if it avoids a costly multi-step retry loop. There is no single "optimize performance" button — there is a design space, and your job is to pick a point in it deliberately for each feature, based on that feature's actual requirements (a real-time chat assistant has a very different latency budget than an overnight batch summarization job).
+</p>
+
+<h3>4.2 Time-to-First-Token vs. Time-to-Last-Token</h3>
+
+<p>
+LLM latency is not one number — it splits into two phases with very different characteristics, and this split is the single most important mental model in this chapter:
+</p>
+
+<ul>
+<li><strong>Prefill (time-to-first-token, TTFT):</strong> the time for the model to read and process your entire input prompt before it produces the very first output token. This phase scales roughly with input length and is largely parallelizable internally.</li>
+<li><strong>Decode (time-per-output-token, and by extension time-to-last-token, TTLT):</strong> the time to generate each subsequent token, one at a time, autoregressively. This phase scales with output length and, unlike prefill, cannot be meaningfully parallelized for a single request because each token depends on the one before it.</li>
+</ul>
+
+<p>
+This split explains a fact that surprises engineers coming from traditional APIs: <strong>a request that returns a long answer is slow mostly because of decode time, not because your prompt was long.</strong> Doubling your input context might add a modest, roughly linear amount to TTFT; asking for twice as much output can dramatically increase total latency, because it doubles the number of sequential decode steps. This single insight — control output length, not just input length — is one of the highest-leverage, most underused optimizations available to you as an application engineer, and it costs nothing to apply: setting a sensible `maxTokens` and prompting for concision are nearly free wins.
+</p>
+
+<h3>4.3 Streaming as a Latency Illusion (That Is Also Real)</h3>
+
+<p>
+Streaming (returning tokens to the client as they are generated, instead of waiting for the full response) does not reduce total generation time — the model still has to produce every token. What it changes is <strong>perceived latency</strong>: the user sees the first words appear after TTFT instead of after TTLT, which for a long response can be the difference between a two-second wait and a fifteen-second wait before anything visible happens. This is a genuine, not merely cosmetic, user-experience win, and it is one of the cheapest performance improvements available in Spring AI, because the framework supports it natively (Section 9). But it is worth being honest that streaming optimizes perceived latency and UX responsiveness, not total compute cost or total wall-clock generation time — do not confuse "feels faster" with "is cheaper" when reporting numbers to stakeholders.
+</p>
+
+<h3>4.4 Caching Layers: Where Repetition Can Be Turned Into Free Answers</h3>
+
+<p>
+Because LLM calls are expensive relative to almost anything else in your stack, caching earns its keep faster here than almost anywhere else in a typical Spring application. There are at least three distinct caching opportunities, each catching a different kind of repetition:
+</p>
+
+<ul>
+<li><strong>Exact-response caching:</strong> identical input (same prompt, same parameters) → return the previously computed answer without calling the model at all. Effective for FAQ-style or deterministic tasks (with temperature at or near zero), nearly useless for open-ended creative or highly personalized conversation.</li>
+<li><strong>Semantic caching:</strong> use embedding similarity (Volume 3 territory, previewed here) to detect that a <em>new</em> question is close enough in meaning to a previously answered one, and reuse (or lightly adapt) that answer instead of recomputing. Higher hit rate than exact-match caching, but requires a similarity threshold tuned carefully to avoid returning a wrong-but-similar answer.</li>
+<li><strong>Provider-side prompt/context caching:</strong> as covered in Section 2, several providers will cache the internal representation of a stable prompt prefix (a long system prompt, a large document you reuse across many questions) and charge and process it far more cheaply on subsequent calls, provided the prefix is byte-identical and appears in the same position across calls.</li>
+</ul>
+
+<p>
+Notice the shape of the trade here: the first two are things <em>you</em> build in Spring; the third is something you get for free from the provider if — and only if — you structure your prompts to keep the reusable, static part first and the variable, per-request part last. This single ordering habit (static content before dynamic content in the prompt) is a zero-cost architectural decision that directly increases provider-side cache hit rate.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+To optimize a system you must first know where the time actually goes. Walk a single chat request through a realistic Spring AI application end to end, and note where each millisecond is spent — this is the map every later optimization in this chapter attaches to.
+</p>
+
+<h3>5.1 Step-by-Step Request Lifecycle</h3>
+
+<ol>
+<li><strong>Client → Spring Boot controller.</strong> Network round trip, TLS handshake (amortized by keep-alive connections), request deserialization. Typically single-digit milliseconds if your infrastructure is healthy.</li>
+<li><strong>Rate limiting / auth / request shaping.</strong> Cheap in isolation, but if implemented with blocking calls to an external auth service without caching, this can quietly add tens of milliseconds per request under load.</li>
+<li><strong>Advisor chain execution (pre-call).</strong> Memory retrieval (loading prior conversation turns — a database or cache read), retrieval-augmented context fetch if RAG is wired in (a vector search — Volume 3), and any logging/guardrail advisors. Each Advisor in the chain (Chapter on Advisors) adds sequential latency unless explicitly parallelized.</li>
+<li><strong>Prompt assembly.</strong> Concatenating system prompt, retrieved context, conversation history, and the new user message. Purely in-process CPU work — fast, but the <em>size</em> of what gets assembled here directly determines the next step's cost.</li>
+<li><strong>Network call to the model provider.</strong> DNS/TLS/connection reuse, request serialization, then the provider's own queueing delay (which grows under the provider's own load, entirely outside your control) before your request even begins processing.</li>
+<li><strong>Prefill phase (server-side, provider-controlled).</strong> The model reads your full assembled prompt. Roughly proportional to input token count; benefits from provider-side prompt caching if your prefix is stable.</li>
+<li><strong>Decode phase (server-side, provider-controlled).</strong> The model generates output tokens one at a time. Roughly proportional to output token count; this is usually the single largest contributor to total latency for anything beyond a short answer.</li>
+<li><strong>Streaming back / full response return.</strong> Either tokens arrive incrementally (perceived latency improvement, Section 4.3) or the full payload arrives once generation completes.</li>
+<li><strong>Advisor chain execution (post-call).</strong> Response logging, memory persistence (writing the new turn back to storage), guardrail/output validation, structured-output parsing (Chapter on Structured Output) — each is sequential in-process work unless explicitly made asynchronous.</li>
+<li><strong>Response serialization and return to client.</strong> Typically negligible unless the payload is unusually large.</li>
+</ol>
+
+<p>
+The uncomfortable but critical realization from this walk-through: in a typical single-turn chat request, steps 6 and 7 (prefill and decode, entirely inside the provider) usually account for 70–95% of total latency. Everything you as a Spring engineer directly control (steps 1–5 and 8–10) is usually a small minority of the total time budget — which is exactly why Section 4's insight (control output length, shape prompts for caching, choose the right model) matters more than micro-optimizing your Java code. That said, under concurrency, steps 3, 4, and 9 stop being "small" the moment they involve blocking I/O on a limited thread pool — a slow synchronous memory-store read repeated across a thousand concurrent requests can starve your server long before the model provider becomes your bottleneck. Both truths hold simultaneously: the model call dominates latency for one request, and your own code can dominate throughput under load.
+</p>
+
+<h3>5.2 Edge Cases a Reader Should Be Able to Reason Through</h3>
+
+<ul>
+<li><strong>What happens if the Advisor chain does a vector search AND a database memory read sequentially, each taking 80ms?</strong> You have added 160ms of pure latency before the model is even called — invisible in a single-request test, very visible in a p95 latency dashboard once you multiply it by chain depth and concurrency contention.</li>
+<li><strong>What happens if you cache full responses keyed only on the user's message text, ignoring conversation history?</strong> Two different users (or the same user in two different conversations) asking "what did I just ask you?" would get the same cached, wrong answer — caching keys must include everything that affects correctness, not just the most visible input.</li>
+<li><strong>What happens if you stream tokens to the client but your Advisor chain's guardrail/output-validation step needs to see the complete response first?</strong> You cannot validate a response you have not fully received — streaming and post-hoc output validation are in genuine tension, and reconciling them (validate incrementally, or validate and then reveal) is a real design decision, not a checkbox.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+This topic needs modest, practical mathematics — not because the ideas are shallow, but because the two formulas below are genuinely how capacity and cost get planned in real systems, and skipping them would leave you unable to size anything.
+</p>
+
+<h3>6.1 Little's Law — Sizing Concurrency</h3>
+
+<p>
+Little's Law, borrowed directly from queueing theory and already familiar to anyone who has sized a thread pool or a connection pool, states:
+</p>
+
+<pre>
+        L = λ × W
+
+  L = average number of requests "in flight" (in the system at once)
+  λ = average arrival rate (requests per second)
+  W = average time each request spends in the system (latency)
+</pre>
+
+<p>
+Apply this directly to an AI endpoint: if your chat endpoint has an average end-to-end latency of 3 seconds (W), and you expect 20 requests per second at peak (λ), you need your system — thread pool, HTTP client connection pool, and the provider's own rate limit for your account — to sustain <strong>60 concurrent in-flight requests</strong> (L = 20 × 3). This single calculation is why "just add more replicas" without checking your provider's concurrent-request or tokens-per-minute rate limit is a common production outage: your Spring Boot instances can happily hold 60 concurrent requests in their thread pools while the provider silently starts returning HTTP 429 (rate limited) once you cross its ceiling.
+</p>
+
+<h3>6.2 Cost as a Direct Function of Tokens</h3>
+
+<p>
+Unlike most backend cost models, LLM cost per request is a simple, calculable formula you should be comfortable writing on a whiteboard:
+</p>
+
+<pre>
+  cost_per_request = (input_tokens × price_per_input_token)
+                    + (output_tokens × price_per_output_token)
+
+  monthly_cost ≈ requests_per_month × avg(cost_per_request)
+</pre>
+
+<p>
+Input and output tokens are typically priced differently (output is usually several times more expensive than input, because decode is the expensive, sequential phase described in Section 4.2). This asymmetry is precisely why "ask for a shorter answer" is a stronger cost lever than "send a shorter prompt" — trimming 500 tokens of unnecessary output typically saves more money than trimming 500 tokens of input, even though both feel like equivalent-sized cuts on paper.
+</p>
+
+<h3>6.3 Cache Hit Rate and Effective Cost</h3>
+
+<pre>
+  effective_cost_per_request = (1 − hit_rate) × full_cost
+                              + hit_rate × cached_cost
+
+  (cached_cost ≈ 0 for exact-match app-level caching;
+   cached_cost ≈ 0.1×–0.5× full_cost for provider prompt caching,
+   depending on provider pricing)
+</pre>
+
+<p>
+This formula is the honest justification for investing engineering time in caching at all: a semantic cache with a modest 30% hit rate on a high-traffic endpoint can cut effective cost by nearly a third with no change to the model or the user experience — often a larger single lever than switching to a cheaper model, and without the quality risk that model-switching carries.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Latency Breakdown of a Single Chat Request</h3>
+
+<pre>
+  Client                Spring Boot App              Model Provider
+    │                        │                              │
+    │── HTTP request ──────►│                              │
+    │                        │ auth/rate-limit  (~2ms)      │
+    │                        │ Advisor: memory read (~40ms) │
+    │                        │ Advisor: RAG lookup (~60ms)  │
+    │                        │ prompt assembly  (~1ms)      │
+    │                        │── model call ───────────────►│
+    │                        │                              │ queue delay (variable,
+    │                        │                              │   0ms–1000ms+ under load)
+    │                        │                              │ PREFILL (reads prompt,
+    │                        │                              │   scales with input len)
+    │                        │                              │ ─── first token ready ───
+    │                        │◄─── token 1 ─────────────────│
+    │◄── stream: token 1 ───│                              │ DECODE (one token at a
+    │                        │◄─── token 2 ─────────────────│   time, sequential,
+    │◄── stream: token 2 ───│         ...                   │   scales with output len)
+    │                        │◄─── token N (done) ──────────│
+    │                        │ Advisor: validate + persist   │
+    │                        │            (~30ms)            │
+    │◄── stream complete ───│                              │
+    │                        │                              │
+
+  Dominant cost for short prompts / long answers →  DECODE PHASE
+  Dominant cost for long prompts / short answers →  PREFILL + QUEUE DELAY
+  Dominant cost for you (the app engineer) to control → everything in the
+  "Spring Boot App" column, plus the SHAPE of what you send to the provider
+</pre>
+
+<h3>7.2 Three Caching Layers, Stacked</h3>
+
+<pre>
+        Incoming request
+              │
+              ▼
+   ┌───────────────────────┐   HIT → return instantly, $0, ~1ms
+   │ 1. Exact-match cache    │───────────────────────────────────►
+   │   (Redis: hash(prompt)) │
+   └───────────┬────────────┘
+               │ MISS
+               ▼
+   ┌───────────────────────┐   HIT (similarity > threshold)
+   │ 2. Semantic cache       │───► return adapted cached answer,
+   │  (embedding similarity  │      $0 model cost, ~10-30ms
+   │   search, Volume 3)     │
+   └───────────┬────────────┘
+               │ MISS
+               ▼
+   ┌───────────────────────┐   Prefix cached by provider?
+   │ 3. Call model provider  │   → cheaper + faster prefill
+   │  (static prompt prefix  │   Prefix NOT cached (dynamic
+   │   FIRST, dynamic content│    content up front)?
+   │   LAST — Section 4.4)   │   → full price, full latency
+   └───────────┬────────────┘
+               │
+               ▼
+      Store result in caches 1 & 2 for next time
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+A performance-conscious Spring AI deployment adds explicit infrastructure around the naive "controller calls ChatClient" shape you likely started with. None of these boxes are exotic — they are the same categories of infrastructure you would add to protect any expensive, rate-limited external dependency, applied deliberately here because the dependency in question is both slower and more expensive than most.
+</p>
+
+<pre>
+┌───────────────────────────────────────────────────────────────────────┐
+│                         Load Balancer / Gateway                        │
+│              (per-client rate limiting, request shaping)               │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                 Spring Boot Instances (horizontally scaled)             │
+│  - Virtual threads for request handling (Java 21)                      │
+│  - Bounded async executor for Advisor pre/post work                    │
+│  - Circuit breaker + timeout + retry (Resilience4j) around model calls │
+└───────────┬───────────────────────────┬─────────────────────────────────┘
+            ▼                           ▼
+ ┌────────────────────┐      ┌────────────────────────────┐
+ │  Exact + Semantic    │      │  Shared WebClient / HTTP    │
+ │  Cache (Redis)        │      │  connection pool, tuned      │
+ │  hot-path short-circuit│      │  per provider's concurrency  │
+ └────────────────────┘      │  limits (Section 6.1)         │
+                              └───────────┬────────────────────┘
+                                         ▼
+                     ┌───────────────────────────────────┐
+                     │   Model Provider(s), behind a       │
+                     │   ChatModel abstraction — cheap      │
+                     │   model for easy tasks, capable model│
+                     │   for hard tasks (cost-aware routing)│
+                     └───────────────────────────────────┘
+                                         ▼
+                     ┌───────────────────────────────────┐
+                     │  Observability: per-request token   │
+                     │  counts, TTFT/TTLT histograms,       │
+                     │  cache hit rate, cost-per-request,   │
+                     │  provider error/rate-limit rate       │
+                     └───────────────────────────────────┘
+</pre>
+
+<p>
+The two boxes most teams skip until an incident forces them to add it are the shared, explicitly bounded HTTP connection pool (Section 6.1's Little's Law math needs an actual number to enforce) and the token/cost observability box — without it, "performance optimization" becomes guesswork, because you cannot improve what you have not measured at the token and dollar level, per endpoint.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI and the modern Java platform give you concrete, idiomatic tools for nearly every lever described above.
+</p>
+
+<h3>9.1 Streaming with ChatClient</h3>
+
+<p>
+Spring AI's <code>ChatClient</code> exposes a reactive streaming API that returns a <code>Flux&lt;String&gt;</code> (or a <code>Flux</code> of richer chunk types), letting you forward tokens to the client as they are produced instead of blocking until generation completes:
+</p>
+
+<pre>
+@RestController
+class ChatController {
+
+    private final ChatClient chatClient;
+
+    ChatController(ChatClient.Builder builder) {
+        this.chatClient = builder.build();
+    }
+
+    @GetMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    Flux&lt;String&gt; streamChat(@RequestParam String message) {
+        return chatClient.prompt()
+                .user(message)
+                .stream()
+                .content();          // Flux&lt;String&gt; — one element per token/chunk
+    }
+}
+</pre>
+
+<p>
+This one change — swapping a blocking <code>.call().content()</code> for <code>.stream().content()</code> — is usually the single highest-leverage, lowest-effort perceived-latency win available in a Spring AI application, precisely because it converts a "wait for TTLT" experience into a "wait for TTFT" experience (Section 4.3) for free.
+</p>
+
+<h3>9.2 Bounding Output Length Explicitly</h3>
+
+<pre>
+ChatOptions options = OpenAiChatOptions.builder()
+        .maxTokens(300)          // caps decode-phase length — directly caps
+        .temperature(0.3)        // the most expensive, most latency-heavy
+        .build();                // phase described in Section 4.2 and 6.2
+
+chatClient.prompt()
+        .user(message)
+        .options(options)
+        .call()
+        .content();
+</pre>
+
+<h3>9.3 Virtual Threads for Advisor-Chain I/O</h3>
+
+<p>
+Java 21's virtual threads (enabled in Spring Boot via <code>spring.threads.virtual.enabled=true</code>) are a strong match for this workload precisely because a chat request's lifecycle (Section 5.1) is dominated by blocking waits — network calls to the model provider, cache reads, vector search calls — rather than CPU work. Virtual threads let you keep the simple, synchronous programming model for Advisors and memory stores while avoiding the platform-thread exhaustion that used to force teams into fully reactive rewrites just to survive concurrent load. This does not replace the reactive <code>Flux</code>-based streaming API in Section 9.1 — the two solve different problems (concurrency scalability vs. perceived per-request latency) and are commonly used together.
+</p>
+
+<h3>9.4 Resilience4j Around the Model Call</h3>
+
+<pre>
+@CircuitBreaker(name = "chatModel", fallbackMethod = "fallbackResponse")
+@TimeLimiter(name = "chatModel")
+@Retry(name = "chatModel")
+public CompletableFuture&lt;String&gt; askModel(String message) {
+    return CompletableFuture.supplyAsync(() ->
+        chatClient.prompt().user(message).call().content());
+}
+
+private CompletableFuture&lt;String&gt; fallbackResponse(String message, Throwable t) {
+    return CompletableFuture.completedFuture(
+        "The assistant is temporarily unavailable — please try again shortly.");
+}
+</pre>
+
+<p>
+Configure the timeout deliberately using your measured p95/p99 latency (Section 12), not a guessed round number — a timeout set below your real p95 will trip the circuit breaker on entirely healthy traffic, and one set far above it will let a hung request tie up a thread far longer than necessary.
+</p>
+
+<h3>9.5 Application-Level Caching with Spring Cache</h3>
+
+<pre>
+@Cacheable(value = "chatResponses", key = "#message", condition = "#temperature == 0.0")
+public String deterministicAnswer(String message, double temperature) {
+    return chatClient.prompt().user(message)
+            .options(OpenAiChatOptions.builder().temperature(temperature).build())
+            .call().content();
+}
+</pre>
+
+<p>
+Note the guard condition: caching only makes sense for low/zero-temperature, deterministic-style requests — caching a high-temperature creative response as if it were the single correct answer defeats the purpose of asking for variety and will produce visibly stale, repetitive output.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Measure before optimizing — instrument token counts, TTFT, TTLT, and cost per endpoint from day one.</strong> Spring AI's response metadata exposes usage/token counts; wire it into your metrics pipeline (Micrometer) rather than discovering your cost structure from a monthly invoice.</li>
+<li><strong>Cap output length deliberately per use case.</strong> A classification task needs a handful of tokens; a summarization task needs a budget matched to the expected summary length. An unbounded <code>maxTokens</code> is an unbounded latency and cost tail.</li>
+<li><strong>Order prompts with static content first, dynamic content last</strong> to maximize provider-side prompt-caching eligibility (Section 4.4) — this is free money left on the table if ignored.</li>
+<li><strong>Route by task difficulty, not uniformly to your "best" model.</strong> Classification, extraction, and simple rewriting tasks are frequently well served by smaller, cheaper, faster models; reserve the most capable (and expensive) model for tasks that demonstrably need it, validated against your evaluation suite from Chapter 63.</li>
+<li><strong>Set timeouts from measured percentiles, not guesses,</strong> and pair every timeout with an explicit fallback (Section 9.4) so a slow provider degrades your feature instead of your whole request thread pool.</li>
+<li><strong>Stream by default for any user-facing, multi-sentence response.</strong> The engineering cost is low and the perceived-latency win is consistently large.</li>
+<li><strong>Load-test against provider rate limits, not just your own infrastructure.</strong> Use Little's Law (Section 6.1) to compute expected concurrency and confirm it against your account's tokens-per-minute and requests-per-minute ceilings before a real launch.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Optimizing your Java code before checking where the time actually goes.</strong> As Section 5.1 showed, prefill and decode inside the provider usually dominate — shaving milliseconds off prompt-assembly code while ignoring an unbounded <code>maxTokens</code> setting is optimizing the wrong 5%.</li>
+<li><strong>Letting conversation memory grow unbounded.</strong> Every turn appended to history without summarization or windowing (Memory chapter) linearly increases input tokens, cost, and prefill latency on every subsequent turn of that conversation — a slow-motion performance regression that will not show up in a short test session.</li>
+<li><strong>Caching without including all relevant inputs in the cache key.</strong> Forgetting to key on conversation ID, user identity, or retrieved context produces stale or cross-contaminated answers — a correctness bug caused directly by a performance optimization.</li>
+<li><strong>Treating streaming as a substitute for actually reducing output length or model size.</strong> Streaming improves perceived latency, not total cost or total generation time (Section 4.3) — teams that stop optimizing once they add streaming often discover their cost problem was never addressed.</li>
+<li><strong>Sizing thread pools and connection pools without checking the provider's own concurrency limits.</strong> Scaling your Spring Boot replicas can create a wall of HTTP 429s the moment aggregate concurrency crosses the provider's ceiling — a failure mode invisible in single-instance testing.</li>
+<li><strong>Reordering or randomizing prompt content "for variety" without realizing it breaks prefix-based provider caching,</strong> silently paying full price and full prefill latency on every call that could have been discounted.</li>
+<li><strong>Reporting average latency instead of p95/p99.</strong> A system with a great average and a terrible tail still produces a stream of angry users — averages hide exactly the failures that matter most operationally.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+This entire chapter is about performance, so this section focuses on the concrete numbers and trade-off shapes you should carry into a real design review rather than repeating the theory above.
+</p>
+
+<ul>
+<li><strong>Latency budget allocation.</strong> For a typical customer-facing chat feature, a reasonable target split might be: &lt;100ms for auth/routing/Advisor pre-work, &lt;500ms TTFT, and a decode rate the user perceives as "typing speed" via streaming — total perceived responsiveness matters more than raw TTLT once streaming is in place.</li>
+<li><strong>Throughput ceilings are usually provider-imposed, not infrastructure-imposed.</strong> Before scaling Spring Boot replicas to handle more load, confirm your provider tier's requests-per-minute and tokens-per-minute limits — they are frequently the true ceiling, and Little's Law (Section 6.1) tells you exactly how much concurrency you can sustain within them.</li>
+<li><strong>Memory footprint of conversation history</strong> matters twice over: once as a token-cost/latency driver (Section 6.2) and once as literal JVM heap/cache memory if you hold many concurrent conversations in an in-memory store — externalize memory to Redis or a database once conversation count grows past a small in-process cache's comfort zone.</li>
+<li><strong>Cost concentration follows a long tail.</strong> In most real deployments, a small fraction of requests (very long conversations, large document uploads for summarization) account for a disproportionate share of total token spend — instrument and cap these outliers specifically rather than optimizing only the median case.</li>
+<li><strong>Caching returns diminish with personalization.</strong> Highly personalized, context-heavy conversations have inherently low cache hit rates; do not expect the same caching wins on a fully personalized assistant that you would see on a shared FAQ endpoint — measure hit rate per endpoint rather than assuming a single number applies everywhere.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Performance optimization has a real but genuinely narrower security surface than topics like prompt injection or data governance — it is worth being honest about that rather than manufacturing risk. Three concrete issues do belong here:
+</p>
+
+<ul>
+<li><strong>Cache poisoning and cross-user leakage.</strong> If an exact-match or semantic cache key is built carelessly (Section 11), one user's cached answer can leak into another user's session, or a maliciously crafted input can poison a shared cache entry that subsequent users then receive as if it were their own answer. Always scope cache keys to the correct trust boundary (per-user, per-tenant) unless the content is genuinely non-personalized and safe to share.</li>
+<li><strong>Denial-of-wallet via unbounded requests.</strong> Because cost scales directly with tokens (Section 6.2), an attacker who can submit arbitrarily long input (or repeatedly trigger long, expensive generations) can drive your bill up deliberately — a cost-based analog of a denial-of-service attack. Enforce input length limits, output token caps, and per-user rate limits as a security control, not merely a cost control.</li>
+<li><strong>Timing side channels from cache hits.</strong> A cache hit returning near-instantly versus a cache miss taking full model latency can, in principle, let an attacker infer whether a specific query (or one similar to it) has been asked before by someone else — relevant mainly in systems with shared caches across users handling sensitive queries; mitigate by scoping caches per-tenant and avoiding cross-user cache sharing for anything sensitive.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is the difference between latency and throughput in the context of an LLM-backed API?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Latency is the time a single request takes from send to complete response. Throughput is how many requests the system can sustain per unit time across many concurrent users. A system can have low latency for one request but low throughput under load if it cannot handle many requests concurrently (e.g., a small thread pool or a provider rate limit), and the two must be measured and optimized separately.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why does streaming a response improve user experience even though it does not reduce total generation time?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The model still has to generate every output token, so total compute time is unchanged. But without streaming, the user sees nothing until the entire response is done (time-to-last-token); with streaming, the user sees the first tokens after time-to-first-token, which is usually much shorter, so the request <em>feels</em> dramatically faster even though the underlying work took the same amount of time.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain the difference between the prefill and decode phases of an LLM request, and why that difference matters for optimization.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Prefill is the phase where the model reads and processes the entire input prompt before producing any output; it scales roughly with input length and is largely parallelizable internally. Decode is the phase where the model generates output tokens one at a time, autoregressively, where each token depends on all previous tokens; it scales with output length and cannot be parallelized within a single request. It matters because decode is usually the dominant cost for typical requests, meaning capping and shortening the expected output (e.g., via <code>maxTokens</code> and concise prompting) is often a more effective latency and cost lever than shortening the input prompt.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. You add a cache in front of your chat endpoint but users start seeing answers meant for other users. What went wrong and how do you fix it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The cache key almost certainly omits an identity or context dimension that should distinguish the requests — for example, caching purely on message text without including user ID, tenant ID, or conversation ID. The fix is to include every input that affects the correct answer in the cache key (user/tenant scope, relevant conversation state, retrieved context), not just the most visible text input, and to default to per-user or per-tenant cache scoping unless the content is verified to be safe and identical to share across users.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. How would you use Little's Law to decide how many concurrent in-flight requests your system needs to support, and what does that tell you about scaling strategy?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Little's Law states L = λ × W: the average number of requests in flight equals the arrival rate multiplied by the average time each request spends in the system. Given an expected peak arrival rate (from traffic projections) and a measured average end-to-end latency, you can compute the required concurrency the system — thread pools, HTTP connection pools, and the provider's own rate limits — must sustain. This matters for scaling strategy because it reveals that simply adding more Spring Boot replicas does not help once aggregate concurrency exceeds the model provider's own concurrent-request or tokens-per-minute ceiling; at that point the fix is provider-side (higher tier, multiple provider accounts, request queuing/shedding) rather than infrastructure-side.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Mention explicitly that provider rate limits, not your own infrastructure, are frequently the true throughput ceiling in LLM-backed systems — this is a distinction many candidates miss, and naming it signals real production experience rather than textbook knowledge.</div>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. A stakeholder wants every request routed to your most capable (and most expensive) model "to guarantee quality." How do you respond from a performance and cost engineering standpoint?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>I would push back with data rather than intuition: build an evaluation set (from the Testing/Evaluation work) covering the actual task distribution, and measure whether a smaller, cheaper, faster model performs acceptably on the easier segment of that distribution — extraction, classification, simple rewriting tasks are frequently well served by smaller models. Propose a cost-aware routing strategy that sends only genuinely hard cases (as identified by the evaluation results, or by a lightweight classifier/heuristic) to the expensive model, and show the latency and cost delta this produces at expected volume. This turns "guarantee quality" into "guarantee quality where it is actually at risk," which is both cheaper and, because the expensive model has more headroom for the genuinely hard requests, sometimes even yields better aggregate outcomes.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q7. Why can naive prompt construction defeat provider-side prompt caching, and how would you structure prompts to take advantage of it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Provider-side prompt caching works by recognizing a byte-identical, stably-positioned prefix across multiple calls and reusing its already-processed internal representation, avoiding reprocessing (and often reducing billed cost) for that portion of the prompt. If dynamic, per-request content (user message, timestamps, reordered instructions) is placed before or interleaved with the static content (system prompt, few-shot examples, large reference documents), the prefix is never identical across calls and the cache never hits. The fix is to structure prompts with the static, reusable content first and the variable, per-request content last, and to keep that ordering completely consistent across calls, so the provider can consistently recognize and reuse the cached prefix.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. Design the performance and cost observability strategy you would put in place before launching a customer-facing Spring AI feature at scale. What would you measure, and what would trigger an alert?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>I would instrument, per endpoint and per model, at minimum: input and output token counts (for cost attribution), time-to-first-token and time-to-last-token as separate histograms (p50/p95/p99, never just averages), cache hit rate broken out by cache layer (exact-match, semantic, provider prompt cache where visible), provider error and rate-limit (429) rates, and cost-per-request rolled up to cost-per-day by feature. Alerting thresholds would be set from measured baselines, not guesses: alert on p95 TTFT/TTLT exceeding an agreed SLO, on a sustained rise in rate-limit errors (an early warning of an approaching provider ceiling per Little's Law), on cache hit rate dropping unexpectedly (often signals a prompt-construction regression breaking cache keys or provider prefix caching), and on daily cost per feature deviating meaningfully from its rolling baseline (catching runaway conversation growth or an unbounded output-length bug before it becomes a large invoice). The unifying design principle is that every lever discussed in this chapter — output length, caching, model routing, concurrency — is only manageable if it is first observable at the token and dollar level, per request.</p>
+</div>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain in your own words why decode-phase (output) tokens typically dominate both latency and cost more than prefill-phase (input) tokens, and derive one concrete prompting practice that follows directly from this fact.</li>
+<li>A colleague proposes caching every LLM response, regardless of temperature setting, to save cost. Explain what breaks, using the distinction between deterministic and creative/high-temperature requests.</li>
+<li>Using Little's Law, explain why horizontally scaling your Spring Boot instances might fail to increase real-world throughput past a certain point, and identify what additional information you would need to find that point.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Take an existing (or sample) Spring AI <code>ChatClient</code> call in your project and convert it from a blocking <code>.call().content()</code> invocation to a streaming <code>.stream().content()</code> endpoint returning <code>text/event-stream</code>. Measure and record time-to-first-byte before and after the change for a response of at least 200 words.</li>
+<li>Instrument one existing AI-backed endpoint with Micrometer timers/counters for input tokens, output tokens, and total latency, split into at least two percentile buckets (p50 and p95). Run a short load test (even 10 concurrent requests) and report where your p95 diverges most sharply from your p50, then explain the likely cause using Section 5.1's request lifecycle.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Performance in AI systems is a three-way trade-off between latency, throughput, and monetary cost, entangled through the fact that the dominant, metered cost — the model call — is largely outside your direct control.</li>
+<li>LLM latency splits into prefill (input-driven) and decode (output-driven, sequential, usually dominant); controlling output length is frequently a stronger lever than trimming input.</li>
+<li>Streaming improves perceived latency by exposing time-to-first-token instead of time-to-last-token, but does not reduce total generation cost or compute time — the two must be optimized separately.</li>
+<li>Caching at the application layer (exact-match, semantic) and shaping prompts to be provider-cache-friendly (static content first, dynamic content last) are among the highest-leverage, lowest-risk optimizations available to you.</li>
+<li>Little's Law (L = λ × W) is the practical tool for sizing concurrency and thread/connection pools, and for recognizing when a provider's own rate limits — not your infrastructure — are the true throughput ceiling.</li>
+<li>Every optimization in this chapter must be measured at the token and dollar level per endpoint; without that observability, "performance optimization" degrades into guesswork and can silently trade away quality for speed.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Volume 2 closes here having taken you from a raw <code>ChatModel</code> call through memory, tools, structured output, testing, and now performance and cost — a complete, production-grade harness around a foundation model. Volume 3 begins by opening the box you have so far treated as an opaque endpoint: Chapter 65, Embedding Models, is where you learn what a vector actually represents, how models turn meaning into geometry, and why that geometry is the foundation every retrieval-augmented system you build from here on depends on.
+</p>
+
+</div>
+
+</body>
+</html>

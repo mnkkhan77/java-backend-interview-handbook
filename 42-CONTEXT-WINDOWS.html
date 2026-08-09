@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>42-CONTEXT-WINDOWS.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 42 — CONTEXT WINDOWS</h1>
+
+<p class="roi">Volume 1 — AI Foundations · Chapter 15 of 22</p>
+
+<div class="callout">
+Vector Mathematics (Chapter 41) gave you the geometry that makes an embedding meaningful — direction, magnitude, similarity, the coordinate space a model reasons in. But geometry alone does not tell you how much a model can actually look at before it produces a single token. Every prompt, every retrieved document, every turn of chat history, every tool definition you hand to a model has to fit inside one fixed, finite, expensive resource: the <strong>context window</strong>. This chapter is where "how much can the model see right now" stops being an afterthought and becomes a first-class engineering constraint you will budget, measure, and design around for the rest of this series.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every Spring Boot engineer has, at some point, hit a resource ceiling that forced a design change: a connection pool that maxed out under load, a JVM heap that needed tuning, a database row limit that made a naive "just load everything" query fall over. Context windows are that same category of constraint, transplanted into AI Engineering — except this ceiling is not a tunable infrastructure parameter you can raise with a config change. It is a property of the model itself, fixed at training and architecture time, and it governs literally everything you will build in Volumes 2 through 6.
+</p>
+
+<p>
+Here is why this chapter cannot wait: almost every non-trivial AI feature you will design involves cramming more information into a single model call than naive intuition suggests will fit. A customer support copilot needs the current ticket, several turns of prior conversation, three retrieved knowledge-base articles, and a system prompt describing tone and tool access — all at once, in one call, before the model produces a single word of output. If you do not understand precisely what a context window is, how it is consumed, and what happens when you exceed it, you will write code that works perfectly in your five-message demo and then silently degrades, truncates, or errors out the moment a real user has a long conversation or your retrieval step returns a slightly larger document than usual.
+</p>
+
+<p>
+This matters even more because context windows are not just a capacity limit — they are an <strong>attention economy</strong>. Later in this chapter you will see the "lost in the middle" phenomenon: a model can technically fit 100,000 tokens in its window and still pay uneven attention to what is inside it, favoring the beginning and the end over the middle. Understanding the context window is therefore not just about "does it fit" — it is about "does the model actually use what I put in there, and where should I put it so that it does." Every chapter downstream of this one — Retrieval-Augmented Generation, Chat Memory, Prompt Engineering, Agents — is, underneath, a discipline built to manage this one finite resource wisely.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Before Attention: Memory That Decayed</h3>
+
+<p>
+Before the Transformer architecture (covered in an earlier chapter in this volume), sequence models like Recurrent Neural Networks (RNNs) and their improved successor, Long Short-Term Memory networks (LSTMs), processed text one token at a time, carrying forward a fixed-size "hidden state" vector as a summary of everything seen so far. In principle, this hidden state could represent memory of unlimited length — there was no hard architectural wall. In practice, it was a leaky bucket: each new token compressed and partially overwrote the running summary, and gradients used during training to reinforce long-range dependencies shrank exponentially the further back in the sequence they had to travel — the <strong>vanishing gradient problem</strong>. The practical result was that RNN/LSTM-based models "forgot" information from more than a few dozen to a few hundred tokens back, no matter how the architecture was tuned. There was no explicit "context window" number to configure; there was a soft, leaky memory that degraded with distance.
+</p>
+
+<h3>2.2 The Transformer Trade: Explicit Window, Explicit Cost</h3>
+<p>
+The 2017 Transformer architecture solved the leaky-memory problem with a very different design: instead of compressing history into one running hidden state, self-attention lets every token directly look at every other token in the input, regardless of distance, with no decay from position alone. This was a genuine breakthrough for long-range recall. But it traded one problem for a new, very concrete one: computing attention between every pair of tokens costs compute and memory that grows <strong>quadratically</strong> with the number of tokens (formalized in Section 6). This is precisely why, unlike RNNs, Transformer-based models ship with a hard, published, architectural number: the <strong>maximum context length</strong> — a wall the model was built and trained against, not a soft degradation.
+</p>
+
+<h3>2.3 The Race to Extend the Window</h3>
+<p>
+Once context length became a marketed, comparable specification, the industry moved through it quickly. Early GPT-2 shipped with a 1,024-token window. GPT-3 doubled that to 2,048, and its "-16k"/"-32k" successors pushed further using techniques like better positional encodings. By the mid-2020s, commercial models routinely advertised 100,000+ token windows, with some providers pushing past one million tokens. This did not happen just by "training on more tokens" — it required real architectural work:
+</p>
+
+<table>
+<tr><th>Technique</th><th>Core Idea</th><th>What It Bought</th></tr>
+<tr><td>Better positional encodings (RoPE, ALiBi)</td><td>Encode token position in a way that generalizes to positions rarely or never seen during training</td><td>Models could be evaluated at longer lengths than they were fully trained on without collapsing</td></tr>
+<tr><td>Sparse / windowed attention</td><td>Instead of attending to every token, attend only to a local window or a fixed sparse pattern</td><td>Sub-quadratic compute cost, enabling much longer nominal windows</td></tr>
+<tr><td>FlashAttention and fused kernels</td><td>Compute exact attention faster and with far less memory traffic, without changing the math</td><td>Made existing quadratic attention cheap enough in practice to push window sizes higher</td></tr>
+<tr><td>Ring attention / context parallelism</td><td>Split a very long sequence's attention computation across multiple accelerators</td><td>Enabled training and inference at extreme lengths (hundreds of thousands to millions of tokens)</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you as an engineer:</strong> a bigger advertised context window is not automatically a better one. Two models can both claim "200,000 tokens" while having very different effective recall inside that window, because they got there through different trade-offs (some sacrifice attention fidelity for length via sparsity; others pay full quadratic cost). This is why benchmarking a model's actual long-context behavior on your workload — not trusting the marketing number — remains a real engineering task, one you will revisit when this series covers evaluation.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Strip away the marketing numbers and the history, and the engineering problem a context window forces you to solve is precise and unavoidable:
+</p>
+
+<div class="callout">
+<strong>Every model call has a single, fixed, shared token budget that must simultaneously hold the system instructions, the conversation history, any retrieved or injected knowledge, the user's current input, AND leave enough room for the model's own output — and if the sum exceeds that budget, something must be cut, and you, not the model, must decide what.</strong>
+</div>
+
+<p>
+Notice the phrase "you, not the model." A context window is not a smart, self-managing cache — it has no built-in notion of "this part of the conversation is more important than that part." If you exceed the limit, the API call fails outright, or (depending on the client/library) older content gets silently truncated from one end. Either way, an engineering decision about <em>what to drop, what to summarize, and what to keep</em> has to be made by your application, deliberately, before the call is made — or it will be made for you, badly, by whatever default truncation behavior your client library happens to implement.
+</p>
+
+<p>
+This reframes a whole category of downstream problems you will meet in this series. Retrieval-Augmented Generation (Volume 3) is, from this chapter's point of view, mostly a context-window budgeting problem: which of your thousands of private documents are worth spending your limited token budget on for this specific query? Chat memory (Volume 2) is a context-window budgeting problem across time: which turns of a long-running conversation still deserve a seat in the window, and which should be summarized or dropped? Multi-agent orchestration (Volume 4) frequently exists specifically to avoid ever putting an entire problem's worth of context into one window at all, splitting it across multiple calls instead. Once you see context windows as a budgeting problem, the shape of nearly the entire rest of this book becomes visible.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 What a Context Window Actually Is</h3>
+
+<p>
+A context window is the maximum number of <strong>tokens</strong> — the sub-word units covered conceptually in earlier chapters on tokenization and embeddings — that a model can process as input and generate as output in a single call, combined. It is not measured in characters, words, or "messages" the way a chat UI might display them; it is measured strictly in the model's own tokenizer units, and different models tokenize the same text differently, so a 500-word paragraph might be 650 tokens in one model's tokenizer and 720 in another's.
+</p>
+
+<p>
+The cleanest working analogy for a Java engineer: think of the context window as a <strong>fixed-size arena allocator</strong>, not a growable <code>ArrayList</code>. You get one contiguous block of a known, fixed capacity at the start of the call. Everything you want the model to consider — instructions, history, retrieved facts, the current question — has to be laid out inside that one block before the call begins. There is no "expand and copy" operation available mid-call the way there is with a resizable collection. If it does not fit, it does not go in, full stop.
+</p>
+
+<h3>4.2 Context Length vs. Effective Context</h3>
+
+<p>
+This is the single most important theoretical distinction in this chapter, and the one most engineers get wrong the first time they design a long-context feature. <strong>Context length</strong> is the architectural, published maximum — the size of the arena. <strong>Effective context</strong> is how much of that arena the model actually uses well when producing an answer. These are not the same number, and the gap between them is not a bug you can patch — it is a structural property of how attention is trained and distributed.
+</p>
+
+<p>
+The most-cited symptom of this gap is the <strong>"lost in the middle"</strong> effect: when relevant information is placed near the very beginning or the very end of a long context, models retrieve and use it reliably; when the same information is placed in the middle of a long context, retrieval accuracy measurably drops, even though the information is technically well within the advertised window. Intuitively, this mirrors something you already know from human cognition — reading a very long email, you remember the opening line and the closing ask far better than a fact buried in paragraph 14 — except here it is a measurable, model-specific curve you can benchmark, not just an analogy.
+</p>
+
+<h3>4.3 The Sliding Window Mental Model</h3>
+
+<p>
+For a single, self-contained model call, the context window is simply "the whole input, all at once" — there is no sliding involved. Sliding becomes relevant the moment you have an <em>ongoing conversation</em> that grows across many calls. Picture a physical window frame of fixed width sliding along a very long scroll of text representing the full conversation history: as new turns are added on the right, and the frame's width cannot grow, something has to leave from the left (or be compressed) to keep the visible portion within the frame's fixed size. This "sliding window" framing is exactly how conversational memory management (formalized in Volume 2's Memory chapter) has to work in practice, and it is the mental model this chapter's Internal Working section will make mechanical.
+</p>
+
+<h3>4.4 Prefill vs. Decode: Two Different Relationships to the Window</h3>
+
+<p>
+A model interacts with its context window in two distinct phases, and conflating them is a common source of confused intuitions about latency and cost (both formalized further in Sections 6 and 12):
+</p>
+
+<ul>
+<li><strong>Prefill</strong> — the model processes your entire input (system prompt, history, retrieved context, user turn) in one pass, computing attention across all of it before producing the first output token. This is where context length directly, heavily affects latency: a bigger input means a bigger one-time computation before anything comes back.</li>
+<li><strong>Decode</strong> — the model then generates output tokens one at a time, and each new token still has to attend back across the entire context (input plus everything generated so far). This is where a cached representation of the context — the <strong>KV cache</strong>, introduced mechanically in Section 5 — becomes essential to keeping generation fast.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Now make the theory mechanical. Here is what actually happens, step by step, from the moment your application assembles a prompt to the moment tokens start streaming back.
+</p>
+
+<h3>5.1 Step 1 — Tokenization and Budget Accounting</h3>
+<p>
+Before anything reaches the model's neural network, every piece of text you plan to send — system prompt, chat history, retrieved documents, the current user message — is converted into tokens by the model's specific tokenizer. This is the first place a context-window bug can be born: application code that estimates size in words or characters, rather than actually tokenizing (or using an accurate token-count estimator), routinely under- or over-estimates how much room is left, because tokenization ratios vary by language, by content type (code tokenizes differently from prose), and by model family.
+</p>
+
+<h3>5.2 Step 2 — Assembly Into One Ordered Sequence</h3>
+<p>
+All of those token streams are concatenated, in a specific order determined by your application (and, for chat-style models, wrapped with role markers distinguishing system/user/assistant turns), into one single flat sequence of tokens that must not exceed the model's maximum context length. There is no separate "channel" for system instructions versus retrieved documents versus chat history at the hardware level — they are all just tokens in one sequence, competing for the same fixed-size slot. This is precisely why ordering and placement (Section 4.2's "lost in the middle") matters so much: the model does not receive a labeled bundle of "important system rules" and "less important background text" — it receives one sequence and has learned, from training data patterns, to weight positions unevenly.
+</p>
+
+<h3>5.3 Step 3 — Positional Encoding</h3>
+<p>
+Because self-attention on its own has no inherent sense of order (it can look at any token regardless of position, as covered in the Transformers chapter), each token's position within the sequence is injected via a positional encoding scheme (absolute position embeddings in older models; relative schemes like RoPE — Rotary Position Embeddings — in most modern ones). This step is what lets the model tell "the user's question, asked just now" apart from "a similar-looking sentence from twelve turns ago." It is also the exact mechanism that determines how gracefully — or how badly — a model handles positions longer than anything it saw during training, which is why context-length extension (Section 2.3) is fundamentally about re-engineering this step, not just "letting more tokens through."
+</p>
+
+<h3>5.4 Step 4 — Full Self-Attention Across the Window (Prefill)</h3>
+<p>
+With tokens embedded and positionally encoded, the model computes self-attention: for every token, a weighted look at every other token in the sequence (subject to causal masking, so a token cannot attend to tokens that come after it — the model can only look backward in time, never forward, matching how it will later have to generate left-to-right). This all-pairs computation is what makes the window a <em>hard architectural boundary</em> rather than a soft configuration knob: the attention mechanism itself, and the matrices it was trained with, are sized for a maximum sequence length. Feed it more tokens than that and there is no well-defined computation to fall back to — this is why providers return an explicit error, rather than a degraded answer, when you exceed the stated limit.
+</p>
+
+<h3>5.5 Step 5 — The KV Cache and Autoregressive Decoding</h3>
+<p>
+Once prefill computes attention over the full input once, generating the first output token, the model does not want to recompute attention over the entire input again from scratch for every subsequent token — that would be wastefully redundant. Instead, it caches the intermediate "key" and "value" projections for every token already processed — the <strong>KV cache</strong> — and each new generated token only needs to compute its own query against that cache plus append its own key/value to it. This is why decode latency per additional output token stays roughly proportional to context length (each new token still attends across the whole growing cache) rather than needing to redo the full quadratic computation every single step. It is also why the KV cache, not the model weights alone, frequently becomes the dominant consumer of GPU memory at long context lengths and large batch sizes — a fact with direct production consequences covered in Section 12.
+</p>
+
+<h3>5.6 Step 6 — What Happens at the Boundary</h3>
+<p>
+When your assembled sequence would exceed the maximum context length, one of a few things happens, and which one depends entirely on your client/library, not the model:
+</p>
+<ul>
+<li><strong>Hard rejection</strong> — the API call fails with an explicit error (most production-grade clients and providers behave this way by default; this is the safest failure mode because it is loud and catchable).</li>
+<li><strong>Silent truncation</strong> — some client libraries or self-managed pipelines will quietly drop the oldest messages (or, worse, truncate from an arbitrary point) to fit, which can silently remove a system instruction, an important early clarification, or a piece of retrieved evidence without any error being raised.</li>
+<li><strong>Application-managed compaction</strong> — the correct production pattern (detailed in Sections 8–10): your own code proactively summarizes, drops, or re-ranks content <em>before</em> the boundary is ever hit, so the model never sees a raw truncation event at all.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS — INTUITION FIRST, FORMALISM WHERE IT HELPS</h1>
+
+<div class="section">
+
+<p>
+You do not need to derive attention mathematics from scratch here — that belongs to the Transformers chapter. What you do need, as an engineer who will be asked to justify latency and cost numbers, is the shape of two specific growth curves.
+</p>
+
+<h3>6.1 Why Attention Cost Grows Quadratically</h3>
+<p>
+Self-attention computes a relevance score between <em>every pair</em> of tokens in the sequence. If your sequence has <code>n</code> tokens, the number of pairs to score is proportional to <code>n × n</code>, written as <strong>O(n²)</strong>. Double your context length, and the core attention computation for prefill does not double — it roughly quadruples. This is the single fact that explains why context windows did not simply grow to "infinite" the moment someone wanted them to: naively, a 10x longer window is not 10x more expensive, it is closer to 100x more expensive for the attention step alone.
+</p>
+
+<pre>
+Sequence length (n)     Pairwise attention scores (∝ n²)     Relative cost
+────────────────────    ─────────────────────────────────    ─────────────
+  1,000 tokens                  ~1,000,000                        1x
+  4,000 tokens                 ~16,000,000                       16x
+ 16,000 tokens                ~256,000,000                      256x
+ 64,000 tokens              ~4,096,000,000                     4096x
+</pre>
+
+<p>
+This is precisely why the engineering techniques in Section 2.3 (sparse attention, FlashAttention's memory-efficient exact computation, ring attention's parallelization) exist — they attack this curve directly, either by not computing every pair, or by computing every pair much more efficiently, or by spreading the computation across more hardware.
+</p>
+
+<h3>6.2 KV Cache Memory: Linear, But Not Small</h3>
+<p>
+Unlike the attention computation itself, the KV cache's memory footprint grows <strong>linearly</strong> with sequence length — but the constant factor involves the number of layers and attention heads in the model, so it adds up fast. A useful mental formula, without needing exact model internals:
+</p>
+<pre>
+KV cache size  ≈  2 × (num_layers) × (num_heads × head_dim) × (sequence_length) × (bytes_per_value) × (batch_size)
+
+  the leading 2  → one cache for Keys, one for Values
+  num_layers     → every transformer layer keeps its own cache
+  sequence_length → grows as the conversation/context grows
+  batch_size     → serving many concurrent requests multiplies this directly
+</pre>
+<p>
+The concrete number matters less here than the shape: this is a straight line that keeps climbing as context length grows, and it climbs faster when you serve many concurrent long-context requests at once — which is exactly why context length interacts directly with a production system's maximum concurrency, not just with a single user's latency (formalized in Section 12).
+</p>
+
+<h3>6.3 Token Budgeting Arithmetic</h3>
+<p>
+The arithmetic you will actually do as an application engineer is simpler than the internals above, and it is worth internalizing as a habit, not a one-off calculation:
+</p>
+<pre>
+available_for_input  =  max_context_length  −  reserved_output_tokens
+
+prompt_budget        =  available_for_input
+                          − tokens(system_prompt)
+                          − tokens(tool/function definitions)
+                          − tokens(retrieved_context)
+                          − tokens(conversation_history)
+                          ≥ tokens(current_user_turn)   ← must hold, or something must be cut
+</pre>
+<p>
+Every production system that talks to a model performs some version of this subtraction before every call — whether that logic is explicit and deliberate, or accidental and buried inside a client library's default truncation behavior.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Anatomy of One Context Window at Call Time</h3>
+
+<pre>
+┌───────────────────────────── MAX CONTEXT LENGTH (fixed, e.g. 128,000 tokens) ─────────────────────────────┐
+│                                                                                                              │
+│ ┌──────────────┐┌───────────────┐┌──────────────────────┐┌────────────────────┐┌───────────┐┌────────────┐ │
+│ │ System Prompt││ Tool/Function ││ Retrieved Context      ││ Conversation        ││ Current   ││ RESERVED    │ │
+│ │ & Persona     ││ Definitions   ││ (RAG chunks, Vol. 3)   ││ History (turns)     ││ User Turn ││ for Output  │ │
+│ │  ~400 tok     ││  ~600 tok     ││  ~6,000 tok             ││  ~3,000 tok          ││  ~200 tok ││  ~4,000 tok │ │
+│ └──────────────┘└───────────────┘└──────────────────────┘└────────────────────┘└───────────┘└────────────┘ │
+│                                                                                                              │
+│      ◄───────────────────────────  everything above is INPUT tokens  ───────────────────────────►          │
+│                                                                                        OUTPUT budget ─────► │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  If system + tools + retrieved + history + current turn + reserved-output > MAX_CONTEXT_LENGTH:
+        → the call fails, OR the client silently truncates, unless YOUR code compacted first.
+</pre>
+
+<h3>7.2 The Sliding Window Across a Growing Conversation</h3>
+
+<pre>
+Turn 1    Turn 2    Turn 3    Turn 4    Turn 5    Turn 6    Turn 7    Turn 8    Turn 9    Turn 10
+  │         │         │         │         │         │         │         │         │         │
+  ▼         ▼         ▼         ▼         ▼         ▼         ▼         ▼         ▼         ▼
+[=========================== fixed-width context window frame ===========================]
+  ▲                                                                                         ▲
+  window covers turns 1-10 comfortably while the conversation is short
+
+... conversation keeps growing ...
+
+                    Turn 4    Turn 5    Turn 6    Turn 7    Turn 8    Turn 9    Turn 10   Turn 11   Turn 12
+                      │         │         │         │         │         │         │         │         │
+                      ▼         ▼         ▼         ▼         ▼         ▼         ▼         ▼         ▼
+      [dropped/summarized] [=========================== fixed-width window frame ===========================]
+                      ▲                                                                                       ▲
+      Turns 1-3 no longer fit raw. They must be DROPPED, SUMMARIZED, or MOVED to retrieval —
+      the window itself has no memory of them once they scroll out; only your application does.
+</pre>
+
+<p class="followup">
+Keep both diagrams pinned mentally. The first explains why a single call can fail even when your "message" feels short — the system prompt, tools, and retrieved context are all invisibly eating the same budget. The second explains why every long-running chat feature eventually needs an explicit memory-management policy — the window does not remember on its own; it only ever sees whatever your application chose to slide back into frame.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a real deployed system, "does it fit in the context window" is not a question you answer once during development — it is a decision made, deliberately, on every single request, by a dedicated piece of the pipeline.
+</p>
+
+<pre>
+                     ┌─────────────────────────────────────────┐
+                     │         Incoming user message             │
+                     └───────────────────┬───────────────────────┘
+                                         ▼
+                     ┌─────────────────────────────────────────┐
+                     │   Token Budget Manager                    │
+                     │   - counts tokens for every candidate      │
+                     │     piece of context (system, history,     │
+                     │     retrieved docs, tool defs)              │
+                     │   - reserves output budget                 │
+                     └───────────────────┬───────────────────────┘
+                                         ▼
+        ┌────────────────────────────────────────────────────────────┐
+        │              Compaction / Selection Layer                   │
+        │   - truncate or summarize oldest chat turns                 │
+        │   - re-rank & cap number of retrieved RAG chunks (Vol. 3)    │
+        │   - drop low-priority tool definitions if near limit         │
+        └───────┬───────────────────────┬──────────────────┬───────────┘
+                ▼                       ▼                  ▼
+      ┌──────────────────┐   ┌───────────────────┐  ┌────────────────┐
+      │  Chat Memory Store │   │  Vector Store /     │  │  Prompt         │
+      │  (per session)      │   │  Retrieval (Vol. 3)  │  │  Assembly       │
+      └──────────────────┘   └───────────────────┘  └────────────────┘
+                                         ▼
+                     ┌─────────────────────────────────────────┐
+                     │     Model call (ChatModel / ChatClient)   │
+                     │      one flat token sequence, ≤ max len   │
+                     └───────────────────┬───────────────────────┘
+                                         ▼
+                     ┌─────────────────────────────────────────┐
+                     │   Response streamed back; new turn        │
+                     │   appended to Chat Memory Store for       │
+                     │   the NEXT request's budget calculation   │
+                     └─────────────────────────────────────────┘
+</pre>
+
+<p>
+Two architectural details matter here that are easy to miss. First, the Token Budget Manager has to run <em>before</em> retrieval finalizes how many chunks to return and <em>before</em> chat memory decides how many turns to include — budgeting is not a final validation step, it is an input to the earlier decisions, or you end up computing expensive retrieval and then throwing most of it away. Second, this whole pipeline runs on <em>every request</em> of a multi-turn conversation, not once at session start, because the budget changes shape as history and retrieved content change from turn to turn.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI treats context-window management as a first-class, pluggable concern rather than something you hand-roll with string concatenation, and the abstractions map cleanly onto the pipeline in Section 8.
+</p>
+
+<table>
+<tr><th>Concept From This Chapter</th><th>Spring AI / Spring Boot Surface</th></tr>
+<tr><td>The model itself, abstracted from any single vendor</td><td><code>ChatModel</code> — the low-level abstraction; different providers plug in behind the same interface</td></tr>
+<tr><td>Building and sending an assembled request</td><td><code>ChatClient</code> — the fluent, high-level API you actually call from application code, composing prompt, options, and advisors</td></tr>
+<tr><td>Cross-cutting logic wrapped around every model call (memory injection, logging, guardrails)</td><td><code>Advisor</code> — Spring AI's AOP-flavored interceptor mechanism; chat-memory advisors are exactly where you would implement window-budget-aware trimming</td></tr>
+<tr><td>Storing and replaying prior conversation turns within a budget</td><td><code>ChatMemory</code> abstraction, with a windowed implementation that keeps only the most recent N messages per conversation, and an accompanying memory advisor that injects the retained history back into each new request before it reaches the model</td></tr>
+<tr><td>Splitting long source documents so retrieval never returns oversized chunks</td><td><code>TokenTextSplitter</code> — a document transformer used during ingestion (Volume 3) that chunks text by an approximate token count rather than raw character count, so retrieved pieces are budget-predictable</td></tr>
+<tr><td>Limiting how much retrieved knowledge enters a single call</td><td>Configuring <code>topK</code> / similarity thresholds on your <code>VectorStore</code> query, and capping the number of documents an Advisor injects into the prompt</td></tr>
+</table>
+
+<p>
+The practical Java pattern looks like a pipeline of small, testable decisions rather than one giant prompt-building method:
+</p>
+
+<pre>
+// Illustrative shape, not a full working example — the point is the ORDER of decisions,
+// which mirrors the Section 8 architecture: budget first, then select, then assemble.
+
+int maxContextTokens   = model.getMaxContextLength();      // architectural constant for this model
+int reservedForOutput  = 1500;                              // leave room for the answer
+int availableForInput  = maxContextTokens - reservedForOutput;
+
+int systemPromptTokens = tokenCounter.count(systemPrompt);
+int toolDefTokens      = tokenCounter.count(toolDefinitions);
+int remainingBudget     = availableForInput - systemPromptTokens - toolDefTokens;
+
+List<Document> retrieved = vectorStore.similaritySearch(
+        SearchRequest.query(userMessage).withTopK(8));
+List<Document> trimmedRetrieved = tokenBudgetSelector.selectWithinBudget(
+        retrieved, remainingBudget * 0.6);          // e.g. reserve ~60% of what's left for RAG context
+
+int afterRetrieval = remainingBudget - tokenCounter.count(trimmedRetrieved);
+List<Message> trimmedHistory = chatMemory.getWithinBudget(conversationId, afterRetrieval);
+
+Prompt prompt = promptBuilder
+        .system(systemPrompt)
+        .documents(trimmedRetrieved)
+        .messages(trimmedHistory)
+        .user(userMessage)
+        .build();
+
+ChatResponse response = chatClient.prompt(prompt).call().chatResponse();
+</pre>
+
+<p>
+Notice this is exactly the Section 6.3 arithmetic, expressed as Java control flow. This is the mindset shift for this chapter specifically: a senior Spring engineer treats <code>availableForInput</code> the way they would treat an available connection-pool slot or a remaining rate-limit quota — a resource you check and allocate deliberately, not one you discover you've exhausted only when a call fails in production.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Always reserve output tokens explicitly, before budgeting input.</strong> A call that fills the entire context window with input and leaves no room for a complete answer will produce a response that gets cut off mid-sentence — a subtle, ugly failure mode that is easy to miss in testing with short prompts.</li>
+<li><strong>Count tokens with the actual model's tokenizer, not word count or character count as a proxy.</strong> Estimates based on "roughly 4 characters per token" are fine for rough dashboards, but budget-critical decisions (will this fit) need real counts, because the error compounds across system prompt, tools, history, and retrieval simultaneously.</li>
+<li><strong>Put the most important instructions and the most important facts near the beginning or the end of the assembled context, not buried in the middle.</strong> This is a direct, actionable response to the "lost in the middle" effect from Section 4.2 — for example, restate the user's core question or the critical constraint immediately before the final user turn, even if it was already stated earlier in the conversation.</li>
+<li><strong>Summarize or compact aggressively rather than truncating blindly.</strong> A short, model-generated summary of turns 1–8 of a conversation usually preserves more useful signal per token than the raw, verbatim text of those same turns — treat summarization as a first-class memory-management strategy, not a fallback.</li>
+<li><strong>Cap retrieval, don't just retrieve "the top K you feel like."</strong> Decide the RAG token budget mathematically (Section 6.3), and let the retrieval layer return exactly as many chunks as that budget allows, re-ranked by relevance — dumping every semi-relevant chunk in "just in case" wastes budget that could have gone to conversation history or output length.</li>
+<li><strong>Take advantage of prompt caching where your provider supports it.</strong> Many providers can cache and reuse the processing of a stable prefix (e.g., a fixed system prompt and tool definitions) across repeated calls, meaningfully cutting prefill latency and cost for the unchanging portion of your context.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Assuming a bigger context window means the retrieval/history problem is "solved."</strong> A 200,000-token window does not mean you should stop being disciplined about what you put in it — Section 4.2's effective-context gap means stuffing the window with marginally relevant content can actively dilute the model's attention on the parts that matter, even though everything "fits."</li>
+<li><strong>Letting conversation history grow unbounded across a long-running session.</strong> Without an explicit windowing or summarization policy, a chat feature that works fine in a five-minute demo will, days into real usage, either hit a hard context-length error or start silently losing early turns via unmanaged client-side truncation.</li>
+<li><strong>Forgetting that tool/function definitions consume real tokens too.</strong> Agentic systems (Volume 4) that register many tools can burn a surprisingly large, easy-to-overlook chunk of the budget on tool schemas alone, before a single word of actual conversation is sent.</li>
+<li><strong>Treating token counting as optional because "the request usually just works."</strong> This is a classic works-in-dev, breaks-in-production trap: your test conversations are short, your test documents are small, and the first time a real user pastes a long document or has an unusually long conversation, the call fails in a way you never exercised.</li>
+<li><strong>Re-sending the entire chat history on every single turn without ever compacting it, purely because it's simpler to implement.</strong> This is not just a correctness risk (eventual overflow) — it is a direct, compounding cost and latency problem, since every turn now re-processes an ever-larger prefill, covered concretely in Section 12.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Context window size is one of the most direct levers on latency, throughput, and cost that you will control as an AI engineer — more direct, in many systems, than the choice of model itself.
+</p>
+
+<ul>
+<li><strong>Time-to-first-token scales with input length.</strong> Because prefill (Section 5.4) has to process the entire input before generating the first output token, a call with a large system prompt, long history, and several retrieved documents will have a noticeably longer time-to-first-token than a short one — this is felt directly by users as "the assistant is thinking" delay, and it grows non-linearly with context length due to the O(n²) attention cost from Section 6.1.</li>
+<li><strong>Per-token decode cost grows with context length too, just more gently.</strong> Each generated token still attends across the full KV cache (Section 5.5), so a long-context conversation generates each subsequent token slightly slower than a short one — the effect is smaller than prefill's, but it compounds over long streamed responses.</li>
+<li><strong>KV cache memory competes directly with serving concurrency.</strong> Because KV cache size grows with both sequence length and batch size (Section 6.2), a provider or self-hosted deployment serving many simultaneous long-context requests can hit GPU memory limits well before hitting compute limits — this is why some providers cap concurrent long-context requests more aggressively than short-context ones, and why self-hosting a model with very long context support requires provisioning memory, not just raw compute.</li>
+<li><strong>Cost is (almost always) billed per token, on both sides of the window.</strong> Input tokens and output tokens are typically priced separately, and a design that habitually resends large, redundant context on every turn (Section 11) pays that cost every single turn — this is the single most common avoidable line item in a production AI system's bill, and it is fixed entirely by the budgeting and compaction discipline from Sections 8–10.</li>
+<li><strong>Prompt caching changes the economics of a stable prefix.</strong> If your system prompt and tool definitions do not change between calls, provider-side prompt caching can turn a large fraction of your input tokens into a much cheaper, much faster "cache hit" on repeated calls — a lever worth designing your prompt structure around (stable content first, variable content last) specifically to make caching effective.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Context windows have a real, specific security surface, and it grows precisely as your application relies on them more heavily for RAG and multi-turn memory.
+</p>
+
+<ul>
+<li><strong>The context window is where prompt injection actually lands.</strong> As covered conceptually in an earlier chapter, a model cannot cleanly distinguish trusted instructions from untrusted data within one flat token sequence — and because a large context window can comfortably hold long retrieved documents or tool outputs, it is exactly the retrieved-document or history slot in Section 7.1's anatomy diagram where an attacker-controlled instruction is most likely to be smuggled in, sometimes deliberately placed away from the beginning/end where a human reviewer is most likely to skim.</li>
+<li><strong>Long-lived chat memory can leak across sessions or tenants if isolation is sloppy.</strong> A chat memory store keyed incorrectly (shared session identifiers, caching bugs, or a memory advisor pulling from the wrong conversation ID) can inject one user's prior conversation — potentially containing sensitive information — into another user's context window. In a multi-tenant system, this is a data-leakage bug with the same severity as a broken row-level security policy in a database.</li>
+<li><strong>Very large contexts make manual review impractical.</strong> A system that stuffs tens of thousands of tokens of retrieved content into a window makes it functionally impossible for a human to review everything the model actually saw before it acted — this is a real argument for keeping retrieved-context budgets deliberately tight and auditable, not just "as large as the window allows," especially for any pipeline where the model's output can trigger a real-world action (Volume 4).</li>
+</ul>
+
+<p>
+This chapter's security surface is narrower than, say, the Guardrails or Prompt Injection chapters later in this series — a context window is a resource-management mechanism, not an authorization mechanism — but it is honest to note that resource limits and security boundaries are not the same thing, and treating "it fits in the window" as any kind of safety signal is a mistake worth naming explicitly here.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is a context window, and what unit is it measured in?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A context window is the maximum amount of input plus output a model can process in a single call. It is measured in tokens — the model's own sub-word units — not in words or characters, and different models tokenize the same text into different numbers of tokens.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. What happens if the total tokens you send exceed a model's maximum context length?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The call either fails outright with an explicit error from the API/provider, or — depending on the client library — gets silently truncated from one end before being sent. Well-designed production systems avoid both outcomes by proactively budgeting and compacting content before the limit is ever reached.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain the difference between "context length" and "effective context," and why the distinction matters in practice.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Context length is the architectural maximum number of tokens a model can accept. Effective context is how well the model actually uses information at different positions within that maximum — in practice, models tend to attend more reliably to content near the beginning and end of a long context than content buried in the middle (the "lost in the middle" effect). It matters because a model can technically fit relevant information within its window and still fail to use it correctly, so simply "fitting" is not the same as "being retrievable" — placement and compaction strategy matter even when raw capacity is not the bottleneck.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why does attention cost grow quadratically with sequence length, and what techniques have been used to soften that cost?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Self-attention computes a relevance score between every pair of tokens in the sequence, so the number of pairwise computations grows proportionally to the square of the sequence length. Techniques that soften this include sparse or windowed attention (not scoring every pair), memory-efficient exact-attention implementations like FlashAttention (reducing memory traffic without changing the math), and parallelization schemes like ring attention that spread the computation across multiple accelerators.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q5. What is a KV cache, and why does it matter for context-window-heavy applications?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The KV cache stores the key and value projections computed for every token already processed, so that generating each new output token only requires a fresh computation for that one token against the cache, rather than recomputing attention over the entire sequence from scratch. It matters because its memory footprint grows with both sequence length and batch size, meaning long-context, high-concurrency workloads can become memory-bound on the KV cache well before they become compute-bound.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Design a strategy for managing context window budget in a customer-support chat application with long-running conversations and a RAG knowledge base. What do you prioritize, and what do you sacrifice first when the budget is tight?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Reserve output tokens first, then allocate remaining budget with explicit priority: system prompt and tool definitions (small, fixed, non-negotiable), then the current user turn (must always fit), then a capped, re-ranked set of retrieved knowledge-base chunks (cut before history, since retrieval can be re-run and re-ranked per turn), then conversation history (summarize older turns into a compact rolling summary rather than dropping them raw, preserving continuity while shrinking token cost). When budget is tight, sacrifice raw retrieved-chunk count and raw history length first — via summarization and re-ranking — never the system prompt's safety/behavior instructions, and never silently truncate the current user turn.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly mention that this budgeting logic must run per-request, not once per session, because the shape of history and retrieval results changes every turn — and mention prompt caching for the stable prefix (system prompt, tool defs) as a concrete latency/cost optimization layered on top of the budgeting logic itself.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q7. A stakeholder proposes solving all context-management problems by switching to a model with a 1-million-token context window and simply stuffing everything in. What is your technical response?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A larger nominal window does not eliminate the "lost in the middle" effect — effective retrieval accuracy at very long context lengths is typically still measurably lower for information placed away from the start/end, so correctness is not guaranteed to improve. It also does not eliminate cost or latency concerns: prefill cost scales roughly quadratically with input length, so filling a 1-million-token window on every call is dramatically more expensive and slower than a well-curated, budgeted context of a few thousand tokens containing only the genuinely relevant content. The better response is to keep disciplined retrieval, ranking, and summarization regardless of window size, using the larger window as headroom for edge cases and safety margin, not as a substitute for context engineering.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How would you build observability and alerting around context-window usage for a platform serving many AI features across an organization?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Instrument every model call to log input token count broken down by component (system prompt, tool defs, retrieved context, history, current turn), output token count, and whether any compaction/truncation occurred, tagged per feature/team. Alert on rising near-limit rates (calls consistently using &gt;80-90% of available input budget, a leading indicator of imminent failures as conversations or documents grow slightly), on unexpected truncation events (a signal that a compaction policy is missing or broken), and on cost/latency percentiles correlated with input length, so a team can see when their feature's context footprint is quietly growing. Strategically, this data also informs platform-level decisions — e.g., building a shared, reusable chat-memory/summarization advisor rather than letting every team hand-roll (and mis-handle) their own truncation logic.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why a model's context window is a hard architectural limit rather than a configurable setting like a thread-pool size — connect your answer to the self-attention mechanism described in Section 5.4.</li>
+<li>The "lost in the middle" effect means fitting content in the window is not the same as the model reliably using it. Describe a concrete change you would make to a prompt's structure to reduce the risk that an important instruction gets ignored because of its position.</li>
+<li>Compare the RNN/LSTM "leaky memory" failure mode described in Section 2.1 with the Transformer's "hard wall" failure mode described in Section 2.2. Which would you rather debug in production, and why?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Pick any publicly available chat-based LLM with a stated maximum context length. Have a long conversation (15+ turns) and, partway through, ask it to recall a specific fact you stated in an early turn versus a fact you stated two turns ago. Note any difference in recall accuracy and connect your observation to Section 4.2.</li>
+<li>Using the token-budgeting arithmetic from Section 6.3, write out (in pseudocode or real Java, in the style of Section 9) a function that takes a system prompt, a list of retrieved documents with token counts, a list of chat history messages with token counts, a maximum context length, and a reserved-output-token count, and returns which retrieved documents and which history messages should be included, prioritizing the most recent history and the most relevant documents first.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>A context window is the fixed, finite number of tokens a model can process as input and output in a single call — an architectural boundary enforced by self-attention's design, not a tunable setting.</li>
+<li>Context length (the advertised maximum) and effective context (how well the model actually uses positions within that maximum) are different things — the "lost in the middle" effect means fitting content is not the same as the model reliably attending to it.</li>
+<li>Attention cost grows roughly quadratically with sequence length during prefill, while KV cache memory grows linearly with both sequence length and concurrent batch size during decode — these two curves together explain most of the latency, throughput, and cost behavior you will observe.</li>
+<li>Because the window has no built-in notion of "important" versus "disposable" content, every production system needs an explicit budgeting and compaction strategy — reserving output tokens, capping retrieval, summarizing or windowing history — or that decision gets made badly by default truncation behavior.</li>
+<li>Spring AI exposes this as composable, testable pieces — <code>ChatModel</code>/<code>ChatClient</code> for the call itself, <code>Advisor</code>s and <code>ChatMemory</code> for injecting and trimming history, <code>TokenTextSplitter</code> and vector-store query limits for keeping retrieval budget-aware — rather than requiring hand-rolled string concatenation.</li>
+<li>A bigger context window is not automatically a better one: it raises the ceiling on what can technically fit, but disciplined context engineering — what you put in, where you put it, and what you leave out — remains the actual engineering skill, at any window size.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> once you understand how much text a model can see at once, the natural next question is what the model does with all that context when actually producing an answer, one token at a time. Sampling (Chapter 43) covers exactly that — the mechanics of how a model turns its internal probability distribution over the next token into an actual chosen token, and why the same context window and the same probabilities can still produce different outputs on different runs.
+</p>
+
+</div>
+
+</body>
+</html>

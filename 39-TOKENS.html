@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>39-TOKENS.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 39 — TOKENS</h1>
+
+<p class="roi">Volume 1 — AI Foundations · Chapter 12 of 22</p>
+
+<div class="callout">
+The Decoder Architecture chapter showed you the machine that generates text one step at a time, but it quietly assumed you already knew what a "step" produces — a token, not a word, not a character, not a byte. That assumption cannot stand any longer: every context window limit you will budget for, every dollar you will spend on a model API, and every off-by-one truncation bug you will debug in production traces directly back to how text gets sliced into tokens before a model ever sees it. This chapter makes that invisible layer visible, because from here forward — embeddings, context engineering, RAG chunking, cost optimization — every single one assumes you can reason fluently about tokens.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Ask a Java engineer new to LLMs what unit an API bills them in, and most will guess "characters" or "words." Both answers are wrong, and the gap between that guess and reality has caused real production incidents: context windows silently overflowing mid-conversation, cost forecasts off by 30-40%, prompt templates that work perfectly in English and then truncate mid-sentence in Japanese or Korean, and "why did the model ignore half my system prompt" bugs that turn out to be a token-budget miscalculation, not a model failure. Tokens are the actual unit of everything — input limits, output limits, pricing, and even subtle behavioral quirks (a model that seems bizarrely bad at counting the letters in a word, or at reversing a string, is very often a token artifact, not a reasoning failure).
+</p>
+
+<p>
+This matters concretely for your journey toward production AI Engineering because tokens are the currency you will budget in for the rest of this series. When Volume 3 teaches you to chunk documents for retrieval, the chunk size is a token count. When Volume 2's <code>ChatClient</code> conversation memory needs trimming, what gets trimmed is measured in tokens. When your finance team asks why the AI feature costs what it costs, the honest answer is a token count multiplied by a per-token price. If you cannot reason precisely about how a string of text becomes a sequence of tokens, you cannot reason precisely about latency, cost, context capacity, or several categories of model failure — you can only guess, and guessing is exactly the failure mode this entire book series is built to eliminate.
+</p>
+
+<p>
+There is a second, subtler reason this chapter exists here, right after Decoder Architecture. The decoder does not operate on English words — it operates on a fixed, finite vocabulary of integer IDs, each one representing a token, and its embedding layer (the very next chapter) is nothing more than a giant lookup table indexed by those IDs. Tokens are the bridge between the human world of text and the mathematical world of vectors that the rest of Volume 1 lives in. Skipping this chapter would mean every following chapter has to hand-wave "and then we convert the text into some numbers" — this chapter makes that step precise.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Word-Level Tokenization — The Obvious First Attempt</h3>
+
+<p>
+The earliest natural language processing systems did exactly what your intuition suggests: split text on whitespace and punctuation, and treat each resulting word as the atomic unit. Build a vocabulary of every distinct word seen in your training corpus, assign each one an integer ID, and now "the cat sat" becomes something like <code>[14, 892, 203]</code>. This is simple, interpretable, and was the standard approach for statistical NLP through the 1990s and 2000s (recall the Statistical ML era from the earlier history chapter).
+</p>
+
+<p>
+It has a fatal flaw for any system that must handle open-ended, real-world text: the vocabulary explodes and still isn't enough. English alone has hundreds of thousands of word forms once you count inflections (<code>run</code>, <code>runs</code>, <code>running</code>, <code>ran</code>), and any word not in your fixed vocabulary — a typo, a brand name, a made-up word, a foreign term, a rare technical term like <code>tokenization</code> itself in a small vocabulary — has no ID at all. Systems handled this with a single catch-all <code>&lt;UNK&gt;</code> (unknown) token, which meant the model was permanently blind to the exact identity of anything outside its training vocabulary. Worse, morphologically rich languages (Finnish, Turkish, German with its compound nouns) could generate essentially unbounded numbers of valid word forms, making a fixed word vocabulary fundamentally the wrong tool.
+</p>
+
+<h3>2.2 Character-Level Tokenization — The Opposite Extreme</h3>
+
+<p>
+The natural overcorrection was to go to the other extreme: treat each individual character as a token. This solves the vocabulary explosion problem completely — English needs perhaps 100-200 tokens to cover every letter, digit, and punctuation mark, and there is no such thing as an "unknown" character in a well-defined alphabet. But it creates a new, equally serious problem: sequences become extremely long. The word "tokenization" becomes 13 separate tokens instead of one or two, meaning the model has to do dramatically more computational work, and — critically, as you saw in the Attention and Decoder chapters — attention's cost grows with sequence length, so character-level tokenization made every downstream computation far more expensive and made it far harder for the model to capture long-range structure, because meaningful units (words, phrases) were now spread across many more positions.
+</p>
+
+<h3>2.3 The Subword Breakthrough — Byte Pair Encoding (2015-2016)</h3>
+
+<p>
+The resolution came from an old, unrelated idea in data compression. <strong>Byte Pair Encoding (BPE)</strong> was originally published in 1994 as a simple data compression algorithm — repeatedly find the most frequent adjacent pair of bytes in a file and replace it with a new, unused byte, shrinking the representation. In 2015-2016, researchers (notably Sennrich, Haddow, and Birch, applying BPE to neural machine translation) realized this exact algorithm, applied to characters instead of raw bytes, produces something remarkable for language modeling: a vocabulary of <strong>subword units</strong> that sits between characters and whole words. Common words (<code>"the"</code>, <code>"is"</code>) end up as single tokens because they are frequent enough to get merged all the way; rare or novel words (<code>"tokenization"</code>, a misspelling, a made-up brand name) get broken into a handful of meaningful pieces (<code>"token"</code> + <code>"ization"</code>) instead of either exploding the vocabulary or degenerating to individual characters.
+</p>
+
+<p>
+This single idea — learn the vocabulary from data by iteratively merging frequent pairs, rather than hand-defining it as "words" — is the direct ancestor of every tokenizer used by production LLMs today. GPT-2 and its successors use a byte-level variant of BPE. Google's SentencePiece library (used by T5, Llama, and many others) implements a related algorithm called <strong>Unigram Language Model tokenization</strong> alongside BPE, operating directly on raw text (including whitespace) without assuming a language has clean word boundaries at all — important for languages like Japanese, Chinese, and Thai that don't use spaces between words the way English does. OpenAI's <code>tiktoken</code> library, which tokenizes for GPT-3.5, GPT-4, and later models, uses byte-level BPE with a vocabulary in the tens of thousands to over 100,000 tokens, growing larger with each model generation to better cover code, multiple languages, and special formatting.
+</p>
+
+<table>
+<tr><th>Era / Approach</th><th>Unit</th><th>Vocabulary Size</th><th>Fatal Flaw</th></tr>
+<tr><td>Word-level (pre-2015)</td><td>Whole words</td><td>50,000 - 1,000,000+</td><td>Unbounded vocabulary growth; unknown words are opaque <code>&lt;UNK&gt;</code></td></tr>
+<tr><td>Character-level</td><td>Single characters</td><td>~100-300</td><td>Very long sequences; expensive attention; loses word-level structure</td></tr>
+<tr><td>Byte Pair Encoding (2016+)</td><td>Learned subword units</td><td>30,000 - 100,000+</td><td>Still language/data-dependent; can split numbers and rare words unevenly</td></tr>
+<tr><td>Byte-level BPE (GPT-2+)</td><td>Merges over raw UTF-8 bytes</td><td>~50,000 - 200,000+</td><td>Handles any Unicode input, but token boundaries can still feel arbitrary to humans</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> the same bottleneck-relocation pattern from the earlier history chapter repeats here in miniature. Word-level tokenization hit a "vocabulary bottleneck." Character-level tokenization traded that for a "sequence-length bottleneck." Subword tokenization did not eliminate the trade-off — it found a much better point on the same curve. You will make an equivalent judgment call whenever you choose a chunk size for retrieval in Volume 3: there is no size with zero trade-offs, only a better or worse position on a spectrum.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Strip away the algorithms and state the precise engineering problem tokenization solves:
+</p>
+
+<div class="callout">
+<strong>Convert arbitrary, unbounded human text into a finite sequence of integers drawn from a fixed, manageably small vocabulary, in a way that is reversible, handles any input (including text never seen during training), and keeps sequences short enough for attention to remain computationally tractable.</strong>
+</div>
+
+<p>
+Every clause in that sentence is load-bearing. <strong>"Finite sequence of integers"</strong> — neural networks, at the input layer, only understand numbers; nothing about matrix multiplication knows what the letter "c" is. <strong>"Fixed, manageably small vocabulary"</strong> — the embedding table (next chapter) has one row per vocabulary entry, and that table's size is a real, non-negotiable memory cost, so the vocabulary cannot simply be "every possible string." <strong>"Reversible"</strong> — a model must be able to decode its output integers back into text a human can read, exactly, with no ambiguity. <strong>"Handles any input"</strong> — a production chatbot will receive misspellings, emoji, code snippets, mixed languages, and text that never appeared anywhere in training; the tokenizer cannot fail or drop information on any of it. <strong>"Keeps sequences short"</strong> — as established in the Attention chapter, self-attention cost grows quadratically with sequence length, so the choice of tokenization scheme directly controls how much compute a given piece of text will cost.
+</p>
+
+<p>
+Notice that this is fundamentally a compression and indexing problem wearing linguistic clothing — which is exactly why the winning solution (BPE) came from data compression research rather than linguistics. Tokenization is not trying to find "true" units of meaning; it is trying to find a statistically efficient encoding that a fixed-size neural network can consume.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 What a Token Actually Is</h3>
+
+<p>
+A <strong>token</strong> is one entry in the model's vocabulary — nothing more mystical than that. Depending on the tokenizer and the specific text, a token might be a whole common word (<code>" the"</code>), a word fragment (<code>"token"</code> and <code>"ization"</code> as two separate pieces), a single punctuation mark, a single digit, a whitespace-plus-word combination, or even part of a multi-byte Unicode character when byte-level encoding falls back to raw bytes for something rare (an unusual emoji, for instance). The vocabulary is a lookup table built once, offline, before the model is ever trained, and it never changes after that — a GPT-4 tokenizer will forever chop up text the same way, regardless of what new words enter the English language after the tokenizer was frozen.
+</p>
+
+<p>
+The single most important intuition to build here: <strong>tokens are not a natural unit of language, they are a learned unit of statistical efficiency.</strong> The tokenizer does not know or care what a "word" means semantically. It only knows which byte/character sequences co-occur frequently enough in its training corpus to be worth merging into a single vocabulary entry. This is why token boundaries frequently look strange to a human: <code>"unbelievable"</code> might tokenize as <code>"un"</code> + <code>"believ"</code> + <code>"able"</code>, and a rare surname might split into three or four seemingly arbitrary pieces, while common short words like <code>"the"</code>, <code>"and"</code>, <code>"is"</code> are almost always single tokens because their frequency earned them a dedicated vocabulary slot early in the merge process.
+</p>
+
+<h3>4.2 The Vocabulary as a Dictionary Analogy</h3>
+
+<p>
+Picture a numbered dictionary with, say, 100,000 entries — but instead of ordering entries alphabetically, the dictionary's author ordered and chose entries by "how often does this exact chunk of characters show up across a huge pile of real-world text." Entry #1 might be a single space character. Entry #50 might be the word " the". Entry #40,000 might be the fragment "ization". Entry #95,000 might be a rare three-byte sequence used only by an obscure emoji. Tokenizing a sentence is the process of finding the shortest sequence of dictionary entries that, concatenated back together, exactly reproduce the original text — greedily preferring longer, more specific entries where the algorithm allows, because a longer token means a shorter overall sequence.
+</p>
+
+<p>
+This is precisely why the same word can tokenize differently depending on context: <code>" hello"</code> (with a leading space, as it typically appears mid-sentence) and <code>"Hello"</code> (capitalized, no leading space, as it appears at the start of a sentence) are frequently two entirely different entries in the dictionary, with two different integer IDs, because the tokenizer's training process saw them as different byte sequences with different frequencies. This single fact explains a surprising amount of "weird" model behavior around casing and spacing that confuses newcomers.
+</p>
+
+<h3>4.3 Key Vocabulary You Will Use for the Rest of This Series</h3>
+
+<table>
+<tr><th>Term</th><th>Precise Meaning</th></tr>
+<tr><td>Token</td><td>One entry in the tokenizer's fixed vocabulary; the atomic unit the model actually consumes and produces</td></tr>
+<tr><td>Token ID</td><td>The integer index of a token within the vocabulary — what actually flows into the embedding lookup table</td></tr>
+<tr><td>Vocabulary size</td><td>Total number of distinct tokens the tokenizer can produce (e.g., ~100K-200K for modern LLM tokenizers)</td></tr>
+<tr><td>Context window / context length</td><td>The maximum number of tokens (input + output combined, in most APIs) a model can attend to in one request</td></tr>
+<tr><td>Special tokens</td><td>Reserved vocabulary entries with structural meaning rather than linguistic content — e.g., beginning-of-sequence, end-of-sequence, chat role markers</td></tr>
+<tr><td>Detokenization</td><td>The reverse process: converting a sequence of token IDs back into human-readable text</td></tr>
+<tr><td>Tokenizer</td><td>The full pipeline (usually pre-tokenization + BPE/Unigram merges + vocabulary lookup) that performs tokenization and detokenization; tied one-to-one with a specific model family</td></tr>
+</table>
+
+<p>
+Hold onto <strong>special tokens</strong> in particular — you will meet them again heavily in the Prompt Engineering and Chat Memory chapters. A chat-tuned model's input is not just "the user's text"; it is a carefully structured sequence like <code>&lt;|system|&gt; ... &lt;|user|&gt; ... &lt;|assistant|&gt; ...</code> where each of those role markers is itself one or more special tokens the model was specifically trained to recognize as structural boundaries, not as content to respond to.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<h3>5.1 Building the Vocabulary — Byte Pair Encoding, Step by Step</h3>
+
+<p>
+BPE vocabulary construction happens once, offline, before any model training begins. Here is the exact mechanical procedure:
+</p>
+
+<ol>
+<li><strong>Start from bytes or characters.</strong> Every distinct byte (0-255, in byte-level BPE) or character starts as its own token. This guarantees the vocabulary can represent any possible input from day one — there is no "unknown token" problem at this level, because any input string can always be spelled out byte-by-byte as a fallback.</li>
+<li><strong>Represent the training corpus as sequences of these base units.</strong> A massive corpus of text (the same kind of corpus used for pretraining, discussed in the Decoder chapter) is split into words (roughly, by whitespace) and each word is represented as its sequence of base units, with counts tracked across the whole corpus.</li>
+<li><strong>Count all adjacent pairs.</strong> Across the entire corpus, count how often every pair of adjacent tokens occurs. Early on, this might reveal that the pair ("t", "h") occurs extremely often (from "the", "that", "this", etc.).</li>
+<li><strong>Merge the single most frequent pair.</strong> Create a new vocabulary entry representing that pair merged together (e.g., "t" + "h" → "th"), add it to the vocabulary, and replace every occurrence of that adjacent pair throughout the corpus representation with the new merged token.</li>
+<li><strong>Repeat.</strong> Recount pairs (now including the new merged tokens as candidates), merge the next most frequent pair, and continue. Each iteration adds exactly one new entry to the vocabulary and reduces the number of tokens needed to represent the corpus.</li>
+<li><strong>Stop at a target vocabulary size.</strong> The process halts once the vocabulary reaches a predetermined size (e.g., 100,000 entries) — this number is a deliberate design choice made by the model's creators, trading off embedding table size against average sequence length.</li>
+</ol>
+
+<p>
+The result is an ordered list of merge rules, learned entirely from data with no human linguistic input, that together define the tokenizer. Common English morphemes, common code patterns (if a lot of code was in the training data — which is why modern tokenizers are unusually good at tokenizing code efficiently, each language's common tokens like <code>"def "</code>, <code>"return "</code>, <code>"    "</code> for indentation get their own dedicated entries), and common multi-character sequences in any well-represented language all naturally earn their own vocabulary slots simply because they appeared frequently enough during this merge process.
+</p>
+
+<h3>5.2 Applying the Tokenizer — Encoding New Text</h3>
+
+<p>
+Once the vocabulary and merge rules are fixed, tokenizing a brand-new piece of text at inference time is deterministic and fast:
+</p>
+
+<ol>
+<li><strong>Pre-tokenize.</strong> Split the raw text into rough chunks — typically by whitespace and punctuation boundaries, though the exact rules (a regular expression, in practice) vary by tokenizer family. This step also typically normalizes text into raw bytes (UTF-8) so every possible Unicode character is representable.</li>
+<li><strong>Apply merge rules in the learned order.</strong> Starting from individual bytes/characters within each chunk, apply the same merge rules learned during vocabulary construction, in the same priority order they were learned, repeatedly merging the highest-priority applicable pair until no more merges apply.</li>
+<li><strong>Look up final token IDs.</strong> Each resulting piece is looked up in the vocabulary table to get its integer ID. This sequence of integers is exactly what gets passed to the embedding layer described in the next chapter.</li>
+</ol>
+
+<p>
+Edge cases matter here, because production systems trip on exactly these: a completely novel string (a random alphanumeric API key, a misspelled word, a word in a language barely represented in training) will still tokenize successfully — it will simply fall back to smaller, more numerous pieces, in the worst case all the way down to individual bytes, since byte-level BPE guarantees every single byte value has a vocabulary entry. This is the modern replacement for the old <code>&lt;UNK&gt;</code> token: nothing is ever truly "unknown," it just becomes expensive (more tokens) to represent.
+</p>
+
+<h3>5.3 Decoding — Going Back to Text</h3>
+
+<p>
+Detokenization reverses the lookup: each output token ID is mapped back to its stored byte/character sequence, and those sequences are concatenated in order. Because BPE merges were built to be exactly reversible (every merged token stores precisely which underlying bytes it represents), this reconstruction is lossless — the exact original text (including whitespace and punctuation) is recoverable, assuming no tokens were dropped. This losslessness is a design requirement, not an accident: a chat model whose detokenizer subtly altered whitespace or dropped characters would be unshippable.
+</p>
+
+<div class="followup">
+<strong>Edge case worth internalizing:</strong> streaming responses (the token-by-token output you see appear live in a chat UI, covered functionally in the Decoder chapter's autoregressive loop) sometimes need to buffer a partially-formed multi-byte Unicode character before it can be safely rendered — because a single visible character (an emoji, an accented letter, many CJK characters) can be composed of more than one token, and displaying an incomplete byte sequence produces garbled output. Production streaming clients, including Spring AI's reactive <code>Flux&lt;ChatResponse&gt;</code> handling, must account for this rather than naively printing each token chunk the instant it arrives.
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS — LIGHT AND PRACTICAL</h1>
+
+<div class="section">
+
+<p>
+Tokenization is an algorithmic and statistical topic more than a heavily mathematical one, so this section stays deliberately light — the two things worth formalizing are the frequency-based merge criterion and the practical heuristic for estimating token counts from character counts, which you will use constantly for capacity planning.
+</p>
+
+<h3>6.1 The Merge Criterion</h3>
+
+<p>
+At each step of BPE construction, given a corpus represented as sequences of current tokens, the algorithm selects the pair <code>(a, b)</code> that maximizes the count of adjacent occurrences across the corpus:
+</p>
+
+<pre>
+merge = argmax over all adjacent pairs (a, b) of  count(a, b)
+
+where count(a, b) = number of times token a is immediately
+                     followed by token b, summed across the
+                     entire training corpus
+</pre>
+
+<p>
+That is the entire mathematical core of BPE — no gradients, no probability distributions to optimize, just a greedy frequency-count maximization repeated N times, where N is however many merges are needed to reach the target vocabulary size. (SentencePiece's Unigram algorithm, used by several major model families as an alternative to raw BPE, instead starts from a large candidate vocabulary and iteratively removes the tokens whose removal least hurts the likelihood of the training corpus under a unigram language model — a different optimization criterion, but the same practical goal of arriving at an efficient fixed vocabulary.)
+</p>
+
+<h3>6.2 The Practical Estimation Heuristic</h3>
+
+<p>
+Because you will need to estimate token counts constantly — sizing prompts, forecasting cost, checking against context limits — before you have a tokenizer library on hand, memorize the standard rule of thumb for English text with modern BPE-style tokenizers:
+</p>
+
+<pre>
+~1 token ≈ 4 characters of English text  (rough average)
+~1 token ≈ 0.75 words of English text    (equivalently: ~100 tokens ≈ 75 words)
+</pre>
+
+<p>
+This heuristic breaks down predictably in specific directions, and knowing <em>which</em> direction it breaks matters for capacity planning: source code, JSON, and other structured/symbol-dense text tend to tokenize <em>less</em> efficiently (more tokens per character) because punctuation and indentation consume tokens that carry little semantic density; non-English languages, especially those with non-Latin scripts (Chinese, Japanese, Korean, Arabic, Hindi), routinely tokenize at 2-4x more tokens per equivalent amount of meaning than English, because most tokenizer vocabularies are trained on English-majority corpora and allocate proportionally fewer dedicated merge slots to other scripts. This is not a minor footnote — it is a real, measurable cost and fairness disparity across languages that shows up directly in both latency and per-request billing.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Full Tokenization Pipeline, End to End</h3>
+
+<pre>
+  RAW TEXT
+  "The tokenizer's unbelievable!"
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  STEP 1 — Pre-tokenize (split on whitespace/punctuation,  │
+  │           normalize to UTF-8 bytes)                       │
+  └─────────────────────────────────────────────────────────┘
+        │
+        ▼
+  ["The", " tokenizer", "'s", " unbelievable", "!"]
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  STEP 2 — Apply learned BPE merge rules within each chunk │
+  │           (greedy, highest-priority merge first)          │
+  └─────────────────────────────────────────────────────────┘
+        │
+        ▼
+  "The"           → ["The"]                (common word: 1 token)
+  " tokenizer"    → [" token", "izer"]     (rarer word: splits in two)
+  "'s"            → ["'s"]                 (common contraction: 1 token)
+  " unbelievable" → [" un", "believ", "able"]  (splits into 3)
+  "!"             → ["!"]                  (punctuation: 1 token)
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  STEP 3 — Vocabulary lookup → integer token IDs           │
+  └─────────────────────────────────────────────────────────┘
+        │
+        ▼
+  [1109, 11241, 82, 526, 2790, 11178, 481, 0]
+   The   token  izer 's   un   believ  able  !
+        │
+        ▼
+  8 TOKENS total for a 30-character sentence
+  (character-to-token ratio here: ~3.75 — close to the "~4 chars/token" rule of thumb)
+</pre>
+
+<h3>7.2 Same Sentence, Three Tokenization Strategies Compared</h3>
+
+<pre>
+  WORD-LEVEL                CHARACTER-LEVEL              SUBWORD (BPE)
+  ──────────                ───────────────              ─────────────
+  "unbelievable"            "unbelievable"               "unbelievable"
+
+  IF in vocabulary:         T,h,e, ,t,o,k,e,n,i,z,e,r,    "un" + "believ" + "able"
+  ["unbelievable"]          ',s, ,u,n,b,e,l,i,e,v,a,      3 tokens — reusable pieces
+  1 token                   b,l,e,!                       seen in MANY other words
+                            26 tokens for 26 chars
+  IF NOT in vocabulary:     (1 token per character,
+  ["<UNK>"]                  regardless of frequency)     Vocabulary stays small
+  ALL MEANING LOST                                        (~100K entries) AND
+                            Vocabulary stays tiny          sequences stay short.
+  Vocabulary must be         (~100-300 entries) BUT        This is why every modern
+  enormous (500K+) to        sequences become VERY         production LLM uses this
+  cover real-world text,     long, making attention        approach.
+  and still misses things    (O(n²) cost) expensive.
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a deployed system, tokenization is not something that happens once inside a mysterious black box at the model provider — it is something you, the application engineer, need to reason about and sometimes compute <em>before</em> a request ever leaves your service, because context limits and cost are enforced in tokens, not characters.
+</p>
+
+<pre>
+  ┌───────────────────────────────────────────────────────────────────┐
+  │                     Spring Boot Application                        │
+  │                                                                     │
+  │   User message + conversation history + retrieved context (RAG)    │
+  │                          │                                          │
+  │                          ▼                                          │
+  │   ┌───────────────────────────────────────────────────────────┐   │
+  │   │   TOKEN BUDGETING LAYER  (your responsibility)              │   │
+  │   │   - Estimate/compute token count of assembled prompt        │   │
+  │   │   - Compare against model's context window                  │   │
+  │   │   - Trim conversation history if over budget (Vol. 2 Memory)│   │
+  │   │   - Truncate/re-chunk retrieved docs if over budget (Vol. 3)│   │
+  │   │   - Reserve headroom for the model's OUTPUT tokens too       │   │
+  │   └───────────────────────────────────────────────────────────┘   │
+  │                          │                                          │
+  │                          ▼                                          │
+  │              Final prompt, fits within context window               │
+  └───────────────────────────────┬───────────────────────────────────┘
+                                  ▼
+              ┌────────────────────────────────────────┐
+              │        Model Provider Boundary           │
+              │  (provider tokenizes internally using     │
+              │   the EXACT tokenizer tied to that model  │
+              │   — you cannot change or bypass this)     │
+              └────────────────────────────────────────┘
+                                  ▼
+                    Response streamed back as tokens,
+                    billed as: input tokens + output tokens
+</pre>
+
+<p>
+Two operational realities fall directly out of this diagram. First, <strong>token counting must happen client-side, before the call</strong>, using a tokenizer library that matches the target model's exact vocabulary (OpenAI's <code>tiktoken</code>, or the equivalent for whichever provider you're calling) — estimating with the "~4 characters per token" heuristic is fine for rough dashboards, but not for a hard pre-flight check that must never let a request exceed a context window, because the heuristic's error compounds badly on code, non-English text, and repetitive structured content. Second, <strong>every provider bills input and output tokens separately, often at different rates</strong> (output tokens are frequently priced 2-5x higher than input tokens across providers, because generation is the sequential, non-parallelizable part of the workload) — a cost model that only tracks prompt length and ignores expected response length will systematically underestimate spend.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI does not force you to hand-roll tokenization logic, but it exposes exactly the seams you need to reason about token budgets responsibly, and it is worth knowing precisely where those seams are.
+</p>
+
+<p>
+The core abstraction you already know from earlier chapters, <code>ChatModel</code> (and the fluent <code>ChatClient</code> built on top of it), accepts a <code>Prompt</code> composed of <code>Message</code> objects — system, user, assistant, and tool messages. None of these types force you to think about tokens directly; you hand them strings. But the moment you build a production feature with a bounded context window, you need to answer "how many tokens will this <code>Prompt</code> actually consume" before you send it, and that responsibility sits with your application code, not with Spring AI's message abstraction. Most Spring AI usages that need precise counts either call out to a tokenizer library appropriate for the target model (for OpenAI-family models, the JVM ecosystem has ports/bindings of <code>tiktoken</code>-equivalent BPE logic) or read the token usage returned in the response metadata after the fact, via the <code>Usage</code> information attached to a <code>ChatResponse</code>, which reports prompt tokens, completion tokens, and total tokens actually consumed by the call the provider just processed.
+</p>
+
+<p>
+This creates a practical, two-tier strategy that maps cleanly onto patterns you already use elsewhere in Spring applications:
+</p>
+
+<table>
+<tr><th>Concern</th><th>Approach</th></tr>
+<tr><td>Pre-flight budget check (before sending)</td><td>Estimate tokens locally with a tokenizer library or the character-based heuristic; reject/trim if over budget — analogous to a <code>@Valid</code> DTO check before hitting a downstream service</td></tr>
+<tr><td>Post-call accounting (after receiving a response)</td><td>Read exact token counts from the response's usage metadata; log/aggregate for cost dashboards — analogous to reading response headers for rate-limit accounting</td></tr>
+<tr><td>Conversation memory trimming (Volume 2)</td><td>An <code>Advisor</code> that inspects accumulated message history token count and summarizes or drops oldest turns before the budget is exceeded — the same AOP-style interception pattern used for logging/security advisors</td></tr>
+<tr><td>RAG chunk sizing (Volume 3)</td><td>Document splitters that target a token count per chunk, not a character count, because retrieval relevance and context-window fit are both governed in tokens</td></tr>
+</table>
+
+<p>
+A subtlety worth flagging explicitly for engineers coming from a strongly-typed, deterministic background: the exact tokenizer — the specific vocabulary and merge rules — differs across model families and even across versions of the same family. A token count computed for a GPT-4-class model's tokenizer is not necessarily accurate for a Claude-class or Llama-class model, because each was trained with its own vocabulary. If your architecture follows the earlier chapter's advice to treat the foundation model as a swappable, provider-agnostic dependency behind <code>ChatModel</code>, your token-budgeting logic needs to swap its tokenizer assumption right alongside the model — hardcoding one provider's token-counting library into core business logic quietly breaks the abstraction the moment you switch providers.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Always reserve explicit headroom for output tokens</strong>, not just input. A context window is shared between prompt and completion in most APIs; budgeting only for the prompt and then requesting a long completion is one of the most common causes of unexpected truncation.</li>
+<li><strong>Use the real tokenizer for the target model whenever the number needs to be exact</strong> (cost forecasting, hard context-limit enforcement); reserve the "~4 characters per token" heuristic for rough dashboards and back-of-envelope sizing, not for enforcement logic that must never be wrong.</li>
+<li><strong>Measure token cost per language if you serve a multilingual user base.</strong> Because non-Latin scripts routinely cost more tokens per unit of meaning, a flat per-request pricing or quota model can be silently unfair or lossy across languages — budget with per-language multipliers if this matters to your product.</li>
+<li><strong>Treat retrieved documents and conversation history as first-class token consumers</strong>, not free additions to a prompt. Every paragraph of RAG context or chat history you inject competes for the same finite budget as the user's actual question.</li>
+<li><strong>Log actual token usage from every response</strong>, not just estimated pre-call counts, and reconcile the two periodically — drift between your estimate and the provider's real count is an early warning sign that your local tokenizer assumption is stale or wrong for the model in use.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Assuming "1 token ≈ 1 word" for capacity planning.</strong> This overestimates capacity for English by roughly 30% and can be off by 2-4x for code or non-English text, leading to context-window overflows that appear only under real production traffic, not in casual testing.</li>
+<li><strong>Counting characters instead of tokens when enforcing a hard limit.</strong> A 4,000-character string is not a fixed number of tokens — it could be anywhere from ~800 to ~4,000+ tokens depending on content — so character-length checks give a false sense of safety against context overflow.</li>
+<li><strong>Forgetting that special/structural tokens (chat role markers, system prompt scaffolding) also consume budget.</strong> Engineers often budget only for the visible text they wrote, forgetting the framework-injected structure around it also costs tokens.</li>
+<li><strong>Blaming the model for "bad at counting letters" or "bad at reversing strings" without recognizing the tokenization cause.</strong> If the word "strawberry" is a single token to the model, the model never directly "sees" the individual letters s-t-r-a-w-b-e-r-r-y the way a human does — it sees one opaque integer ID — so character-level tasks are fighting the representation, not testing reasoning ability. This is one of the most frequently misdiagnosed model "failures" in practice.</li>
+<li><strong>Reusing a token-counting utility written for one model family across a different provider</strong> after a mid-project model swap, silently producing wrong budget calculations because the vocabularies (and therefore the counts) differ between tokenizers.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Tokens are the direct unit of both latency and cost, which makes this section unusually concrete compared to more abstract chapters.
+</p>
+
+<ul>
+<li><strong>Cost scales linearly with token count, at two different rates.</strong> Input and output tokens are typically billed separately, and output tokens usually cost more per token than input tokens across providers — a system that generates long responses will be far more cost-sensitive to prompt engineering that shortens output than one that only ingests long context.</li>
+<li><strong>Latency scales with output token count far more than input token count</strong> in autoregressive generation (as established in the Decoder chapter's step-by-step generation loop) — each output token typically requires a sequential forward pass, whereas input tokens can be processed largely in parallel during the initial "prefill" phase. A prompt-heavy, response-light interaction pattern is inherently faster than a short-prompt, long-response one, all else equal.</li>
+<li><strong>Attention cost grows with the square of total sequence length</strong> (input + output combined), which is why tokenization efficiency compounds: a tokenizer that represents the same meaning in fewer tokens doesn't just save linear cost on the token count itself, it saves quadratic cost on the attention computation across the whole sequence.</li>
+<li><strong>Caching (covered functionally in later chapters) operates at the token/prompt level</strong> — providers that offer prompt caching key on exact token-sequence prefixes, so even whitespace or ordering differences that change the tokenization of a shared prefix can silently defeat a cache hit that would otherwise have saved significant cost and latency.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Tokenization has a narrower security surface than topics like prompt construction or tool use, but it is not zero, and it is worth being precise rather than padding this section artificially.
+</p>
+
+<p>
+The most concrete concern is <strong>token-based resource exhaustion / denial-of-wallet</strong>: because cost and processing time scale with token count, an attacker who can get a service to process an unbounded amount of text (an extremely long user-supplied document fed into a prompt, a maliciously crafted input designed to expand into many tokens, or a request loop that keeps growing a conversation's token count) can drive real, uncapped financial cost or exhaust context-window capacity in a way that degrades service for other users. This is why hard, server-side token limits — not just client-side UI limits — on every user-controllable piece of a prompt are a baseline production requirement, not an optional hardening step.
+</p>
+
+<p>
+A second, more subtle concern connects back to the earlier "prompt injection" discussion: because tokenization treats all text uniformly regardless of its source (there is no cryptographic or structural separation between "trusted system instructions" and "untrusted retrieved content" at the tokenizer level — both become the same kind of token sequence), tokenization itself offers no defense against injection; that defense has to be engineered at the prompt-construction and guardrail layers covered later in this series. It is worth naming explicitly here so you do not mistake "the text got correctly tokenized" for "the text was safely handled" — tokenization is a faithful, mechanical transformation, not a security boundary.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is a token, and why can't a model just process raw text characters or words directly?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A token is one entry in a fixed vocabulary that a tokenizer maps text onto; neural networks require fixed-size numeric input, so raw text must be converted into integer IDs before it can be processed. Words alone are unusable because a word-level vocabulary would need to be enormous (and still fail on typos, new words, and rare terms), while individual characters alone would keep the vocabulary tiny but make sequences far too long for efficient processing.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Roughly how many tokens is 1,000 characters of typical English text?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Roughly 250 tokens, using the common rule of thumb of about 4 characters per token for English. This is an approximation — code, non-English text, and unusual/rare words tokenize less efficiently (more tokens per character) than typical English prose.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain how Byte Pair Encoding builds a vocabulary, step by step.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>BPE starts with every individual byte or character as its own token, then repeatedly scans the training corpus to find the single most frequent adjacent pair of tokens, merges that pair into one new vocabulary entry, and replaces all occurrences of that pair throughout the corpus. This repeats for a fixed number of iterations until the vocabulary reaches a target size (often tens of thousands to over 100,000 entries). The result is a set of merge rules that turn frequent character sequences into single tokens while rare sequences remain split into smaller, reusable pieces.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why do non-English languages, especially those with non-Latin scripts, often consume more tokens for the same amount of meaning?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because tokenizer vocabularies are learned from training corpora that are usually English-majority, the merge process allocates proportionally more dedicated vocabulary slots to frequent English character sequences than to sequences from other scripts. Text in underrepresented languages therefore falls back to smaller, more numerous subword or byte-level fragments more often, increasing both the token count and, correspondingly, the cost and latency for equivalent content.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. A production system is intermittently exceeding a model's context window despite the application-level character-count check passing. Diagnose the likely cause and describe the fix.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Character count is not a reliable proxy for token count — the ratio varies with content type (code, non-English text, repeated symbols all tokenize less efficiently than average prose), so a character-based guard can pass while the actual token count exceeds the window. The fix is to replace the character-based check with an exact or tokenizer-accurate count for the specific model in use (e.g., a proper BPE tokenizer library matching that model family), account for both input and reserved output token budget, and add server-side enforcement rather than relying on client-side estimates alone.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Mention that the correct fix must also be provider-aware — if the architecture treats the model as swappable (per the ChatModel abstraction discussed earlier), the token-counting logic must swap its tokenizer assumption in lockstep with the model, or counts silently become wrong after a provider migration. Naming this coupling explicitly signals you think about token budgeting as part of the architecture, not a one-off utility function.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Why is a model sometimes unable to correctly count the letters in a word or reverse a short string, even though it can perform much more complex reasoning tasks?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>If a word is represented as one or a few subword tokens, the model's internal representation never explicitly exposes the individual characters that compose it — it operates on opaque integer token IDs, not letters. Tasks that require character-level manipulation (counting letters, reversing a string, spelling checks) are fighting against the tokenization scheme itself rather than testing the model's reasoning capacity, which is why these specific tasks fail disproportionately compared to tasks operating at the word or phrase level, where the model's learned representations are far richer.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. You're designing token-budget enforcement for a multi-tenant platform where users can inject arbitrary text (documents, chat history, retrieved context) into prompts. What failure modes must the design account for, and how would you architect the safeguard?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Failure modes: (1) denial-of-wallet from unbounded user-supplied text driving uncapped per-request cost; (2) context-window overflow causing silent truncation of important content (often the system prompt or safety instructions, depending on truncation order); (3) inconsistent token accounting if different components estimate tokens differently or use a tokenizer mismatched to the active model; (4) cache-defeating variance if prompt assembly isn't deterministic at the token level. The architecture should enforce hard, server-side token ceilings per request and per component (system prompt, retrieved context, conversation history, user input each get their own budget slice), compute exact token counts using the tokenizer matching the currently active model rather than a fixed assumption, reserve explicit headroom for output tokens, fail closed (reject or trim deterministically, never silently truncate whatever happens to be last) when a request would exceed budget, and reconcile estimated vs. actual token usage from response metadata continuously to catch drift.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. Explain why tokenization, despite being a purely mechanical transformation, cannot serve as a security boundary between trusted instructions and untrusted content.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Tokenization converts any text — system instructions, retrieved documents, user input — into the same kind of undifferentiated token sequence with no structural or cryptographic marker distinguishing "trusted" from "untrusted" origin at the token level itself; any separation of trust has to be enforced above the tokenizer, in prompt construction, message role structuring, and guardrail/validation layers. Treating "the text tokenized successfully" as equivalent to "the text was handled safely" is a category error: tokenization guarantees a faithful, lossless encoding of the input, not a judgment about whether that input should be allowed to influence model behavior.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain in your own words why Byte Pair Encoding, an algorithm originally designed for general-purpose data compression, turned out to be the right tool for building a language model vocabulary. What property do "compressing data efficiently" and "tokenizing language efficiently" have in common?</li>
+<li>A colleague proposes building a custom word-level vocabulary for a new internal chatbot, arguing "our domain has a fixed, known set of terms, so we don't need subword tokenization." Identify at least two ways this could still fail in production, drawing on the failure modes discussed in Sections 2 and 3.</li>
+<li>Explain why a model can be excellent at summarizing a legal contract but unreliable at telling you how many times the letter "e" appears in a paragraph, connecting your answer directly to how tokenization represents text.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Take a paragraph of English prose, a paragraph of source code of similar character length, and (if available to you) a paragraph in a non-Latin-script language of similar character length. Using any publicly available tokenizer tool or library, count the tokens for each and compare the character-to-token ratios. Write two sentences explaining the differences using concepts from Sections 2 and 6.</li>
+<li>Design (in a short paragraph plus an ASCII diagram in the style of Section 8) a token-budgeting component for a Spring Boot chat endpoint that assembles a system prompt, trailing conversation history, and one retrieved document into a single request. Specify how you would allocate token budget across the three components and what your fallback behavior is when the combined total would exceed the model's context window.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>A token is a fixed vocabulary entry, not a word or character — the tokenizer converts arbitrary text into a sequence of integer token IDs that the model actually consumes and produces.</li>
+<li>Modern LLMs use subword tokenization (Byte Pair Encoding or the related Unigram algorithm), a data-compression technique adapted to language, because it resolves the trade-off between word-level tokenization's exploding vocabulary and character-level tokenization's excessively long sequences.</li>
+<li>Vocabulary construction is a one-time, offline, data-driven process (iteratively merging the most frequent adjacent pair); applying it to new text at inference time is deterministic and always succeeds, falling back to smaller pieces for novel or rare content rather than failing outright.</li>
+<li>Tokens are the real unit of context window limits, latency, and API cost — character counts and word counts are only rough approximations, and the gap between the approximation and reality is large enough to cause real production incidents.</li>
+<li>Non-English languages and structured/symbolic text (code, JSON) routinely cost more tokens per unit of meaning than English prose, which has direct cost, latency, and fairness implications for multilingual products.</li>
+<li>Tokenization is a faithful mechanical transformation, not a security boundary — trust separation between instructions and untrusted content must be engineered at higher layers, and token budgets must be enforced server-side to prevent resource-exhaustion abuse.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> now that text arrives at the model as a sequence of integer token IDs, the next question is unavoidable — what does the model actually do with a bare integer? Embeddings (Chapter 40) answers this by showing how each token ID is converted into a dense vector of numbers that captures meaning, and how these vectors become the mathematical substrate every neural computation in the model — attention, the decoder layers, everything since Chapter 38 — actually operates on.
+</p>
+
+</div>
+
+</body>
+</html>

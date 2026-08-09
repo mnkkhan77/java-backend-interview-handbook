@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>70-QDRANT.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 70 — QDRANT</h1>
+
+<p class="roi">Volume 3 — Embeddings & RAG · Chapter 6 of 13</p>
+
+<div class="callout">
+Pinecone (Chapter 69) showed you what a fully managed, opinionated vector database looks like from the outside — an API you call and never think about again. Qdrant exists at the opposite end of a real architectural decision every AI engineering team eventually faces: do you rent a black box, or do you run an open-source engine you can inspect, self-host, tune, and reason about down to its storage layer? Qdrant is written in Rust, ships a real payload filtering language, and is honest about the engineering trade-offs behind approximate nearest neighbor search — which makes it the right vehicle for going one level deeper than Pinecone's chapter did into how a vector database actually works internally.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+By this point in Volume 3 you understand why retrieval exists at all: a foundation model's knowledge is frozen at training time and compressed lossily into its parameters (the "compression as proxy for understanding" idea from the Intelligence chapter), so anything private, current, or precise has to be handed to the model at inference time as retrieved context. Embeddings (covered earlier in this volume) turn text into vectors that capture semantic similarity, and a vector database is the component that stores millions or billions of those vectors and answers, in milliseconds, "which of these are most similar to this query vector?" Pinecone gave you that capability as a managed service. Qdrant matters because it forces you to confront the machinery Pinecone hid from you — and understanding that machinery changes how you design, tune, and debug <em>every</em> vector database you will ever use, managed or not.
+</p>
+
+<p>
+There is also a very concrete, non-academic reason Qdrant appears in almost every serious enterprise RAG shortlist: data residency and cost. A bank, hospital, or government contractor frequently cannot send embeddings of sensitive documents to a third-party managed cloud at all, no matter how good the SLA is. Qdrant runs as a single Docker container on a laptop, as a Kubernetes StatefulSet in a private VPC, or as Qdrant Cloud if you do want managed convenience — the same query API and the same on-disk format work in all three deployments. As a Java/Spring engineer, this is the vector database you are most likely to be asked to run yourself, which means you need to understand not just its client API but its operational shape: how it stores data, how it shards, how it recovers from a crash, and where its performance knobs actually live.
+</p>
+
+<p>
+Finally, Qdrant is the cleanest teaching vehicle in this volume for <strong>filtered vector search</strong> — the requirement that shows up in almost every real RAG system the moment it leaves a demo: "search only within documents this user is authorized to see," or "search only within the last 90 days of tickets." Pinecone supports metadata filtering too, but Qdrant's payload index and filter DSL are rich enough, and documented precisely enough, to actually teach how filtering interacts with approximate nearest neighbor search under the hood — which is a subtlety that silently breaks recall in systems built by engineers who treat filtering as an afterthought.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+Vector similarity search itself is old — nearest-neighbor search in high-dimensional space was studied in information retrieval and computer vision long before "RAG" was a term anyone used. Early production similarity search lived inside search engines (image similarity, "more like this" recommendations) using libraries like Annoy (Spotify, 2015) and later Facebook's FAISS (2017), both of which are <em>libraries</em>, not databases: you linked them into your application process, built an in-memory index, and had none of the durability, replication, filtering, or multi-tenant concerns a real database provides. If your index needed to grow past what fit on one machine, or you needed to update vectors without rebuilding the whole index, you were on your own.
+</p>
+
+<p>
+Qdrant was started in 2021 by Andrey Vasnetsov and Andrey Zinoviev, and its founding thesis was explicit: nearest-neighbor libraries like FAISS solved the pure math of "find similar vectors fast," but production systems needed a database wrapped around that math — persistence, horizontal scaling, rich filtering that actually composes correctly with approximate search, and a real API surface (gRPC and REST) rather than a linked library. The choice of Rust as the implementation language was also deliberate and still shapes how the product is marketed today: Rust's memory safety without a garbage collector gives Qdrant predictable, low-tail latency — no GC pause spikes under load, which matters enormously for a service sitting in the hot path of every RAG query your application makes.
+</p>
+
+<p>
+The rise of the "vector database" as its own product category between 2022 and 2024 — Pinecone, Weaviate, Milvus, Qdrant, and pgvector as a Postgres extension all competing for the same RAG workload — is itself a direct consequence of the LLM boom this series has been tracing since Chapter 1: once retrieval-augmented generation became the default architecture for grounding LLMs in private data, "store and search embeddings at scale" went from a niche recommendation-systems problem to a mainstream backend requirement almost overnight, and Qdrant rode that wave from a promising open-source project to a company with commercial cloud offering and enterprise adoption.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Given a query vector, find the k vectors, among millions or billions stored, that are closest to it by some distance metric — fast enough for an interactive request, while also respecting arbitrary structured filters over metadata, and while the underlying data set is continuously being inserted into, updated, and deleted from.</strong>
+</div>
+
+<p>
+Every clause in that sentence names a real engineering problem Qdrant has to solve, and none of them are free:
+</p>
+
+<ul>
+<li><strong>"Among millions or billions"</strong> rules out brute-force comparison (computing the distance from the query to every stored vector) for latency-sensitive workloads — this is the exact-nearest-neighbor problem, and it does not scale. Qdrant, like every serious vector database, instead solves <strong>approximate</strong> nearest neighbor (ANN) search: return the k vectors that are <em>almost certainly</em> the closest ones, in exchange for sub-linear time.</li>
+<li><strong>"Fast enough for an interactive request"</strong> means single-digit-to-low-double-digit milliseconds at the p99, not seconds — because this call sits inside a user-facing RAG request that also has to call the LLM afterward.</li>
+<li><strong>"Respecting arbitrary structured filters"</strong> is the hard part most naive implementations get wrong: a graph-based ANN index (explained in Section 5) is built assuming it can freely hop between any two indexed vectors. The moment you say "but only consider vectors where <code>tenant_id = 42</code>," you have potentially cut the graph into disconnected islands, and a naive filter-after-search approach can silently return far fewer than k results, or the wrong k results entirely.</li>
+<li><strong>"Continuously being inserted into, updated, and deleted from"</strong> means the index cannot be a static, offline-built artifact (the way a research paper's FAISS benchmark often assumes) — it has to support online mutation without full index rebuilds, while still serving queries.</li>
+</ul>
+
+<p>
+Qdrant's entire architecture, described in the next several sections, is the answer to this compound problem.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 Collections, Points, and Payloads — Qdrant's Vocabulary</h3>
+
+<p>
+Qdrant organizes data into <strong>collections</strong> — the rough equivalent of a table in a relational database, or an index in Elasticsearch. Each collection holds <strong>points</strong>, and a point is the atomic unit of storage: an ID, one or more named vectors, and a JSON-like <strong>payload</strong> holding arbitrary metadata (source document ID, tenant, timestamp, access-control tags, raw text chunk, whatever your application needs). If you are used to relational modeling, think of a point as a denormalized row that carries its embedding and its metadata together, because in a RAG pipeline you almost always need both at once: "give me the text this vector represents" and "only if this user can see it."
+</p>
+
+<p>
+A subtlety worth internalizing early: Qdrant supports <strong>named vectors</strong> — a single point can carry multiple vectors under different names (say, a "dense" embedding from an embedding model and a "sparse" bag-of-words-style vector for keyword-style matching), each with its own distance metric and its own index. This is what makes hybrid search (dense semantic similarity plus sparse lexical matching, fused together) a first-class citizen in Qdrant rather than a bolt-on hack.
+</p>
+
+<h3>4.2 Distance Metrics — What "Closest" Means</h3>
+
+<p>
+"Closest" is not a single fixed notion; Qdrant lets you choose per-vector at collection-creation time, and the right choice depends on how your embedding model was trained:
+</p>
+
+<table>
+<tr><th>Metric</th><th>Intuition</th><th>Typical Use</th></tr>
+<tr><td>Cosine similarity</td><td>Angle between two vectors, ignoring magnitude — "do they point the same direction?"</td><td>Most text embedding models (OpenAI, Cohere, many sentence-transformers) are trained/normalized for this; the default choice for RAG</td></tr>
+<tr><td>Dot product</td><td>Raw projection of one vector onto another — sensitive to magnitude as well as direction</td><td>Models explicitly trained with dot-product objectives (some retrieval-tuned embedding models); faster to compute than cosine if vectors are pre-normalized</td></tr>
+<tr><td>Euclidean (L2) distance</td><td>Straight-line distance in vector space</td><td>Image embeddings, some classical ML embeddings where absolute position in space is meaningful</td></tr>
+</table>
+
+<p>
+Getting this wrong is a silent correctness bug, not a crash: if your embedding model was trained assuming cosine similarity and you configure the collection for Euclidean distance, search still returns <em>results</em> — they will simply be subtly, systematically worse, ranking documents in an order that does not reflect true semantic closeness, and nothing in your logs will tell you that.
+</p>
+
+<h3>4.3 The Core Idea: Trading Perfect Recall for Speed</h3>
+
+<p>
+The central theoretical concept underneath Qdrant, and every modern vector database, is that <strong>exact</strong> nearest-neighbor search over high-dimensional vectors has no known algorithm that beats brute-force comparison by an asymptotically large margin — this is a real, studied phenomenon sometimes called the "curse of dimensionality" in nearest-neighbor search: the structures that make low-dimensional search fast (like k-d trees, which work beautifully in 2 or 3 dimensions for geospatial queries) degrade toward brute-force performance once you have hundreds of dimensions, which is exactly the regime text embeddings live in (768, 1024, 1536, 3072 dimensions are all common). The practical answer the field converged on is to give up the guarantee of finding the <em>exact</em> top-k and instead build index structures that find the <em>approximate</em> top-k with extremely high probability, in exchange for search times that are orders of magnitude faster. Qdrant's default and flagship index for this is a graph structure called <strong>HNSW</strong> (Hierarchical Navigable Small World), which Section 5 walks through mechanically.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<h3>5.1 HNSW, Built From Intuition Upward</h3>
+
+<p>
+Imagine you are dropped into a city you don't know and asked to find the coffee shop closest to a friend's address, but you have no map — only the ability to ask a stranger "which of your neighbors is closer to this address than you are?" and walk to whichever neighbor they point at. If everyone is only connected to their immediate neighbors, this works but is slow: you shuffle one block at a time across the whole city. Now imagine the city also has a sparse network of a few "hub" people who each know dozens of others scattered across many neighborhoods — you can ask a hub, jump most of the way across the city in one hop, then switch to fine-grained neighbor-hopping once you're close. This two-scale structure — long jumps to get in the right neighborhood, short hops to refine — is exactly what a "navigable small world" graph is, and it is the same phenomenon behind the "six degrees of separation" idea in social networks.
+</p>
+
+<p>
+HNSW builds exactly this, but layered: it constructs several stacked graphs, where the top layer is very sparse (few nodes, mostly hub-like long-range connections) and each layer below adds more nodes and denser, shorter-range connections, until the bottom layer contains every single point with fine-grained local connections. A search starts at the sparse top layer, greedily walks toward the query vector's neighborhood (a few big jumps), then drops down a layer and refines, repeating until it reaches the bottom layer and returns the best candidates found. This is why HNSW search is roughly logarithmic in the number of points rather than linear — you are doing a coarse-to-fine search, not a flat scan.
+</p>
+
+<h3>5.2 What Happens on a Write</h3>
+
+<p>
+When you upsert a point, Qdrant does two things: it durably persists the point and its payload (so the write survives a crash), and it inserts the new point into the HNSW graph by running the same "find my nearest neighbors" search against the existing graph and wiring the new point into the graph at the layers it gets randomly assigned to (a point's presence at higher layers is probabilistic and decreasing — most points only exist at the bottom layer, fewer exist at middle layers, very few become "hubs" at the top layer). This means HNSW supports incremental insertion natively — you do not rebuild the whole graph on every write, which is exactly the "continuously mutated" requirement from the Problem Statement.
+</p>
+
+<p>
+Deletes are handled with a tombstone-style approach: rather than expensively re-wiring the graph on every delete, Qdrant marks points as deleted and excludes them from result sets, periodically compacting/optimizing segments in the background to reclaim space and graph quality. This background process, called <strong>segment optimization</strong> in Qdrant's architecture, is something you will tune directly in production (Section 8).
+</p>
+
+<h3>5.3 What Happens on a Filtered Query — The Subtle Part</h3>
+
+<p>
+This is the mechanism most engineers underestimate. Suppose you ask for the top 10 nearest neighbors to a query vector, filtered to <code>tenant_id = 42</code>. A naive implementation would run the unfiltered HNSW search, get the top 10 nearest neighbors overall, and then discard any that fail the filter — which can return zero or very few results if tenant 42's points happen to be sparse in vector space relative to everyone else, even though tenant 42 has plenty of relevant documents.
+</p>
+
+<p>
+Qdrant instead implements what it calls <strong>filterable HNSW</strong>: the graph traversal itself is filter-aware. As it walks the graph, it checks the payload filter against each candidate and prefers to explore branches likely to satisfy the filter, using payload indexes (built separately from the vector index, similar in spirit to a database index on a column) to make "does this point match the filter" a cheap lookup rather than a JSON scan. Qdrant also dynamically decides, based on filter selectivity, whether it is cheaper to do filtered graph traversal or to fall back toward a more exhaustive scan restricted to matching points — a highly selective filter (matching 0.01% of points) is sometimes faster to satisfy by directly enumerating the small matching set than by fighting the graph structure. Understanding that this decision exists is exactly why declaring the right <strong>payload index</strong> on frequently filtered fields is a production-critical step, not an optional optimization — without it, every filtered query pays a much heavier cost.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+You do not need to re-derive HNSW's probabilistic layer assignment to use Qdrant well, but two pieces of light formalism sharpen the intuition from Section 5 considerably.
+</p>
+
+<p>
+<strong>Cosine similarity</strong>, the default metric for text embeddings, is defined between two vectors <code>A</code> and <code>B</code> as:
+</p>
+
+<pre>
+cosine_similarity(A, B) = (A · B) / (||A|| × ||B||)
+
+where A · B is the dot product (sum of element-wise products),
+and ||A||, ||B|| are the vector magnitudes (Euclidean length).
+</pre>
+
+<p>
+The intuition: dividing out the magnitudes means only the <em>direction</em> the vectors point matters, not how "long" they are. Two embeddings pointing in nearly the same direction in 1536-dimensional space score close to 1 (very similar); orthogonal vectors score near 0; opposite directions score near -1. This is why Qdrant lets you pre-normalize vectors to unit length at ingestion time — once every vector has magnitude 1, cosine similarity reduces to a plain dot product, which is cheaper to compute at scale across millions of comparisons, a real performance lever, not a cosmetic one.
+</p>
+
+<p>
+<strong>Recall@k</strong> is the metric that quantifies HNSW's "approximate" trade-off concretely: if brute-force exact search would have returned a specific set of k true nearest neighbors, and your ANN search returns a set that overlaps that true set by, say, 9 out of 10, your recall@10 for that query is 0.9. HNSW's tunable parameters (covered operationally in Section 8 as <code>ef_construct</code> and <code>ef_search</code>) directly trade recall against latency: search more of the graph and recall rises toward 1.0, but so does query time. There is no free lunch here — every vector database's marketing claim of "blazing fast <em>and</em> accurate" is a specific point chosen on this recall/latency curve, and Qdrant exposes the dial explicitly rather than hiding it.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 HNSW's Layered Graph, Coarse to Fine</h3>
+
+<pre>
+Layer 2 (sparse — a handful of long-range "hub" points)
+
+      A ─────────────────────────── F
+       \                           /
+        \                         /
+         \                       /
+
+Layer 1 (denser — more points, medium-range links)
+
+      A ──── C ──────── E ──────── F
+       \    / \        /          /
+        \  /   \      /          /
+         B      D ───┘          G
+
+Layer 0 (every point — dense, short-range local links)
+
+  A─B─C─D─E─F─G─H─I─J─K─L─M─N─O─P─Q ... (every stored vector, richly interlinked)
+
+QUERY: start at Layer 2, greedily move toward the query vector
+(e.g. A → F, a huge jump across the space in one hop).
+Drop to Layer 1 at F, refine locally (F → E → D).
+Drop to Layer 0 at D, do fine-grained local search among D's
+dense neighbors to find the true top-k candidates.
+
+Result: O(log N)-ish traversal instead of scanning all N points.
+</pre>
+
+<h3>7.2 Filtered Search: Naive Post-Filter vs. Qdrant's Filter-Aware Traversal</h3>
+
+<pre>
+NAIVE "SEARCH THEN FILTER"                 QDRANT-STYLE FILTER-AWARE TRAVERSAL
+───────────────────────────                ────────────────────────────────────
+1. Run full HNSW search, ignore filter     1. Payload index tells traversal which
+   → top 10 nearest overall:                  regions of the graph likely satisfy
+     [P1,P2,P3,P4,P5,P6,P7,P8,P9,P10]          tenant_id = 42 BEFORE/DURING walk
+2. Apply filter tenant_id = 42             2. Graph walk actively steers toward
+   → only P4 and P9 match                     matching candidates, expanding search
+3. Return [P4, P9]                            budget (ef) dynamically if filter is
+   ✗ Only 2 results instead of 10,             restrictive
+     even though tenant 42 may have         3. Return true top-10 among tenant 42's
+     10+ relevant, close documents             points — correct count, correct ranking
+     elsewhere in the graph
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+A production Qdrant deployment is a small, focused distributed system, not a single binary you fire-and-forget. Key architectural elements:
+</p>
+
+<ul>
+<li><strong>Collections and shards:</strong> a collection is split into shards for horizontal scale; each shard holds a subset of points, its own HNSW graph segment, and its own payload index. Qdrant distributes shards across nodes in a cluster.</li>
+<li><strong>Replication:</strong> each shard can be replicated across multiple nodes using a Raft-based consensus mechanism for cluster metadata, giving you availability if a node dies — a familiar concept if you've operated Kafka partitions or any replicated log-based system.</li>
+<li><strong>Segments and optimizers:</strong> within a shard, data is organized into segments (roughly analogous to Lucene/Elasticsearch segments); background optimizer threads merge small segments, rebuild/compact HNSW graphs, and reclaim space from deleted points, tunable via indexing thresholds so you can trade ingestion throughput against query freshness.</li>
+<li><strong>Storage:</strong> vectors and payloads can live fully in RAM for lowest latency, or be memory-mapped from disk (with optional quantization, see Section 12) when the dataset is too large to keep fully resident — a cost/latency knob you control per collection.</li>
+</ul>
+
+<pre>
+                         ┌───────────────────────────┐
+                         │   Spring Boot Application   │
+                         │  (RAG orchestration layer)  │
+                         └──────────────┬──────────────┘
+                                        │ gRPC / REST
+                                        ▼
+                         ┌───────────────────────────┐
+                         │        Qdrant Cluster        │
+                         │  ┌─────────┐  ┌─────────┐   │
+                         │  │ Node 1   │  │ Node 2   │   │
+                         │  │ Shard A  │  │ Shard A' │   │  ← replica
+                         │  │ (primary)│  │ (replica)│   │
+                         │  ├─────────┤  ├─────────┤   │
+                         │  │ Shard B' │  │ Shard B  │   │
+                         │  │ (replica)│  │ (primary)│   │
+                         │  └─────────┘  └─────────┘   │
+                         │   Raft-coordinated metadata   │
+                         └──────────────┬──────────────┘
+                                        ▼
+                         ┌───────────────────────────┐
+                         │  Persistent volumes (disk)   │
+                         │  segments, WAL, snapshots     │
+                         └───────────────────────────┘
+</pre>
+
+<p>
+Notice this slots directly into the "Retrieval Layer / Vector DB + RAG" box from the production architecture diagram introduced in the Intelligence chapter and reused throughout this volume — Qdrant is a concrete, operable implementation of that box, with real operational surface area: node failover, snapshot-based backup/restore, and rolling upgrades your platform team will actually own.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI treats Qdrant as one implementation of its <code>VectorStore</code> abstraction — the same interface-driven pattern you have already seen with <code>ChatModel</code> abstracting away the LLM provider. This is a deliberate design echo: just as your business logic should not hard-code "OpenAI" versus "Anthropic," it should not hard-code "Pinecone" versus "Qdrant" — you program against <code>VectorStore</code>, and the specific implementation (Spring AI ships a <code>QdrantVectorStore</code>) is a configuration and dependency-injection concern.
+</p>
+
+<pre>
+// build.gradle / pom.xml: spring-ai-qdrant-store-spring-boot-starter
+
+@Configuration
+public class VectorStoreConfig {
+
+    @Bean
+    public VectorStore vectorStore(QdrantClient qdrantClient,
+                                    EmbeddingModel embeddingModel) {
+        return QdrantVectorStore.builder(qdrantClient, embeddingModel)
+                .collectionName("support_tickets")
+                .initializeSchema(true)
+                .build();
+    }
+}
+
+// application.yml
+spring:
+  ai:
+    vectorstore:
+      qdrant:
+        host: qdrant.internal
+        port: 6334
+        use-tls: true
+        api-key: ${QDRANT_API_KEY}
+        collection-name: support_tickets
+</pre>
+
+<p>
+Once wired, ingestion and retrieval both flow through the same <code>VectorStore</code> contract you would use with any other backing store:
+</p>
+
+<pre>
+// Ingestion: chunk, embed (handled internally via the configured
+// EmbeddingModel), and upsert into Qdrant as Documents with metadata.
+List&lt;Document&gt; chunks = textSplitter.split(sourceDocuments);
+vectorStore.add(chunks);
+
+// Retrieval: metadata-filtered similarity search, mirroring the
+// filter-aware traversal explained in Section 5.
+SearchRequest request = SearchRequest.builder()
+        .query(userQuestion)
+        .topK(5)
+        .filterExpression("tenant_id == '42' && status == 'open'")
+        .build();
+List&lt;Document&gt; results = vectorStore.similaritySearch(request);
+</pre>
+
+<p>
+This connects directly to the <strong>Advisors</strong> mechanism from Spring AI's core (the AOP-flavored interceptor pattern introduced earlier in this series): a <code>QuestionAnswerAdvisor</code> wraps a <code>ChatClient</code> call, automatically performing this exact similarity search against your configured <code>VectorStore</code> and injecting the retrieved chunks into the prompt before the model ever sees the user's question — meaning a Spring engineer wires Qdrant into a RAG pipeline largely through configuration and a builder-style advisor chain, not hand-rolled HTTP calls to a vector database SDK.
+</p>
+
+<p>
+Because <code>VectorStore</code> is an interface, a genuinely valuable architectural pattern is to develop and test against an in-memory <code>SimpleVectorStore</code> locally, and swap in <code>QdrantVectorStore</code> for staging/production purely via Spring profiles and configuration — the same dependency-inversion discipline you already apply to <code>DataSource</code> or messaging abstractions.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Always create a payload index on fields you filter by frequently</strong> (tenant ID, document type, date ranges) — filtering without a payload index forces Qdrant into much more expensive traversal or scan behavior, as explained in Section 5.3.</li>
+<li><strong>Match the distance metric to how your embedding model was trained</strong> — check the embedding model's documentation rather than assuming cosine is universally correct; a mismatch degrades ranking quality silently, with no error to alert you.</li>
+<li><strong>Use named vectors for hybrid search</strong> rather than running separate dense and sparse searches in application code and fusing results yourself — Qdrant's native support avoids duplicated round trips and lets the server-side fusion be more efficient.</li>
+<li><strong>Tune <code>ef_search</code> per use case, not globally</strong> — a high-stakes compliance search may warrant higher recall (higher <code>ef_search</code>, more latency) than a "similar articles" widget where a slightly imperfect top-10 is harmless.</li>
+<li><strong>Use snapshots for backup, and test restore, before you need it</strong> — Qdrant's snapshot mechanism captures full collection state; treat it with the same operational seriousness as a database backup, including scheduled restore drills.</li>
+<li><strong>Size RAM around your quantization strategy deliberately</strong> (see Section 12) rather than defaulting to full-precision, full-in-RAM vectors and being surprised by the memory bill at scale.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Filtering without a payload index and assuming it "just works."</strong> It does work — it just gets progressively slower and can degrade recall as the filtered subset shrinks relative to the whole collection, and this regression often only shows up once real production data volume arrives, past the demo stage.</li>
+<li><strong>Treating collection schema (vector size, distance metric) as easily changeable later.</strong> Changing embedding models (e.g., moving from a 1536-dimension to a 3072-dimension embedding model) requires a new collection and full re-embedding of your corpus — this is not a lightweight migration, and teams that don't plan for it get stuck maintaining two collections mid-migration.</li>
+<li><strong>Conflating "approximate" with "unreliable."</strong> Some engineers, on first learning HNSW is approximate, distrust it entirely and try to force exact search, killing the latency benefits that make vector search viable in the first place — the correct response is to measure recall@k for your actual data and tune <code>ef_search</code>/<code>ef_construct</code>, not abandon ANN search.</li>
+<li><strong>Ignoring background segment optimization under heavy write load.</strong> A bulk-ingestion job that fires thousands of upserts per second without regard for indexing thresholds can starve the optimizer, leaving the collection in a state with degraded query performance until optimization catches up.</li>
+<li><strong>Storing the full source document as payload instead of a reference.</strong> Payloads are convenient, but stuffing large text blobs into every point bloats memory and slows snapshot/replication operations — many production designs store a compact payload (IDs, short metadata) and fetch full document content from a separate store keyed by that ID.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Three levers dominate Qdrant performance tuning, and understanding them concretely is a genuine differentiator between engineers who can "use a vector database" and engineers who can operate one under real load:
+</p>
+
+<ul>
+<li><strong><code>ef_construct</code> and <code>ef_search</code>:</strong> these control how wide the HNSW graph search explores during index-building and query-time respectively. Higher values improve recall but cost more CPU and latency; this is the direct, tunable expression of the recall/latency trade-off from Section 6.</li>
+<li><strong>Quantization:</strong> Qdrant supports scalar, product, and binary quantization — compressing vectors from full 32-bit floats down to smaller representations (e.g., 8-bit integers, or even 1 bit per dimension for binary quantization), dramatically cutting memory footprint and speeding up distance computation, at the cost of some recall. For very large collections, quantization is frequently the difference between a dataset fitting in RAM (fast) versus needing disk-backed storage (much slower tail latency).</li>
+<li><strong>Memory-mapped vs. in-RAM storage:</strong> keeping the full HNSW graph and vectors in RAM gives the lowest latency but caps how large a single node's collection can be; memory-mapping from disk trades some latency for the ability to serve collections far larger than available RAM — a decision that should be made deliberately against your actual dataset size and latency SLA, not left at defaults.</li>
+</ul>
+
+<p>
+At the throughput level, remember that every filtered or unfiltered similarity search is still fundamentally CPU-bound work (graph traversal plus distance computations), so horizontal scaling via sharding, and vertical scaling via more CPU cores per node, both matter — and because Qdrant is written in Rust without a garbage collector, tail latency (p99, p999) tends to be far more predictable under load than JVM-based alternatives, which is precisely the low-latency guarantee the project's Rust choice was made to deliver.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Qdrant's security surface is real but narrower than an LLM's, and it is worth being honest about the shape of it rather than manufacturing false depth. The primary concerns are conventional database-adjacent ones: API-key authentication and TLS for the client connection (self-hosted Qdrant does not enforce authentication by default, so an exposed instance with no API key configured is an open door to your entire embedded corpus — a mistake seen repeatedly with quickly-spun-up Docker deployments left reachable on a public network); network isolation (running Qdrant inside a private VPC/subnet rather than exposing its ports publicly); and payload-level access control, since payloads frequently contain sensitive metadata or even raw document text, meaning your filter-based multi-tenancy strategy (Section 10's <code>tenant_id</code> filtering) is doing real security work, not just correctness work — a bug in that filter expression is a cross-tenant data leak, not a cosmetic search-quality issue.
+</p>
+
+<p>
+There is also a subtler concern connecting back to the prompt injection risk raised in the Intelligence chapter: retrieved payload content flows directly into your LLM prompt through the retrieval-augmented pipeline, so any untrusted text that made it into a payload (a user-submitted support ticket, a scraped web page) is exactly the kind of untrusted text that can carry an injection payload. Qdrant itself has no way to know or prevent this — sanitization and injection-awareness belong in your application/orchestration layer, not the vector store, and this is exactly why Volume 5's guardrails material treats retrieval content as an attack surface, not just a knowledge source.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is a "collection" in Qdrant, and how does it relate to a table in a relational database?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A collection is Qdrant's top-level container for a set of related points, similar to a table. Each point within it holds a vector (or several named vectors), an ID, and a JSON-like payload of metadata — conceptually a denormalized row carrying both its embedding and its associated data together, so a single lookup returns both the similarity match and the metadata needed to use it.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why can't Qdrant just compare the query vector against every stored vector to find the nearest neighbors?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Brute-force comparison is linear in the number of stored vectors, and high-dimensional nearest-neighbor search does not have efficient exact algorithms the way low-dimensional spatial search does (the "curse of dimensionality"). For millions or billions of vectors, this is too slow for interactive queries, so Qdrant uses an approximate nearest neighbor (ANN) index, HNSW, that trades a small amount of accuracy for orders-of-magnitude faster search.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain, mechanically, how HNSW search works.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>HNSW builds multiple stacked graph layers: the top layer is sparse with long-range connections between a few "hub" points, and each layer below is progressively denser with shorter-range connections, until the bottom layer contains every point. A search starts at the top layer, greedily hops toward the query vector (covering large distances quickly), then drops down a layer and refines, repeating until it reaches the bottom layer, where it does fine-grained local search to produce the final approximate top-k results. This coarse-to-fine traversal is what makes search close to logarithmic rather than linear in the number of points.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. What is recall@k, and why does it matter when configuring a vector database?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Recall@k measures what fraction of the true k nearest neighbors (as found by exact brute-force search) an approximate search actually returns. Because HNSW trades accuracy for speed, recall@k is never guaranteed to be 1.0 by default; parameters like <code>ef_search</code> let you trade latency against recall, and teams should measure recall@k against representative queries rather than assume default settings are adequate for their accuracy requirements.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Why does filtering combined with ANN search require special handling, and how does Qdrant address it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>A graph-based ANN index like HNSW assumes traversal can move freely between indexed points. Applying a metadata filter after running an unfiltered search can return too few or the wrong results if matching points are sparsely distributed relative to the graph's natural traversal paths — the search may exhaust its candidate budget before finding enough matches. Qdrant addresses this with filter-aware graph traversal: it uses payload indexes to cheaply evaluate filters during the walk itself, steering traversal toward matching regions and dynamically adjusting search effort based on filter selectivity, rather than filtering a fixed unfiltered result set after the fact.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly state that payload indexes are what make filter-aware traversal cheap — mention that filtering on an unindexed payload field still works correctly but degrades toward exhaustive scanning, which is the detail that separates a candidate who has actually operated Qdrant from one who has only read the marketing page.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. How does Spring AI's <code>VectorStore</code> abstraction change how you'd architect a switch from Qdrant to another vector database, and what are its limits?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because business logic is written against the <code>VectorStore</code> interface (add, similaritySearch, filter expressions) rather than a Qdrant-specific SDK, swapping the backing implementation (e.g., to a different <code>VectorStore</code> bean) is largely a configuration and dependency change, mirroring how <code>ChatModel</code> abstracts LLM providers. The limits are real, though: implementation-specific capabilities like Qdrant's named vectors for hybrid search, or its specific quantization strategies, are not uniformly exposed across every <code>VectorStore</code> implementation, so a migration can still require re-validating filter expression syntax, distance metric configuration, and re-embedding if vector dimensions or normalization assumptions differ.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A platform team wants to migrate an embedding model (changing vector dimensionality) on a live Qdrant-backed RAG system serving production traffic. Walk through how you'd do this without downtime or a recall cliff.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Since a collection is bound to a fixed vector dimension and distance metric, you cannot mutate an existing collection in place for a new embedding model — you create a new collection sized for the new model, and run a backfill job that re-embeds the full corpus (chunk text is typically preserved in payload precisely to make this possible) into the new collection while the old collection continues serving live traffic unchanged. Once the new collection's freshness and recall are validated against a held-out evaluation set, traffic is cut over via a feature flag or configuration change (exploiting the <code>VectorStore</code> abstraction to swap collections without redeploying business logic), ideally with a brief dual-write or shadow-read period to compare result quality before fully retiring the old collection. Throughout, payload text (not just vectors) is the thing that must be durably retained, since it's the reusable input for re-embedding — losing it would force reconstructing chunk boundaries from source documents.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. When would you choose to self-host Qdrant over a fully managed vector database, and what operational responsibilities does that decision actually create?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Self-hosting makes sense under data residency/compliance constraints that prohibit sending embeddings to third-party infrastructure, when cost at very large scale favors owning infrastructure over pay-per-use managed pricing, or when you need tuning control (quantization strategy, ef parameters, sharding topology) beyond what a managed API exposes. The trade-off is real operational ownership: cluster sizing and shard/replica planning, backup and restore drills, rolling upgrades, monitoring recall and latency in production, and incident response for node failures — none of which disappear, they simply move from a vendor's SLA to your team's on-call rotation. A staff-level answer weighs this explicitly against team size and existing platform maturity, rather than treating "open source and self-hosted" as free.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why filtering a graph-based ANN index is fundamentally harder than filtering a SQL table scan, and why a naive "search then discard non-matching results" strategy can silently return fewer results than requested.</li>
+<li>Using the recall@k concept from Section 6, describe a scenario where accepting lower recall (faster, less exhaustive search) is the correct engineering trade-off, and a scenario where it is not.</li>
+<li>Compare Qdrant's approach (self-hostable, Rust-based, filter-aware HNSW) against Pinecone's fully managed model from the previous chapter. For a three-person startup with no dedicated platform team, which would you recommend, and why?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Run Qdrant locally via Docker, create a collection with cosine distance, and insert 50 points representing short text snippets you embed with any available embedding model. Query for the nearest neighbors to a new snippet, then add a payload field (e.g., a category) to each point, create a payload index on it, and re-run the same query with a filter applied. Compare result counts and ordering before and after the filter.</li>
+<li>Using Spring AI's <code>QdrantVectorStore</code>, wire up a minimal Spring Boot service exposing one endpoint that ingests documents (chunk + embed + upsert) and one endpoint that performs a filtered similarity search using a <code>filterExpression</code>. Write one integration test that asserts a document is retrievable only when the filter matches its metadata.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Qdrant is an open-source, Rust-built vector database that answers the same core problem as Pinecone — fast approximate nearest-neighbor search over millions or billions of embeddings — but gives you self-hostable, inspectable, tunable control over how it's done.</li>
+<li>Its flagship index, HNSW, achieves near-logarithmic search time by building layered graphs that combine sparse long-range "hub" connections with dense local connections, trading a small amount of recall for large latency gains.</li>
+<li>Filtering interacts non-trivially with graph-based ANN search; Qdrant's filter-aware traversal and payload indexes are what make metadata-filtered search both correct and fast — declaring payload indexes on frequently filtered fields is a production necessity, not an optimization.</li>
+<li>Distance metric choice (cosine, dot product, Euclidean) must match how your embedding model was trained, or ranking quality degrades silently with no visible error.</li>
+<li>Spring AI exposes Qdrant through the same provider-agnostic <code>VectorStore</code> abstraction used for other vector databases, letting RAG pipelines built with <code>ChatClient</code> and advisors like <code>QuestionAnswerAdvisor</code> swap the underlying store via configuration rather than rewritten business logic.</li>
+<li>Real production operation of Qdrant means owning genuine distributed-systems concerns — sharding, replication, quantization trade-offs, backup/restore, and network-level security — that a fully managed vector database would otherwise absorb on your behalf.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Weaviate (Chapter 71) takes the vector database conversation in a different direction — a database that bakes schema, built-in vectorization modules, and GraphQL-style querying directly into the product, and one that leans further into hybrid dense-plus-sparse search as a default rather than an opt-in feature. Holding Pinecone, Qdrant, and Weaviate side by side will give you the comparative vocabulary a senior AI engineer needs to justify a vector database choice on its actual engineering merits, not on marketing.
+</p>
+
+</div>
+
+</body>
+</html>
