@@ -1,6 +1,6 @@
 # Java Backend Interview Handbook
 
-A self-contained, mobile-friendly handbook for **Senior Java Backend Engineer** roles, extending into a full **AI Engineering with Java & Spring AI** track — one single app, one reader, chapters numbered continuously from 01 onward. Interview chapters (01–24) carry high-ROI questions, sample answers, code, and "interview gold point" follow-ups; the AI Engineering chapters (25+) are deep, book-style chapters (motivation → theory → internals → math → production architecture → Spring AI mapping → interview questions) covering everything from ML foundations through Spring AI, RAG, agents, and enterprise AI systems.
+A self-contained, mobile-friendly handbook covering three tracks in one single app, one reader: **Senior Java Backend Engineer** interview prep, a **React / Frontend Engineer** interview handbook, and a full **AI Engineering with Java & Spring AI** track. The sidebar reads Java → React → AI Engineering, in that order, even though chapter numbers are not contiguous across tracks (see the numbering note in each section below). Interview chapters (Java: 01–24, React: 112–135) carry high-ROI questions, sample answers, code, and "interview gold point" follow-ups; the AI Engineering chapters (25–111) are deep, book-style chapters (motivation → theory → internals → math → production architecture → Spring AI mapping → interview questions) covering everything from ML foundations through Spring AI, RAG, agents, and enterprise AI systems.
 
 ### 🌐 Live site: **[inter-lyart.vercel.app](https://inter-lyart.vercel.app)**
 
@@ -147,26 +147,24 @@ Open [`handbook.html`](handbook.html) directly in a browser, or visit the [live 
 
 ## ⚛️ React / Frontend Interview Handbook
 
-A **dedicated companion handbook** for **Frontend / React Engineer** roles — same format, depth, and reader as the Java handbook, in the [`react/`](react/) folder.
-
-### 🌐 Live site: **[inter-lyart.vercel.app/react](https://inter-lyart.vercel.app/react)**
+Same format and depth as the Java interview chapters, now **merged into the single combined handbook** as chapters 112–135 (previously a standalone reader under `react/`, which has been folded in and removed). The sidebar shows this track as its own "React & Frontend Interview Handbook" block, positioned right after the Java interview chapters and before the AI Engineering track — chapter numbers are 112–135 rather than contiguous with the Java chapters purely so that existing AI Engineering chapter links (25 onward) never had to change.
 
 | # | Chapter | # | Chapter |
 |---|---------|---|---------|
-| 01 | Introduction & HR | 13 | Next.js, SSR & Server Components |
-| 02 | JavaScript Fundamentals | 14 | Performance Optimization |
-| 03 | Advanced JavaScript & Async | 15 | React Internals (Fiber & Reconciliation) |
-| 04 | TypeScript for React | 16 | Styling & CSS Architecture |
-| 05 | React Fundamentals | 17 | Testing (Jest & RTL) |
-| 06 | React Hooks | 18 | Accessibility (a11y) |
-| 07 | Advanced Hooks & Custom Hooks | 19 | Browser & Web Platform Fundamentals |
-| 08 | Component Patterns | 20 | Frontend Security |
-| 09 | State Management | 21 | Build Tools & Tooling |
-| 10 | Data Fetching & Server State | 22 | Frontend System Design |
-| 11 | Forms & Validation | 23 | Data Structures & Algorithms (JS) |
-| 12 | React Router & Navigation | 24 | Behavioural & Self-Introduction |
+| 112 | Introduction & HR | 124 | Next.js, SSR & Server Components |
+| 113 | JavaScript Fundamentals | 125 | Performance Optimization |
+| 114 | Advanced JavaScript & Async | 126 | React Internals (Fiber & Reconciliation) |
+| 115 | TypeScript for React | 127 | Styling & CSS Architecture |
+| 116 | React Fundamentals | 128 | Testing (Jest & RTL) |
+| 117 | React Hooks | 129 | Accessibility (a11y) |
+| 118 | Advanced Hooks & Custom Hooks | 130 | Browser & Web Platform Fundamentals |
+| 119 | Component Patterns | 131 | Frontend Security |
+| 120 | State Management | 132 | Build Tools & Tooling |
+| 121 | Data Fetching & Server State | 133 | Frontend System Design |
+| 122 | Forms & Validation | 134 | Data Structures & Algorithms (JS) |
+| 123 | React Router & Navigation | 135 | Behavioural & Self-Introduction |
 
-Regenerate the React readers after editing any chapter with `python react/_build_index.py`.
+Regenerate the handbook after editing any chapter (Java, React, or AI Engineering) with `python _build_index.py` — one script, one combined `handbook.html`/`index.html`.
 
 ---
 
