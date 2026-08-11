@@ -1,10 +1,10 @@
 # Java Backend Interview Handbook
 
-A self-contained, mobile-friendly handbook covering three tracks in one single app, one reader: **Senior Java Backend Engineer** interview prep, a **React / Frontend Engineer** interview handbook, and a full **AI Engineering with Java & Spring AI** track. The sidebar reads Java → React → AI Engineering, in that order, even though chapter numbers are not contiguous across tracks (see the numbering note in each section below). Interview chapters (Java: 01–24, React: 112–135) carry high-ROI questions, sample answers, code, and "interview gold point" follow-ups; the AI Engineering chapters (25–111) are deep, book-style chapters (motivation → theory → internals → math → production architecture → Spring AI mapping → interview questions) covering everything from ML foundations through Spring AI, RAG, agents, and enterprise AI systems.
+A mobile-friendly handbook covering three tracks in one single app, one reader: **Senior Java Backend Engineer** interview prep, a **React / Frontend Engineer** interview handbook, and a full **AI Engineering with Java & Spring AI** track. The sidebar reads Java → React → AI Engineering, in that order, even though chapter numbers are not contiguous across tracks (see the numbering note in each section below). Interview chapters (Java: 01–24, React: 112–135) carry high-ROI questions, sample answers, code, and "interview gold point" follow-ups; the AI Engineering chapters (25–111) are deep, book-style chapters (motivation → theory → internals → math → production architecture → Spring AI mapping → interview questions) covering everything from ML foundations through Spring AI, RAG, agents, and enterprise AI systems.
 
 ### 🌐 Live site: **[inter-lyart.vercel.app](https://inter-lyart.vercel.app)**
 
-> The live site is the single-file [`handbook.html`](handbook.html) — a searchable, dark-mode-enabled reader with all chapters inlined. Each chapter also exists as its own standalone HTML file in this repo.
+> The live site is [`handbook.html`](handbook.html) — a searchable, dark-mode-enabled reader shell (~150 KB) that fetches each chapter's HTML on demand the first time you open it, then caches it in memory for the rest of the session, instead of shipping all 135 chapters (~8 MB) up front. Each chapter also exists as its own standalone HTML file in this repo — that standalone file *is* what gets fetched, so there's no separate "lazy" copy to keep in sync. Requires a network connection (or the browser's disk cache) to open a chapter you haven't already visited this session — the previous single-file, fully-offline version traded that off for a much smaller initial download; see `git log` if you need that version back.
 
 ---
 
@@ -141,7 +141,7 @@ Currently published:
 
 ## 🚀 Usage
 
-Open [`handbook.html`](handbook.html) directly in a browser, or visit the [live site](https://inter-lyart.vercel.app). Regenerate both readers after adding or editing any chapter with `python _build_index.py`.
+Visit the [live site](https://inter-lyart.vercel.app), or serve this folder locally (e.g. `python -m http.server`) and open `handbook.html` through that server. Opening `handbook.html` directly as a `file://` path loads the shell but **not** any chapter content — chapters are fetched with `fetch()`, which browsers block against `file://` origins for security, so a real HTTP server (local or deployed) is required. Regenerate the handbook after adding or editing any chapter with `python _build_index.py`; CI re-checks this on every push.
 
 ---
 
@@ -164,7 +164,7 @@ Same format and depth as the Java interview chapters, now **merged into the sing
 | 122 | Forms & Validation | 134 | Data Structures & Algorithms (JS) |
 | 123 | React Router & Navigation | 135 | Behavioural & Self-Introduction |
 
-Regenerate the handbook after editing any chapter (Java, React, or AI Engineering) with `python _build_index.py` — one script, one combined `handbook.html`/`index.html`.
+Regenerate the handbook after editing any chapter (Java, React, or AI Engineering) with `python _build_index.py` — one script, one combined `handbook.html`. CI (`.github/workflows/build-check.yml`) re-runs this on every push and fails the build if it produces a diff, so a forgotten rebuild never reaches `main`.
 
 ---
 
