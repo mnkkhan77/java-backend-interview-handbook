@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>148-FINE-TUNING-DEEP-DIVE.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 88 — FINE-TUNING DEEP DIVE</h1>
+
+<p class="roi">Volume 7 — Advanced &amp; Specialized Topics · Chapter 1 of 6</p>
+
+<div class="callout">
+Chapter 23 (Fine-Tuning) gave you the concept at a foundational level: fine-tuning permanently changes a model's weights rather than its context, LoRA exists because full fine-tuning stops scaling somewhere around the tens-of-billions-of-parameters mark, and most "let's fine-tune it" requests are secretly RAG or prompting requests wearing a disguise. That chapter was deliberately conceptual — it told you LoRA freezes the base model and trains small adapter matrices, showed you the <code>W + B·A</code> shape, and stopped there. This chapter goes underneath that abstraction. It is written for the engineer who has already accepted, in principle, that fine-tuning is the right tool for a specific production requirement, and who now has to answer the much harder question actually asked in a design review or a GPU-procurement approval: which fine-tuning approach — full fine-tuning, LoRA, QLoRA, or one of the lighter-weight PEFT alternatives such as prefix-tuning or prompt-tuning — and why, backed by real numbers: how much GPU memory, how many dollars, how long, and how you will prove afterward, using the evaluation discipline from Chapter 53, that the fine-tune was actually worth doing at all rather than just satisfying to have shipped.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Chapter 23 left you with a filter: prefer prompting, then RAG, then fine-tuning, and prefer PEFT over full fine-tuning once you get there. That filter is necessary but not sufficient. In practice, once a team clears that bar and commits to fine-tuning something, the very next question — the one that actually determines the budget line, the GPU order, and the timeline — is never answered by the introductory chapter: <em>which</em> fine-tuning approach, at <em>what</em> rank, at <em>what</em> quantization level, and how do you defend that choice to a skeptical staff engineer or a finance partner who wants to know why this needs an A100 for six hours instead of a laptop for twenty minutes?
+</p>
+
+<p>
+This gap matters because the four real candidates — full fine-tuning, LoRA, QLoRA, and the prompt/prefix-tuning family — are not simply "more expensive" versus "less expensive" versions of the same thing. They sit at genuinely different points on a memory/quality/flexibility trade-off surface, and picking the wrong one produces one of two expensive failure modes: you either over-provision (renting a multi-GPU cluster and a week of engineering time for a task a single consumer GPU and an afternoon of QLoRA training would have handled), or you under-provision (trying to force a rank-4 LoRA adapter to absorb a behavioral shift that genuinely needed full-parameter movement, shipping a fine-tune that "sort of" works and then spending the next quarter debugging why it plateaus). Both failure modes are common in real organizations, and both are entirely avoidable once you understand the mechanics well enough to reason about the trade-off from first principles instead of copying whatever configuration a blog post used.
+</p>
+
+<p>
+There is a second, equally practical motivation specific to production systems: serving. Chapter 23 mentioned, briefly, that LoRA adapters can be hot-swapped at serving time for multi-tenant platforms. This chapter treats that as a first-class production decision rather than a footnote — whether to merge an adapter into the base weights or keep it separate has real, opposite consequences for latency, deployment complexity, and how many customers a single GPU fleet can serve, and an engineer who has only read the introductory chapter will not know which one to pick without guidance.
+</p>
+
+<p>
+Finally, this chapter closes a loop back to Chapter 53. A fine-tune that "feels" better in a few manual spot-checks is not evidence — it is exactly the unmeasured gut-feeling Chapter 53 warned against, applied to a much more expensive intervention than a prompt change. Justifying a fine-tuning approach to a production system means being able to say, with a golden-set number in hand, not just "we chose QLoRA at rank 16" but "we chose QLoRA at rank 16, and here is the faithfulness/task-accuracy delta versus our prompting-only baseline that proves the training cost was worth paying."
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Where Chapter 23 Left the Timeline</h3>
+
+<p>
+Chapter 23 traced the lineage from vision transfer learning, through full fine-tuning of early language models, to LoRA's 2021 arrival as the response to a hard infrastructure wall: full fine-tuning of a large model requires storing gradients and optimizer state for every parameter simultaneously, which for a multi-billion-parameter model can dwarf the memory needed to merely run the model. This chapter picks up exactly where that history stopped — at LoRA's success — because LoRA alone did not fully solve the accessibility problem, and the years immediately after 2021 are the story of closing the remaining gap.
+</p>
+
+<h3>2.2 The Remaining Wall After LoRA: the Frozen Base Model Still Has to Fit in Memory</h3>
+
+<p>
+LoRA reduced the memory needed for <em>trainable</em> parameters to a tiny fraction of the model, but it did nothing about the memory needed to simply hold the frozen base model in GPU memory during training, typically in 16-bit precision. A 65-billion-parameter model in 16-bit precision still needs on the order of 130 gigabytes just to sit in memory before a single gradient is computed — putting LoRA fine-tuning of the largest open-weight models out of reach for anyone without multiple high-end GPUs. The base model itself, not the adapter, remained the bottleneck.
+</p>
+
+<h3>2.3 QLoRA (2023): Quantize the Wall Away</h3>
+
+<p>
+QLoRA's contribution, published in 2023, was to attack exactly that remaining wall: load and freeze the base model in a heavily compressed 4-bit representation instead of 16-bit, train LoRA adapters in a higher-precision format on top of it, and de-quantize back to a working precision on the fly only for the specific computation that needs it. The paper's headline result — fine-tuning a 65-billion-parameter model on a single 48GB GPU with no measurable quality loss versus full 16-bit LoRA fine-tuning — is the reason QLoRA, rather than plain LoRA, is now the default starting point for most teams fine-tuning an open-weight model outside of a well-resourced ML infrastructure org. It did not invent a new adaptation mechanism; it made the existing LoRA mechanism dramatically cheaper to run by attacking the base model's memory footprint rather than the adapter's.
+</p>
+
+<h3>2.4 The Parallel Track: Prompt-Tuning and Prefix-Tuning</h3>
+
+<p>
+LoRA was not the only PEFT idea competing for attention in 2021–2022. A parallel line of research asked a more radical question: instead of adding trainable matrices inside the model's weight computations at all, what if you left every original weight completely untouched and only learned a small number of additional "virtual tokens" — continuous vectors prepended to the input (prompt-tuning) or injected into every attention layer's key/value computation (prefix-tuning)? These techniques train even fewer parameters than LoRA, sometimes by another order of magnitude, and never touch the model's internal weight matrices at all, only its inputs at every layer. They did not become the dominant default the way LoRA did, largely because they tend to need larger base models to work well and are comparatively fiddly to train stably, but they remain genuinely useful in specific niches this chapter covers in Section 4, and understanding why they lost the popularity contest to LoRA is itself instructive about what made LoRA's design choice — modifying the weight-space update rather than the input space — the more robust bet.
+</p>
+
+<table>
+<tr><th>Era</th><th>Core Innovation</th><th>What It Solved</th><th>What It Left Unsolved</th></tr>
+<tr><td>Full fine-tuning (2018–2019)</td><td>Update every parameter</td><td>Task adaptation for hundred-million-parameter models</td><td>Does not scale to tens/hundreds of billions of parameters</td></tr>
+<tr><td>LoRA (2021)</td><td>Freeze base weights, train small low-rank adapter matrices</td><td>Trainable-parameter memory and compute</td><td>Frozen base model itself still must fit in GPU memory at 16-bit precision</td></tr>
+<tr><td>Prompt/Prefix-Tuning (2021)</td><td>Learn virtual tokens/continuous prefixes; touch no internal weights at all</td><td>Even smaller trainable footprint than LoRA</td><td>Less robust at smaller model scales; trickier optimization; lower ceiling on complex behavioral shifts</td></tr>
+<tr><td>QLoRA (2023)</td><td>4-bit quantized frozen base model + LoRA adapters trained on top</td><td>The base model's own memory footprint during training</td><td>Adds quantization/dequantization engineering complexity; slight inference-time overhead if not merged</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> notice that each innovation attacked a specific, nameable memory bottleneck rather than being a generically "better" algorithm — full fine-tuning's bottleneck was gradient/optimizer-state memory for all parameters; LoRA's remaining bottleneck was the frozen base model's own footprint; QLoRA's target was exactly that. This is the same pattern from Chapter 53's history section (each era's bottleneck relocated rather than vanished), and it is exactly why "which one should I use?" has a principled answer rooted in where your own bottleneck actually sits, covered next in Section 3 and quantified in Section 6.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Chapter 23's problem statement was "how do you permanently and efficiently adapt a pretrained model's weights." This chapter's problem statement is narrower and more operational:
+</p>
+
+<div class="callout">
+<strong>Given a confirmed, justified fine-tuning requirement, a target base model, a fixed hardware/cloud budget, and a production serving constraint (single-tenant or multi-tenant), select — and be able to defend with numbers — a specific point in the full-fine-tuning / LoRA / QLoRA / prompt-tuning family, along with its key hyperparameters (rank, quantization scheme, which layers to adapt), such that the resulting model meets the task's quality bar at the lowest defensible cost, without introducing serving-time complexity the production system cannot absorb.</strong>
+</div>
+
+<p>
+Three sub-problems hide inside that statement, and each has its own section later in this chapter:
+</p>
+
+<ul>
+<li><strong>The memory sub-problem.</strong> Every candidate approach has a computable GPU memory requirement for training, driven by base model size, precision, and how many parameters actually receive gradients. This is arithmetic, not guesswork, and Section 6 gives you the formulas to do it yourself for any model size before you ever request hardware.</li>
+<li><strong>The quality-ceiling sub-problem.</strong> Full fine-tuning has the highest theoretical quality ceiling because it can move every weight; LoRA and QLoRA constrain updates to a low-rank subspace, which is usually enough but is a real, nameable constraint; prompt/prefix-tuning constrains updates even further, to the input space alone. Choosing an approach means choosing how much of that ceiling you actually need for your task, not defaulting to the most powerful (and most expensive) option out of caution.</li>
+<li><strong>The serving-topology sub-problem.</strong> A single fine-tune for a single product is a different serving problem than one fine-tune per enterprise customer across hundreds of tenants. Merging an adapter into base weights versus keeping it separate is not a training-time decision — it is a serving-architecture decision, and Section 8 treats it as such.</li>
+</ul>
+
+<p>
+A useful reframing, directly analogous to Chapter 53's retrieval-versus-generation decomposition: do not ask "should I fine-tune?" (Chapter 23 already answered the version of that question that matters). Ask, separately, "where does my bottleneck actually live — GPU memory, training wall-clock time, adapter portability, or raw achievable quality — and which approach in the PEFT family relieves <em>that specific</em> bottleneck?" Teams that skip this decomposition tend to default to whichever approach was in the most recent blog post they read, which is precisely the "gut feel" failure mode this book keeps warning against, just relocated from evaluation to infrastructure procurement.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The PEFT Family as One Spectrum, Not Four Unrelated Techniques</h3>
+
+<p>
+The clearest mental model for this entire chapter is a single spectrum, not four disconnected tools. At one end sits full fine-tuning: maximum degrees of freedom, maximum memory cost, maximum risk of catastrophic forgetting because nothing constrains how far any weight can move. At the other end sits prompt-tuning: minimum degrees of freedom (a handful of learned vectors), minimum memory cost, minimum forgetting risk because the base model's weights are never touched at all, only its effective input. LoRA and QLoRA sit in between, closer to the low-cost end: they constrain weight updates to a deliberately low-rank subspace rather than eliminating weight updates entirely, which is why they capture most of full fine-tuning's quality on most tasks while paying only a small fraction of its cost.
+</p>
+
+<table>
+<tr><th>Approach</th><th>What Actually Gets Trained</th><th>Degrees of Freedom</th><th>Typical Use Case</th></tr>
+<tr><td>Full Fine-Tuning</td><td>Every parameter in the model</td><td>Maximum — unconstrained weight movement</td><td>Small models; deep, pervasive behavioral shifts; teams with dedicated ML infra</td></tr>
+<tr><td>LoRA</td><td>Small low-rank matrices A, B injected alongside frozen weights (effective weight W + B·A)</td><td>Constrained to rank r per adapted matrix</td><td>The default for most production fine-tuning of mid-to-large open-weight models</td></tr>
+<tr><td>QLoRA</td><td>Same LoRA matrices, but the frozen base model is held in 4-bit quantized form</td><td>Same as LoRA — quantization affects the base model's storage, not the adapter's expressiveness</td><td>Same use cases as LoRA, on much larger models or much smaller/cheaper hardware</td></tr>
+<tr><td>Prefix/Prompt-Tuning</td><td>A small number of learned continuous vectors prepended to inputs or injected per-layer as key/value prefixes</td><td>Minimum — model's internal weights and computation graph structure are untouched</td><td>Very low training budget; many small, cheaply-switchable task variants on one frozen deployment; less demanding behavioral shifts</td></tr>
+</table>
+
+<h3>4.2 Why LoRA Works Despite Updating Far Fewer Parameters</h3>
+
+<p>
+The theoretical justification, beyond the "it empirically works" observation Chapter 23 gave you, rests on an idea sometimes called the <strong>intrinsic dimensionality</strong> of a fine-tuning task: although a weight matrix has an enormous number of entries, the actual <em>change</em> needed to shift a well-pretrained model's behavior toward a specific narrow task tends to live in a much lower-dimensional subspace than the full matrix. This is not a claim that the model's knowledge is low-rank — the base model's weights remain full-rank and enormously expressive — it is a claim specifically about the <em>update</em>: the direction and magnitude of change needed to adapt already-general competence to a narrower task is well-approximated by a low-rank correction. Empirically this holds up remarkably well across model families and task types, which is why practitioners rarely need rank higher than 64 even for fairly substantial style or format shifts, and why Section 6 can give you a concrete rank-selection heuristic rather than "try values until it works."
+</p>
+
+<h3>4.3 QLoRA's Three Load-Bearing Ideas</h3>
+
+<p>
+QLoRA is not "LoRA plus generic 4-bit quantization" — it depends on three specific engineering decisions, each solving a distinct problem that naive quantization would otherwise introduce:
+</p>
+
+<ul>
+<li><strong>NF4 (4-bit NormalFloat) quantization.</strong> Standard 4-bit quantization schemes assume values are roughly uniformly distributed across their range. Pretrained neural network weights are not uniformly distributed — they cluster tightly around zero in an approximately normal (bell-curve) distribution. NF4 is a quantization scheme whose 16 representable values are spaced to match a normal distribution's quantiles rather than spaced evenly, so more of the limited 4-bit "budget" of representable values falls where weights actually are dense, near zero, and less is wasted on the sparse tails. This is why NF4 preserves model quality noticeably better than a generic uniform 4-bit scheme at the same bit width.</li>
+<li><strong>Double quantization.</strong> Quantizing weights requires storing a small amount of extra metadata per block of weights (a scaling constant used to map the compressed 4-bit values back to real numbers). At the scale of a multi-billion-parameter model, even this small per-block metadata adds up to a non-trivial amount of memory. Double quantization quantizes <em>the quantization constants themselves</em> a second time, squeezing out additional memory savings — a genuinely clever, slightly recursive optimization that only matters at large scale, but matters a lot there.</li>
+<li><strong>Paged optimizers.</strong> Training can still hit sudden GPU memory spikes — for instance, when processing an unusually long sequence in a batch. Rather than crashing the training job on an out-of-memory error, paged optimizers use NVIDIA's unified memory feature to automatically page optimizer state between GPU and CPU memory on demand, the same conceptual trick as OS-level virtual memory paging, trading a small amount of speed during a rare spike for training-run reliability.</li>
+</ul>
+
+<p>
+Together these three ideas are why QLoRA's quality, in the original paper's benchmarks, tracked full 16-bit LoRA fine-tuning almost exactly, despite the base model occupying roughly a quarter of the memory. None of the three is optional in the way "you could skip it and still call it QLoRA" — remove NF4 and quality degrades measurably; remove double quantization and you lose a meaningful memory saving at scale; remove paged optimizers and long-sequence training runs become fragile.</p>
+
+<h3>4.4 Catastrophic Forgetting, Revisited Structurally</h3>
+
+<p>
+Chapter 23 introduced catastrophic forgetting as an evaluation concern — something you test for with a regression suite after the fact. This chapter adds the structural half of the story: <em>why</em> PEFT methods forget less in the first place, not just how to detect it after the fact. Full fine-tuning allows gradient descent to move any weight anywhere the loss landscape suggests, with no constraint tying the update back to a small subspace — so a training run overly focused on a narrow task can, in principle, drag weights far enough from their pretrained values to damage capabilities the fine-tuning data never touched or tested. LoRA's low-rank constraint acts as an implicit regularizer: because the update is forced to be expressible as B·A for a small rank r, there are structurally fewer directions available for the optimizer to move the effective weights in, which mechanically limits how far any single update can drift from the original behavior, independent of how aggressively you train. Prompt/prefix-tuning takes this to its logical extreme — since the base weights are mathematically untouched, forgetting of the kind that damages the base model's own weights is structurally impossible; whatever quality loss occurs must come entirely from the learned prefix crowding out or conflicting with the base model's own default behavior, a categorically milder failure mode.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<h3>5.1 Step-by-Step: What Actually Happens Inside a QLoRA Training Step</h3>
+
+<ol>
+<li><strong>Load the base model in 4-bit NF4 format.</strong> Each weight matrix is quantized block-wise (typically blocks of 64 values sharing one scaling constant) into 4-bit codes, with the scaling constants themselves further compressed via double quantization. The full model now occupies roughly a quarter of its 16-bit memory footprint, and every one of these weights is marked non-trainable — frozen for the entire training run.</li>
+<li><strong>Inject LoRA adapters at chosen layers.</strong> Small trainable matrices A (shape d × r) and B (shape r × k) are added alongside selected frozen weight matrices W (shape d × k), almost always the attention projection matrices (query, key, value, output) and sometimes the feed-forward layers. These adapter matrices are stored and trained in a higher precision (typically bfloat16), not 4-bit, because they are the only part of the model actually receiving gradient updates and need enough numerical precision for training to converge.</li>
+<li><strong>Forward pass: dequantize on the fly, compute, discard.</strong> For each frozen weight matrix's contribution to the forward pass, the 4-bit stored values are dequantized back to a working precision just long enough to perform the matrix multiplication, then the higher-precision copy is discarded — it is never stored persistently. This is the mechanical trick that makes QLoRA work at all: the model spends most of its "resting" memory footprint in 4-bit form and only briefly, transiently expands precision during active computation.</li>
+<li><strong>Compute the combined output.</strong> The effective output of an adapted layer is the frozen path's output (W·x, computed via the dequantize-then-multiply step above) plus the adapter path's output (B·A·x, computed in full higher precision) — exactly the <code>W + B·A</code> structure from Chapter 23's Section 5.3, with the difference that W here was reconstructed from a 4-bit representation rather than read directly.</li>
+<li><strong>Backward pass: gradients flow only into A and B.</strong> Because W is frozen (and, in QLoRA's case, not even stored in a gradient-friendly precision), no gradient computation or optimizer state is needed for it at all. Gradients are computed only for the adapter matrices, and only their optimizer state (e.g., Adam's moment estimates) needs to be held in memory — this is the single largest source of the technique's memory savings, independent of quantization.</li>
+<li><strong>Optimizer step, with paging as a safety valve.</strong> The optimizer updates A and B using the accumulated gradients. If a memory spike occurs (long sequence, large batch), the paged optimizer mechanism transparently offloads optimizer state to CPU memory and pages it back as needed, rather than the training job crashing outright.</li>
+</ol>
+
+<h3>5.2 Step-by-Step: Merging an Adapter Back Into the Base Model</h3>
+
+<p>
+After training, you face the merge-or-keep-separate decision flagged in Section 3. Merging is mechanically simple once you see it written out: because the adapted layer's effective weight is defined as W + B·A, and both W and the product B·A are ordinary matrices of the same shape, you can compute W_merged = W + B·A exactly once, offline, and replace the original frozen W with this new merged matrix. From that point forward, the model is architecturally indistinguishable from a normally full-fine-tuned model of the same size — the adapter's separate identity disappears entirely into the merged weights. This step is why merging fundamentally trades away flexibility for simplicity: once merged, you cannot cheaply "subtract out" the adaptation to recover the original base model or hot-swap in a different customer's adapter without re-merging from a separately kept copy of the original frozen weights.
+</p>
+
+<h3>5.3 Step-by-Step: Choosing Which Layers to Adapt</h3>
+
+<p>
+Not every weight matrix in a transformer needs (or benefits from) a LoRA adapter, and this choice is a real, consequential hyperparameter rather than an afterthought:
+</p>
+
+<ol>
+<li><strong>Start with attention projections.</strong> The original LoRA paper's strongest results came from adapting only the query and value projection matrices in self-attention, leaving key projections and the feed-forward layers untouched — a surprisingly small footprint that still captured most of the achievable quality gain for the tasks tested.</li>
+<li><strong>Expand to all attention projections (query, key, value, output) if quality plateaus.</strong> This roughly doubles adapter parameter count but remains a tiny fraction of the base model, and is the most common production default today because it is a reliable, modest step up in expressiveness without the cost of adapting the far larger feed-forward matrices.</li>
+<li><strong>Add feed-forward layers only for demanding tasks.</strong> Feed-forward matrices are typically the largest matrices in a transformer layer, so adapting them meaningfully increases both trainable parameter count and memory, and should be reserved for tasks where attention-only adaptation has been tried and demonstrably falls short on your held-out evaluation set — not applied by default "just in case."</li>
+</ol>
+
+<h3>5.4 Edge Cases Worth Reasoning Through</h3>
+
+<ul>
+<li><strong>What if the task needs the model to change its tokenizer or vocabulary?</strong> None of the PEFT methods in this chapter touch tokenization or embedding-table structure by default (though embedding rows can, in principle, also be LoRA-adapted); adding genuinely new vocabulary or tokens is a different, more invasive change that usually pushes you back toward full fine-tuning or a dedicated embedding-layer update, regardless of how attractive PEFT's cost profile looks otherwise.</li>
+<li><strong>What if you need to serve both the base model and multiple adapters concurrently with low latency?</strong> Dequantizing a 4-bit base model on every request for every tenant, repeatedly, is real, measurable inference-time overhead compared to a merged 16-bit model — this is the direct connection to Section 8's serving-topology discussion, and it is why QLoRA's cost advantage is overwhelmingly a training-time story, not automatically a serving-time one.</li>
+<li><strong>What if rank r is set too low for the task?</strong> Training loss plateaus at a level higher than a full fine-tune would achieve on the same data — the low-rank subspace genuinely cannot express the needed update. The fix is not more epochs (which risks overfitting the constrained subspace to the training set, Section 11) but a higher rank or a broader set of adapted layers, since the bottleneck is expressiveness, not optimization difficulty.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<h3>6.1 The Low-Rank Update, Made Concrete With Numbers</h3>
+
+<p>
+Chapter 23 gave you the shape of the LoRA update. Here is why the parameter savings are so dramatic, worked through with real numbers for a representative transformer weight matrix:
+</p>
+
+<pre>
+Frozen weight matrix W has shape (d × k)         e.g. d = k = 4096
+LoRA introduces:
+    A  has shape (d × r)                          e.g. 4096 × 16
+    B  has shape (r × k)                          e.g. 16 × 4096
+
+Effective weight used at inference:
+    W' = W + ΔW  =  W + B·A
+
+Parameter count comparison for THIS ONE matrix:
+    Full fine-tuning trains:      d · k            = 4096 · 4096  = 16,777,216 params
+    LoRA trains:                  d·r + r·k         = (4096·16)+(16·4096) = 131,072 params
+
+    Reduction factor  =  (d·k) / (d·r + r·k)  =  16,777,216 / 131,072  ≈ 128×
+
+General form (assuming d = k for simplicity):
+    Reduction factor  ≈  d / (2r)
+    → doubling rank r HALVES the reduction factor (more capacity, less savings)
+    → this is the single knob that trades expressiveness for parameter savings
+</pre>
+
+<p>
+That 128× reduction is for a single matrix; across an entire transformer's attention projections the ratio stays in the same order of magnitude, which is why real production LoRA fine-tunes routinely train well under 1% of a model's total parameter count while still moving task accuracy substantially — the rank r term in the denominator is deliberately tiny (typically 4 to 64) compared to the matrix's full dimension (typically thousands).
+</p>
+
+<h3>6.2 GPU Memory Math for a Concrete Fine-Tuning Job</h3>
+
+<p>
+This is the arithmetic that turns "which approach should we use?" from a debate into a spreadsheet. Take a representative 7-billion-parameter open-weight model as the worked example:
+</p>
+
+<pre>
+Base model parameters:            P = 7,000,000,000
+
+FULL FINE-TUNING (mixed precision, Adam optimizer), rough memory per parameter:
+    Weights (bf16)                 2 bytes
+    Gradients (bf16)               2 bytes
+    Adam optimizer state (fp32)    8 bytes   (first + second moment estimates)
+    Master weights copy (fp32)     4 bytes
+                                   ─────────
+    Total per parameter        ≈  16 bytes
+
+    Total memory  ≈  P × 16 bytes  =  7e9 × 16  ≈ 112 GB
+    → requires multiple high-end GPUs (e.g. 2–4× 80GB A100/H100) just to fit,
+      before accounting for activations and batch size
+
+LoRA (16-bit base model, frozen — no gradients/optimizer state for it):
+    Base weights (bf16, frozen)     2 bytes × P            ≈ 14 GB
+    Adapter weights (bf16)          negligible (≪1% of P)   ≈ tens of MB
+    Adapter gradients + Adam state  negligible               ≈ tens of MB
+                                   ─────────
+    Total memory  ≈  ~14–16 GB     → fits on a single consumer/prosumer GPU
+                                      (e.g. one 24GB card) with room for activations
+
+QLoRA (4-bit NF4 base model, frozen — no gradients/optimizer state for it):
+    Base weights (4-bit)            0.5 bytes × P           ≈ 3.5 GB
+    Adapter weights + optimizer state (bf16/fp32)            ≈ tens of MB
+                                   ─────────
+    Total memory  ≈  ~4–6 GB       → fits comfortably on a single consumer GPU,
+                                      leaving substantial headroom for larger
+                                      batch sizes or a larger base model
+</pre>
+
+<p>
+The practical reading of this table: for a 7B model, full fine-tuning needs an order of magnitude more GPU memory than LoRA, and LoRA needs roughly 3× more than QLoRA — and the gap only widens as base model size grows, which is exactly why QLoRA is what makes fine-tuning a 70B-class model something a small team can do on a single high-memory GPU instead of a multi-node cluster. When you scale P up in these formulas (say, to 70 billion), the full fine-tuning row crosses into "requires a dedicated multi-GPU cluster" territory while the QLoRA row stays within reach of a single high-memory consumer or prosumer card — this is the arithmetic that should anchor any hardware request you write, rather than a round-number guess.
+</p>
+
+<h3>6.3 A Simple Cost Model for Defending the Choice in Dollars</h3>
+
+<pre>
+Estimated training cost  ≈  (GPU-hours required) × (cloud GPU $/hour rate)
+
+GPU-hours required depends on:
+    - dataset size (number of training examples)
+    - number of epochs
+    - approach chosen (full FT needs more GPUs running in parallel,
+      which shortens wall-clock time but does NOT reduce total GPU-hours
+      proportionally — communication overhead across GPUs adds cost)
+
+Rough illustrative comparison for the SAME 7B model, SAME dataset:
+    Full fine-tuning:  4 × A100 (80GB) for 3 hours   = 12 GPU-hours
+    QLoRA:             1 × consumer 24GB GPU, 4 hours =  4 GPU-hours
+
+Even before applying a $/GPU-hour rate, QLoRA's GPU-hour count is smaller
+AND each GPU-hour is on cheaper, more available hardware — a compounding,
+not merely additive, cost advantage.
+</pre>
+
+<p>
+This is the exact shape of argument a staff engineer should bring to a design review: not "QLoRA is cheaper" as an assertion, but a GPU-hours-times-rate calculation for the specific model and dataset in question, computed the same way Section 6.2's memory numbers were computed — from first principles, not vendor marketing.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The PEFT Spectrum — Where Each Approach Sits</h3>
+
+<pre>
+  MAXIMUM COST, MAXIMUM                                    MINIMUM COST, MINIMUM
+  EXPRESSIVENESS, MAXIMUM                                  EXPRESSIVENESS, MINIMUM
+  FORGETTING RISK                                          FORGETTING RISK
+       │                                                              │
+       ▼                                                              ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐   ┌───────────────────┐
+│ FULL           │   │ LoRA           │   │ QLoRA          │   │ Prefix / Prompt    │
+│ FINE-TUNING    │   │                │   │                │   │ TUNING             │
+│                │   │ frozen 16-bit  │   │ frozen 4-bit   │   │                     │
+│ every weight   │──▶│ base + small   │──▶│ base (NF4) +   │──▶│ base fully frozen;  │
+│ trainable      │   │ trainable      │   │ same small     │   │ only learned virtual│
+│                │   │ B·A adapters   │   │ B·A adapters   │   │ tokens/prefixes     │
+└───────────────┘   └───────────────┘   └───────────────┘   └───────────────────┘
+   ~100% of params      &lt;1% of params       &lt;1% of params        &lt;0.1% of params
+   trainable             trainable            trainable            trainable
+   (base memory          (base memory         (base memory         (no base weights
+    at full precision)    at 16-bit)           at 4-bit)            touched at all)
+
+     Choose LEFT when: task needs deep, pervasive behavioral change,
+                       and you have dedicated ML infra to support it.
+     Choose RIGHT when: task is narrow, training budget is tight, or
+                       you need many cheap, swappable task variants on
+                       one shared frozen deployment.
+     LoRA/QLoRA are the pragmatic middle — the default for most real work.
+</pre>
+
+<h3>7.2 QLoRA's Forward Pass, Mechanically</h3>
+
+<pre>
+   Input x
+      │
+      ▼
+┌─────────────────────┐        ┌───────────────────────┐
+│ Frozen weight W       │        │ Adapter matrices A, B   │
+│ stored in 4-bit NF4   │        │ stored in bf16 (trained) │
+│ (block-quantized,     │        │                         │
+│  double-quantized     │        │                         │
+│  scaling constants)    │        │                         │
+└──────────┬───────────┘        └───────────┬───────────┘
+           │                                  │
+           ▼                                  ▼
+  dequantize block-by-block            compute B·(A·x) directly
+  to bf16 JUST for this multiply        in bf16, no quantization
+           │                             involved on this path
+           ▼                                  │
+      compute W·x  (bf16)                     │
+           │                                  │
+           └───────────────┬──────────────────┘
+                            ▼
+                   Output = W·x + B·A·x
+                            │
+                            ▼
+              dequantized bf16 copy of W is
+              DISCARDED immediately — never
+              persisted, keeping resting memory
+              footprint at the 4-bit level
+</pre>
+
+<h3>7.3 Merge vs. Keep-Separate — the Multi-Tenant Serving Fork</h3>
+
+<pre>
+                     Trained adapter (A, B) ready
+                                 │
+              ┌──────────────────┴──────────────────┐
+              ▼                                       ▼
+        MERGE INTO BASE                        KEEP SEPARATE
+   W_merged = W + B·A, saved                (base model deployed once;
+   as a new standalone model                 many small adapter files
+              │                              loaded per-request/per-tenant)
+              ▼                                       ▼
+  + Inference identical in shape         + One shared GPU fleet serves
+    and speed to an ordinary model         N tenants; memory scales with
+    (no extra adapter math per call)       adapter size, not full model size
+  + Simple to deploy behind any            + Adapters can be swapped, A/B
+    standard model-serving stack             tested, or rolled back independently
+  − One deployable artifact PER             − Small per-request overhead for
+    fine-tune — does not scale to            the B·A computation and adapter
+    many cheaply-switchable tenants          lookup/loading
+  − Cannot cheaply "subtract out"           − Slightly more serving-infrastructure
+    the adaptation later                     complexity (adapter registry, routing)
+
+   Choose MERGE for: a single product-wide fine-tune, latency-critical
+                     paths, or simple single-tenant deployments.
+   Choose SEPARATE for: multi-tenant platforms, frequent adapter updates,
+                        or needing to serve many task variants off one base.
+</pre>
+
+<p class="followup">
+This third diagram is the direct payoff of Section 5.2's merge mechanics: it is not a training-time decision at all, it is a serving-architecture decision, and getting it backwards — merging when you needed multi-tenant flexibility, or keeping adapters separate on a single latency-critical path that never needed the flexibility — is a common, avoidable production design mistake covered again in Section 11.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+Chapter 23 gave you the overall offline-training/online-serving split. This chapter's production architecture layers the approach-selection decision and the merge-versus-separate decision on top of that same skeleton, because in a real system these are not academic choices — they determine what your infrastructure team actually has to build and operate.
+</p>
+
+<pre>
+┌───────────────────────────────────────────────────────────────────────────┐
+│                    DECISION GATE (before any training job runs)             │
+│                                                                              │
+│  Task needs deep/pervasive behavioral change AND dedicated ML infra exists? │
+│     YES ──▶ FULL FINE-TUNING pipeline (multi-GPU cluster, longer wall-clock)│
+│     NO  ──▶ continue                                                         │
+│                                                                              │
+│  Base model + dataset comfortably fit training-memory budget at 16-bit?     │
+│     YES ──▶ LoRA pipeline (single/few GPU, 16-bit frozen base)              │
+│     NO  ──▶ QLoRA pipeline (single GPU, 4-bit frozen base, NF4 + paged opt) │
+│                                                                              │
+│  Need many cheap, swappable task/tenant variants off ONE frozen deployment? │
+│     YES ──▶ consider Prefix/Prompt-Tuning instead of/alongside LoRA         │
+└───────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                     TRAINING (chosen approach's pipeline)                    │
+│   Curated dataset ──▶ Training job ──▶ Evaluation gate (Ch.77-style:        │
+│                                          task metric + forgetting suite)     │
+│                                                     │ pass                   │
+│                                                     ▼                       │
+│                                    Versioned adapter/model artifact          │
+└───────────────────────────────────────────────────┬───────────────────────┘
+                                                      ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                        SERVING TOPOLOGY DECISION                            │
+│                                                                              │
+│   Single-tenant / latency-critical      Multi-tenant / many variants        │
+│           │                                       │                        │
+│           ▼                                       ▼                        │
+│   MERGE adapter into base ──▶            KEEP adapters separate ──▶         │
+│   deploy as one standalone model         one shared base + adapter registry │
+│   (simplest serving path)                (hot-load/hot-swap per request)    │
+└───────────────────────────────────────────────────────────────────────────┘
+</pre>
+
+<p>
+The adapter registry in the bottom-right path is worth calling out as a genuinely new piece of infrastructure most teams do not already have: it is a small service (or a well-organized object store plus metadata table) mapping tenant/task identifiers to specific versioned adapter artifacts, with the serving layer resolving "which adapter for this request" before or during inference, analogous to a feature-flag service but resolving to a model artifact rather than a boolean. Teams that skip building this and instead hard-code adapter paths per deployment discover the cost the first time they need to roll back one tenant's adapter without touching anyone else's traffic.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Exactly as Chapter 23 established, the training job itself lives outside your Spring application tier — the QLoRA/LoRA training loop, the quantization machinery, and GPU orchestration are the domain of a training framework and a GPU cluster, not Java code. What a Spring application must do differently once you have moved from "one fine-tuned model" to "a family of approaches and potentially many adapters" is manage <em>which</em> model or adapter a given request should resolve to, and expose that as a clean, testable abstraction rather than scattered configuration.
+</p>
+
+<p>
+The <code>ChatModel</code>/<code>ChatClient</code> abstraction still does the heavy lifting, but a multi-tenant, multi-adapter production system typically needs a resolution layer in front of it that Chapter 23's simple single-model example did not require:
+</p>
+
+<pre>
+// A model-resolution service sitting in front of ChatClient, choosing which
+// fine-tuned artifact (or the base model) a given tenant/request should use —
+// this is the concrete Java-side consequence of Section 8's serving topology.
+
+public interface FineTunedModelResolver {
+    String resolveModelIdentifier(String tenantId, String taskType);
+}
+
+@Service
+public class AdapterRegistryModelResolver implements FineTunedModelResolver {
+
+    private final AdapterRegistryRepository registry; // persisted mapping:
+                                                        // tenantId+taskType -> model/adapter id
+
+    public AdapterRegistryModelResolver(AdapterRegistryRepository registry) {
+        this.registry = registry;
+    }
+
+    @Override
+    public String resolveModelIdentifier(String tenantId, String taskType) {
+        return registry.findActiveAdapter(tenantId, taskType)
+                .map(AdapterRecord::modelIdentifier)
+                // fall back to the shared base model if no adapter is
+                // registered for this tenant/task — never fail the request
+                .orElse("base-model-default");
+    }
+}
+
+@Service
+public class SupportReplyService {
+
+    private final ChatClient.Builder builder;
+    private final FineTunedModelResolver resolver;
+
+    public SupportReplyService(ChatClient.Builder builder,
+                                FineTunedModelResolver resolver) {
+        this.builder = builder;
+        this.resolver = resolver;
+    }
+
+    public String draftReply(String tenantId, String ticketText) {
+        String modelId = resolver.resolveModelIdentifier(tenantId, "support-tone");
+
+        ChatClient client = builder
+                .defaultOptions(OpenAiChatOptions.builder().model(modelId).build())
+                .build();
+
+        return client.prompt().user(ticketText).call().content();
+    }
+}
+</pre>
+
+<p>
+This resolver is the direct Java-side analogue of the adapter registry described in Section 8 — it is ordinary Spring service-and-repository design, deliberately unremarkable, because the whole point of keeping the <code>ChatModel</code> abstraction at the call site is that swapping which fine-tuning approach or which specific tenant's adapter answers a request never requires touching business logic, only the resolution layer's data. The same pattern extends naturally to rollback (point <code>resolveModelIdentifier</code> back at a previous version by updating the registry row, no redeploy needed) and canary rollout (resolve a small percentage of a tenant's traffic to a new adapter version before flipping everyone over) — both are configuration-and-data changes against this one seam, not code changes scattered across the application.
+</p>
+
+<p>
+Worth flagging explicitly: nothing about calling a QLoRA-trained (versus LoRA or fully fine-tuned) model differs at all from the Java side once it is deployed behind an inference endpoint — the quantization scheme and adapter mechanics are entirely a training-and-serving-infrastructure concern. This is precisely why the approach-selection work in this chapter belongs upstream of your Spring codebase, and why a well-designed resolver like the one above should never need to know or care which of the four approaches produced the model identifier it is resolving to.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Compute the memory math from Section 6.2 before requesting hardware, every time.</strong> "We need a bigger GPU" should always be backed by a parameter-count-times-bytes-per-parameter calculation for the specific model and approach in question, not a round-number guess or a copied blog-post configuration.</li>
+<li><strong>Default to QLoRA unless you have a specific, named reason not to.</strong> For the overwhelming majority of production fine-tuning tasks on open-weight models, QLoRA's memory savings come at negligible measured quality cost versus full-precision LoRA — treat full fine-tuning and even plain 16-bit LoRA as the exceptions requiring justification, not the default.</li>
+<li><strong>Start rank low (8–16) and raise it only if the held-out evaluation metric (Chapter 53-style, not just training loss) plateaus below your bar.</strong> Higher rank is not free — it linearly increases adapter parameter count and forgetting risk — so treat it as a knob you turn deliberately, not a value you maximize preemptively.</li>
+<li><strong>Decide merge-versus-separate as a serving-architecture decision before training finishes, not after.</strong> Retrofitting a multi-tenant adapter registry onto a system built assuming one merged model is a much larger effort than designing for the actual serving topology up front.</li>
+<li><strong>Run the exact same held-out evaluation suite across every candidate approach you test</strong> — full fine-tuning, LoRA, QLoRA, and, where relevant, prompt-tuning — so the choice you defend is backed by a like-for-like comparison, not a comparison across different datasets or scoring criteria.</li>
+<li><strong>Treat the adapter registry (Section 8) as production infrastructure from day one</strong> if you have any plausible path to multi-tenant or multi-variant serving, even if you launch with a single adapter — retrofitting this later is materially more expensive than building the seam early.</li>
+<li><strong>Reserve full fine-tuning for cases with a specific, articulable reason PEFT would fall short</strong> — a genuinely small model where the memory savings barely matter, or a behavioral shift that has already been demonstrated, empirically, to plateau under LoRA/QLoRA at reasonable rank.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Overfitting on a tiny, narrow dataset.</strong> A few hundred examples are often enough for a genuine behavioral nudge, but pushing too many epochs over too small or too repetitive a dataset — especially at higher LoRA rank, which gives the optimizer more room to memorize — produces a model that reproduces training examples verbatim rather than generalizing the underlying pattern. The held-out evaluation set from Chapter 23's pipeline exists specifically to catch this, and skipping it here is exactly as costly as skipping it there.</li>
+<li><strong>Forgetting to actually freeze the base model's parameters correctly.</strong> A surprisingly common implementation bug: injecting LoRA adapters but failing to set <code>requires_grad = False</code> (or the equivalent) on the base model's weights, silently turning a cheap LoRA/QLoRA run into an accidental, extremely expensive full fine-tune that also happens to have unused adapter matrices along for the ride — this is a real, reported failure mode, not a hypothetical one, and it is worth an explicit sanity check (verifying trainable-parameter count matches the expected order of magnitude from Section 6.1's arithmetic) before a training job runs unattended for hours.</li>
+<li><strong>Fine-tuning when RAG would have solved the actual problem more cheaply.</strong> Chapter 23's most expensive mistake resurfaces here in a sharper form: choosing between QLoRA and full fine-tuning is a wasted, sometimes multi-day exercise if the underlying requirement was "the model doesn't know our current data," which no amount of weight-space adaptation — at any rank, at any quantization level — actually solves as well as retrieval does.</li>
+<li><strong>Defaulting to the highest-quality-ceiling option "to be safe."</strong> Choosing full fine-tuning by default, on the reasoning that more degrees of freedom can only help, ignores that it also raises forgetting risk and memory cost by an order of magnitude for tasks that a rank-16 LoRA adapter would have handled just as well — this is the fine-tuning-approach version of over-engineering, and it costs real GPU-hours and real calendar time.</li>
+<li><strong>Choosing merge-versus-separate based on training-time convenience rather than serving requirements.</strong> Merging because it was simpler to test locally, then discovering in production that three enterprise customers each need a slightly different adapter, forces an expensive re-architecture that Section 8's up-front decision gate exists to prevent.</li>
+<li><strong>Skipping quantization-aware evaluation.</strong> Assuming a QLoRA fine-tune will perform identically to a LoRA fine-tune without ever actually running the held-out evaluation suite against the quantized version — quantization's quality cost is usually small but is not provably zero for every task, and "usually small" is not a substitute for measuring it on your own golden set.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Training-time memory versus serving-time latency are two separate performance stories, and QLoRA's advantage lives almost entirely in the first.</strong> The 4-bit dequantize-then-compute step in Section 5.1 adds real, measurable per-request overhead if a QLoRA-trained adapter is served without merging; for latency-sensitive single-tenant paths, merging into a full-precision model (Section 5.2) removes this overhead entirely at the cost of losing hot-swap flexibility.</li>
+<li><strong>Rank r has performance consequences beyond parameter count.</strong> Higher rank increases the size of the B·A matrix multiplication performed at every adapted layer on every forward pass, which is a real, if usually small, inference-time cost that compounds across many adapted layers and high request volume — pick the smallest rank that clears your quality bar (Section 10), not the largest rank you can afford.</li>
+<li><strong>Batch size and sequence length dominate training wall-clock time far more than the choice of approach does, for a fixed hardware budget.</strong> A QLoRA job on a smaller GPU with a small batch size can take longer in wall-clock time than a LoRA job on a larger GPU with a bigger batch size, even though QLoRA needs less memory per example — memory savings buy you the option to fit on smaller hardware, they do not automatically buy you faster training.</li>
+<li><strong>Multi-GPU full fine-tuning introduces communication overhead that partially erodes its parallelism advantage.</strong> Splitting gradient and optimizer state across multiple GPUs (as full fine-tuning of a large model typically requires) means those GPUs must synchronize during training, and this communication cost is a real, non-trivial fraction of total training time — part of why full fine-tuning's GPU-hour cost does not shrink proportionally just by adding more GPUs.</li>
+<li><strong>Adapter-loading latency matters at serving time for the keep-separate topology.</strong> The first request routed to a newly hot-loaded adapter pays a load cost (reading the adapter file, initializing it alongside the shared base model); production systems serving many tenants typically pre-warm frequently used adapters and apply an LRU-style eviction policy for rarely used ones, exactly the caching discipline Chapter 53's performance section already named as a transferable instinct.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Everything Chapter 23 flagged about fine-tuning's security surface — training-data memorization and leakage, weakened safety alignment, artifact supply-chain risk, and data governance on the training set — applies unchanged here and is not repeated in full. This section covers what changes specifically because you are now choosing among multiple approaches and, often, running a multi-tenant adapter registry.
+</p>
+
+<ul>
+<li><strong>Adapter isolation in a multi-tenant registry is a genuine access-control boundary, not just a routing convenience.</strong> If Tenant A's adapter and Tenant B's adapter are both hot-loadable onto the same shared base model deployment, a bug in the resolution layer (Section 9's <code>FineTunedModelResolver</code>) that routes a request to the wrong tenant's adapter is a real data-exposure incident — a fine-tuned adapter can encode style, tone, or even memorized fragments specific to the tenant whose data trained it. Treat adapter resolution with the same rigor as row-level tenant isolation in a shared database, including tests that explicitly assert cross-tenant adapter access is impossible.</li>
+<li><strong>Quantization does not anonymize or sanitize training data.</strong> A QLoRA-trained adapter carries the same memorization risk as a full-precision LoRA adapter trained on the same data — 4-bit storage of the frozen base model has no bearing on what the trainable adapter itself may have memorized from your fine-tuning examples. Do not treat "we used QLoRA" as any kind of privacy mitigation.</li>
+<li><strong>Merged models lose the ability to cheaply audit or revoke a specific adaptation.</strong> Once an adapter is merged into base weights (Section 5.2), there is no clean way to "remove" a specific tenant's or dataset's contribution from a deployed model short of retraining from the pre-merge checkpoint — a real consideration for right-to-deletion or data-subject-erasure obligations, and a concrete reason some regulated-industry teams deliberately choose to keep adapters separate even when merge would otherwise be the simpler serving choice.</li>
+<li><strong>Adapter files are a smaller, more easily exfiltrated artifact than a full model checkpoint.</strong> A LoRA/QLoRA adapter can be megabytes rather than gigabytes, which is an operational advantage for deployment but also means it is easier to copy, move, or leak undetected — apply the same access-control and provenance-tracking rigor to adapter files that Chapter 23 required for full model checkpoints, scaled to the fact that a smaller artifact is not a lower-risk one just because it is lower-effort to store.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. In plain terms, what does a LoRA adapter actually add to a frozen weight matrix, and why does that make training so much cheaper?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>LoRA keeps the original weight matrix W completely frozen and adds two small matrices, A and B, whose product B·A is added to W to form the effective weight used at inference: W' = W + B·A. Because A and B share a small inner dimension called the rank (often 8 to 64), the two of them together contain vastly fewer numbers than the full matrix W — often well under 1% of its parameter count. Training only has to compute gradients and store optimizer state for A and B, not for W, which is why LoRA needs a small fraction of the memory and compute that updating every parameter in W would require.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. What is QLoRA, and how is it different from plain LoRA?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>QLoRA is LoRA with one additional change: the frozen base model is stored and held in memory in a compressed 4-bit format (specifically a scheme called NF4) instead of the usual 16-bit precision, and is only temporarily decompressed back to a working precision during the actual matrix multiplication in the forward pass. The LoRA adapter matrices themselves are unchanged — they are still trained in higher precision on top of this quantized base. The benefit is purely about the base model's memory footprint: a model that would need many tens of gigabytes in 16-bit form can fit in roughly a quarter of that in 4-bit form, making it possible to fine-tune much larger models on much smaller, cheaper hardware.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Your team is deciding between LoRA and QLoRA for fine-tuning a 13-billion-parameter open-weight model on a single 24GB GPU. Walk through how you'd make that decision.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Start with the memory arithmetic: a 13B model in 16-bit precision alone occupies roughly 26GB just for the frozen weights, which already exceeds a 24GB card before accounting for adapter parameters, activations, or batch size — so plain LoRA is not viable on this hardware. The same model in 4-bit NF4 form occupies roughly 6.5GB, leaving ample headroom on a 24GB card for adapter training, activations, and a reasonable batch size. Given the same task and dataset, QLoRA is the correct choice here specifically because plain LoRA fails the memory budget on this hardware, not because QLoRA is unconditionally better — if the team had a GPU with 40GB or more, plain LoRA would be a perfectly reasonable, slightly simpler alternative with no quantization overhead at serving time.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Explain the difference between merging a LoRA adapter into the base model versus keeping it separate at serving time, and when you'd choose each.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Merging computes W_merged = W + B·A once, offline, producing a single standalone model indistinguishable in structure from a normally fine-tuned model — inference is then exactly as fast as the base model, with no extra adapter computation per request, but you lose the ability to cheaply swap, update, or roll back the adaptation independently, and you need one full deployable artifact per fine-tune. Keeping adapters separate means deploying one shared base model and hot-loading small adapter files per request or per tenant, which scales far better for many customers or task variants — memory grows with adapter size, not full model size — at the cost of a small per-request computational overhead and the added infrastructure complexity of an adapter registry and routing layer. Merge for single-tenant, latency-critical, or simple deployments; keep separate for multi-tenant platforms or frequently updated/rolled-back adaptations.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. A fine-tuning run's training loss plateaus at a level clearly worse than what full fine-tuning achieved on the same dataset in a prior experiment. How do you diagnose whether this is a rank problem, a data problem, or something else?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>First rule out a data or setup problem, since those are cheaper to check: confirm the dataset, preprocessing, and number of epochs are actually equivalent to the full fine-tuning run, and confirm the base model's parameters are genuinely frozen (a mis-set flag can silently turn a LoRA run into a much more expensive, and differently behaved, full update — worth an explicit trainable-parameter-count sanity check). If those check out and training loss is still plateauing measurably above the full fine-tuning baseline, this is evidence the task's required weight update does not live in the low-rank subspace the current adapter configuration allows — the fix is to raise rank r, and/or expand which layers are adapted (moving from attention-only to including feed-forward matrices), rather than training for more epochs, since more epochs on a rank-constrained adapter risks overfitting the constrained subspace to the training data without closing the capability gap. If raising rank substantially still does not close the gap, that is itself useful evidence the task may genuinely need full fine-tuning's unconstrained expressiveness.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly rule out the "did we actually freeze the base model correctly" bug before concluding it's a genuine rank/expressiveness limitation — this is a real, commonly reported failure mode, and jumping straight to "we need higher rank" without checking it first is a mistake many candidates make.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Your platform needs to serve a distinct fine-tuned behavior for each of 200 enterprise customers on a shared GPU fleet. Walk through the architecture you'd propose and why full fine-tuning per customer is not viable here.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Full fine-tuning per customer would require hosting 200 independent full model copies, with GPU memory scaling linearly with customer count — for any model beyond a few billion parameters this becomes economically and operationally infeasible well before reaching 200 tenants. The correct architecture uses LoRA or QLoRA adapters kept separate rather than merged: one shared base model deployment (or a small number of replicas for load) hosts a base model once, and each customer's small adapter file (megabytes, not gigabytes) is hot-loaded and applied per request via an adapter registry that maps tenant identifiers to specific adapter versions. Memory now scales with the much smaller adapter size times the number of concurrently active tenants, not with full model size times total tenant count. This also gives independent versioning, canary rollout, and rollback per tenant without affecting others sharing the same base model, and it is precisely the architecture pattern that makes multi-tenant fine-tuned serving commercially viable at all.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A stakeholder wants to fine-tune using full-parameter training "to be safe and get the best possible quality," even though your evaluation shows QLoRA at rank 32 already clears the task's quality bar. How do you respond?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Reframe the decision around evidence rather than intuition about safety margins: if QLoRA at rank 32 already clears the agreed quality bar on a representative held-out evaluation set, choosing full fine-tuning "to be safe" is not actually purchasing additional safety — it is purchasing an order of magnitude more GPU memory and cost, a meaningfully longer training and iteration cycle, and a measurably higher catastrophic-forgetting risk (Section 4.4), all for degrees of freedom the task's own evaluation results show are not needed. The correct staff-level move is to make the trade-off explicit and quantified: show the GPU-hour and dollar cost delta between the two options (Section 6.3's cost model), show the evaluation numbers proving QLoRA already meets the bar, and show the incremental forgetting-risk cost that full fine-tuning's unconstrained weight movement introduces. If the stakeholder's actual concern is that the evaluation set itself might not be representative enough to trust, that is a legitimate, separate conversation about strengthening the golden set (Chapter 53) — but it is a different problem from "spend 10x the compute by default," and conflating the two leads to systematically over-provisioned, harder-to-operate fine-tuning infrastructure across the whole organization.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How would you determine, after shipping a fine-tuned model, whether the fine-tune was actually worth its cost compared to simply investing further in prompting or RAG?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Treat this exactly as an evaluation problem in Chapter 53's sense, not a one-time launch decision made on gut feel. Before training, establish a prompting-only (and, if relevant, RAG-augmented) baseline scored on the same held-out golden set the fine-tune will eventually be judged against, using the same metrics — task accuracy, faithfulness, or whatever domain-specific measure matters for this system. After the fine-tune ships, score it against that identical set and compute the delta, not just the fine-tuned model's absolute score in isolation. Then weigh that quality delta against the full cost side of the ledger: one-time training cost (Section 6.3's GPU-hours-times-rate), ongoing costs the fine-tune actually saves (reduced per-request prompt tokens and latency, per Chapter 23's performance section), and ongoing costs it adds (adapter registry infrastructure, re-validation burden every time the base model is upgraded, forgetting-risk monitoring). If the quality delta over the prompting/RAG baseline is small and the recurring infrastructure and re-validation burden is real, the honest conclusion may be that the fine-tune was not worth it even if it "works" — and that conclusion, reached with numbers, is exactly the kind of disciplined judgment call that distinguishes measured engineering from a team that fine-tunes because it was available rather than because it was justified.</p>
+</div>
+
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Using the parameter-count formula from Section 6.1, compute the LoRA-versus-full-fine-tuning reduction factor for a weight matrix of shape 8192 × 8192 at rank 32, and again at rank 128. Explain in your own words why raising the rank narrows this gap, and connect that to the forgetting-risk discussion in Section 4.4.</li>
+<li>A colleague argues QLoRA is "strictly better" than plain LoRA since it uses less memory for the same adapter quality, and the team should never use plain LoRA again. Using Section 5.4's edge cases and Section 12's performance considerations, write a short rebuttal identifying at least one concrete scenario where plain LoRA remains the better choice.</li>
+<li>Explain why prefix/prompt-tuning is structurally immune to the specific kind of catastrophic forgetting that damages a model's own pretrained weights, while still being capable of a different, milder kind of quality degradation. What is that milder failure mode, in your own words?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Using the memory formulas in Section 6.2, build a small spreadsheet (or a short script) that takes base model parameter count, precision (16-bit or 4-bit), and chosen approach (full fine-tuning, LoRA, or QLoRA) as inputs, and outputs an estimated GPU memory requirement. Run it for a 3B, a 13B, and a 70B model under all three approaches, and identify at what model size full fine-tuning first requires more than a single 80GB GPU.</li>
+<li>Design (as an ASCII diagram, following Section 8's style) the adapter registry and resolution flow you would build for a Spring Boot service serving 50 enterprise customers off one shared, QLoRA-fine-tunable base model. Include where tenant isolation is enforced, where a canary rollout of a new adapter version would fit, and where you would add the cross-tenant-adapter-access test flagged in Section 13's security considerations.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Choosing a fine-tuning approach is a distinct, quantifiable engineering decision that sits underneath Chapter 23's higher-level "should we fine-tune at all" judgment call — full fine-tuning, LoRA, QLoRA, and prefix/prompt-tuning form one spectrum trading expressiveness and forgetting risk against memory cost, not four unrelated techniques.</li>
+<li>LoRA's low-rank update W' = W + B·A works because the behavioral shift a fine-tune needs typically lives in a much lower-dimensional subspace than the full weight matrix, letting rank-16-to-64 adapters train well under 1% of a model's parameters while capturing most of full fine-tuning's achievable quality.</li>
+<li>QLoRA extends LoRA by holding the frozen base model in 4-bit NF4 form (plus double quantization and paged optimizers), attacking the base model's own memory footprint rather than the adapter's, and is the pragmatic default for fine-tuning open-weight models outside dedicated ML infrastructure teams.</li>
+<li>Memory and cost differences across approaches are computable in advance from parameter count, precision, and which parameters actually receive gradients (Section 6) — every hardware request and budget justification should be backed by this arithmetic, not a round-number guess.</li>
+<li>Merging an adapter into base weights versus keeping it separate is a serving-architecture decision, not a training-time afterthought: merge for simple, latency-critical, single-tenant deployments; keep adapters separate, behind an adapter registry, for multi-tenant platforms needing independent versioning, rollback, and tenant isolation.</li>
+<li>Whether any of this was worth doing is answerable only by applying Chapter 53's evaluation discipline against a prompting/RAG baseline measured on the same golden set — a fine-tune that "feels" better without that comparison is exactly the unmeasured judgment call this entire book has been building the discipline to avoid.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Chapter 89 continues Volume 7's advanced topics track, moving from adapting an existing model's weights to the next specialized production concern in the series — building on this chapter's cost and architecture discipline the same way this chapter built on Chapter 23's foundational concepts.
+</p>
+
+</div>
+
+</body>
+</html>

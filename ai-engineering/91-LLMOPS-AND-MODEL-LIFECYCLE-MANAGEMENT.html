@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>151-LLMOPS-AND-MODEL-LIFECYCLE-MANAGEMENT.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 91 — LLMOPS &amp; MODEL LIFECYCLE MANAGEMENT</h1>
+
+<p class="roi">Volume 7 — Advanced &amp; Specialized Topics · Chapter 4 of 6</p>
+
+<div class="callout">
+Monitoring (Chapter 68) taught you to watch a running system continuously — latency, cost, quality, and safety signals streaming off every request, in real time. Cost Optimization (Chapter 70) taught you to make each of those requests as cheap as possible without sacrificing the quality bar Evaluation (Chapter 53) established. Both of those chapters, however, quietly assumed the thing being observed and optimized was <em>standing still</em> — a fixed model, a fixed prompt, a fixed configuration, sampled repeatedly over time. That assumption is false in practice, and this chapter is about the gap it leaves open: models get upgraded, prompts get edited, fine-tunes get retrained, and — the case that catches teams off guard hardest — a vendor can silently swap the model behind a stable API name you never touched. This chapter gives you the discipline for managing <em>change itself</em> in a production LLM system: versioning, staged rollout, rollback, and drift detection across every axis that can move underneath a system you thought was finished.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every earlier chapter in this book, including the two it builds most directly on, describes a system at a single point in time. Chapter 68's dashboards show you today's latency and today's faithfulness score. Chapter 70's cost formulas compute today's dollar-per-request. Chapter 53's golden set validates today's model-and-prompt combination against today's evaluation criteria. None of that machinery, on its own, tells you what happens on the day after today — the day someone edits a system prompt to fix one bug and accidentally breaks three other behaviors, or the day your foundation-model provider ships a routine update behind the same model name your code has called for a year, with no changelog you were copied on and no deploy on your side to bisect.
+</p>
+
+<p>
+Here is the concrete failure this chapter exists to prevent, and it happens constantly in real organizations. A team is running a production support assistant on a model referenced by a floating alias — call it <code>"gpt-x-latest"</code> — because pinning to a dated snapshot felt like unnecessary ceremony for a string in a config file. The provider updates what that alias points to. Nothing in the team's code changed. Nothing was deployed. And yet: response tone shifts, refusal rate on borderline questions climbs, and the golden-set faithfulness score that used to sit at 0.93 quietly drifts to 0.86 — a regression nobody caused on purpose and, worse, nobody notices for three weeks, because the only thing being monitored is whether the service returns 200 OK. This is the AI-era equivalent of a transitive dependency upgrading itself in production without a version bump in your build file — except unlike a Maven dependency, there is no lockfile mechanism most teams think to reach for, because "the model" does not feel like a dependency you version. It is exactly that, and treating it otherwise is the single biggest gap this chapter closes.
+</p>
+
+<p>
+The second half of the motivation is one you already understand instinctively as a Spring engineer, even if you have never applied it to a prompt: you would never let an engineer edit a payment-calculation method directly in production without a code review, a test suite run, and a deploy pipeline with a rollback plan. Yet it remains routine, even at well-funded AI teams, to edit a system prompt directly in a config dashboard, or bump a model version string, and ship it with nothing more rigorous than "I tried a few messages and it looked fine." A prompt template and a model-version pin are both production artifacts with exactly the same blast radius as application code — arguably larger, because a single prompt template can be the one being executed for every request across an entire feature, and a single model-version bump can silently change behavior across every feature that shares that model. LLMOps is the name for applying the CI/CD, versioning, and release-engineering discipline you already trust for code to these two artifacts as well.
+</p>
+
+<p>
+Finally, this chapter is a hinge between two ideas the book has kept mostly separate: Chapter 53 gave you a <em>gate</em> — a way to numerically decide whether a system is good enough to ship. This chapter gives you the <em>pipeline</em> that gate sits inside — a repeatable process for introducing any change (model, prompt, or config) through that gate, into a staged rollout, and, if needed, safely back out again. An evaluation gate nobody is required to pass before shipping is a suggestion, not a control; this chapter is what turns the suggestion into an enforced discipline.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Classical MLOps: Registries and Champion/Challenger (2015–2020)</h3>
+
+<p>
+Long before generative AI, teams running classical ML models in production — fraud scoring, credit risk, recommendation ranking — already faced a version of this problem: a trained model is a binary artifact, retraining produces a new one, and shipping the new one without comparison against the old one is dangerous. This produced two durable ideas that transfer almost unchanged into this chapter. First, the <strong>model registry</strong> (MLflow's Model Registry being the best-known example): a central, versioned catalog of trained model artifacts, each tagged with its training data snapshot, evaluation metrics, and a lifecycle stage (staging, production, archived), so "which exact model is serving traffic right now, and what proved it was good enough" is always a queryable fact, not tribal knowledge. Second, <strong>champion/challenger deployment</strong> (sometimes called shadow or A/B deployment in this context): a newly trained "challenger" model runs alongside the current "champion," scored against the same or mirrored traffic, and only replaces the champion once it demonstrably performs at least as well.
+</p>
+
+<h3>2.2 Classical Release Engineering: Canary, Blue-Green, Feature Flags</h3>
+
+<p>
+In parallel, general software release engineering solved an adjacent problem — how do you ship a code change to a live service without a bad change taking down 100% of traffic at once? Canary releases (route a small percentage of traffic to the new version, watch its metrics, then ramp up), blue-green deployments (run two full environments, cut traffic over atomically, keep the old one warm for instant rollback), and feature flags (decouple "deployed" from "enabled," so a change can be shipped dark and turned on gradually or per-segment) are all now standard practice for any backend engineer. LLMOps borrows every one of these patterns essentially unmodified — a canary release of a new prompt version and a canary release of a new payment-service build are structurally the same idea, routing a small slice of traffic to the new thing and watching before committing further.
+</p>
+
+<h3>2.3 The LLMOps Turn: You Often Don't Own the Model (2023–present)</h3>
+
+<p>
+What makes LLMOps a genuinely distinct discipline, rather than just "MLOps with a new name," is a fact classical MLOps never had to deal with: for most teams, the foundation model itself is not an artifact you trained, retrained, or fully control the versioning of. You are usually not the one deciding when a new model version is created — a third-party provider is, and they can update what a stable-looking API name resolves to on their own schedule, sometimes with no announcement at all to individual customers. Classical MLOps registries version something you built; LLMOps registries must version something you did <em>not</em> build (the model, referenced by a version string or alias you do not control the meaning of over time) alongside something you <em>do</em> fully own and can genuinely version with full rigor — the prompt template, the system instructions, retrieval and tool configuration, and, if you fine-tune, the adapter weights layered on top of the base model. This split — "partially yours, partially a black box you can only pin, probe, and react to" — is the reason this chapter exists as its own topic rather than being folded entirely into Chapter 68's monitoring or Chapter 53's evaluation.
+</p>
+
+<table>
+<tr><th>Era</th><th>Core Idea</th><th>What It Versioned</th><th>What Carries Into LLMOps</th></tr>
+<tr><td>Classical MLOps (MLflow, champion/challenger)</td><td>A registry of trained artifacts with lifecycle stages and attached metrics</td><td>A model you trained yourself, end to end</td><td>The registry pattern itself (Section 8), and champion/challenger as the ancestor of canary/shadow rollout (Section 5)</td></tr>
+<tr><td>Classical release engineering (canary, blue-green, feature flags)</td><td>Gradual, reversible exposure of a new version to real traffic</td><td>Application code and infrastructure</td><td>Canary percentages, rollback mechanics, and flag-gated exposure — applied to prompts and model pins instead of binaries</td></tr>
+<tr><td>LLMOps (2023–present)</td><td>Version what you control (prompts, config, fine-tunes) rigorously; detect and react to what you don't control (vendor model updates behind stable aliases)</td><td>A composite artifact: model reference + prompt + config, where only part is under your authorship</td><td>Every mechanism in Sections 5–9 of this chapter</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> notice that LLMOps did not need to invent versioning, canarying, or registries from scratch — it inherited all three wholesale from MLOps and release engineering. The genuinely new engineering problem it had to solve is narrower and sharper: how do you apply "version everything, roll out gradually, be ready to roll back" discipline to an artifact where a meaningful fraction of what you are shipping is a third party's black box that can change without your permission? Section 5.2's drift-probe mechanism is the direct answer to that narrower problem.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Given a production LLM system whose behavior is jointly determined by a foundation model version (partially outside your control), a prompt/instruction template (fully under your control), and supporting configuration (retrieval settings, tool schemas, sampling parameters — fully under your control), build a disciplined process to introduce, validate, stage-roll-out, and — if necessary — roll back a change to any of these components, while detecting changes that were never initiated by your team at all.</strong>
+</div>
+
+<p>
+This decomposes into four coupled sub-problems, and conflating them is where most teams' informal processes break down:
+</p>
+
+<ul>
+<li><strong>Versioning what you own.</strong> Prompt templates, system instructions, tool/function schemas, retrieval configuration, and fine-tune weights all need the same treatment as application code: a version identifier, a change history, code review, and a place they live that is not "a string literal buried in a service class" or "a value in a dashboard nobody diffs."</li>
+<li><strong>Staging a change safely.</strong> Whether the change is a new prompt version or a new model-version pin, it needs to pass through Chapter 53's evaluation gate before it reaches any real user, and then be exposed gradually — shadow, canary, progressive rollout — rather than switched over for 100% of traffic in one step, exactly the release-engineering discipline from Section 2.2.</li>
+<li><strong>Rolling back safely when a stateful conversation is involved.</strong> A traditional web service rollback is close to instantaneous and consequence-free: the next request after rollback simply hits the old code. An LLM-backed conversational system breaks this assumption, because a user can be mid-conversation, with turns already generated under the new version's behavior contract, when a rollback decision is made — reverting the model out from under an in-flight session can produce jarring, inconsistent behavior (the system suddenly "forgets" a tool it just offered, or contradicts something it said one turn ago under a different prompt version).</li>
+<li><strong>Detecting change you did not initiate.</strong> Unlike any of the first three sub-problems, this one has no deploy event to anchor to — a vendor-side model update behind a floating alias produces a behavior shift with zero corresponding entries in your own deployment log, which means detection must come from continuously probing the live system's output distribution against a historical baseline, not from watching your own change management system.</li>
+</ul>
+
+<p>
+It is worth being explicit about why lifecycle management cannot simply be "run Chapter 53's evaluation suite before every deploy and call it done." Evaluation answers "is this specific candidate good enough right now, on this test set?" — a point-in-time question about one artifact. Lifecycle management answers a different, ongoing question: "as this system's model, prompt, and configuration continue to change — sometimes at our initiative, sometimes at a vendor's — do we have a process that catches every meaningful change, routes it through the gate, and can undo it safely if the gate was wrong or reality diverges from the test set?" Evaluation is the instrument; lifecycle management is the discipline of using that instrument every single time something changes, including the times nobody on your team pulled a trigger.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Core Mental Model: Prompts and Model Pins Are Deployable Artifacts, Not Incidental Strings</h3>
+
+<p>
+The single mindset shift this chapter asks you to make is treating every one of the following as a first-class, versioned artifact with the same seriousness as a JAR in your Maven repository: the system prompt and any prompt templates, the exact model identifier your code calls (not "whatever the alias currently resolves to"), tool/function schemas exposed to the model, retrieval configuration (chunking, top-k, reranker settings — inherited from Volume 3), sampling parameters (temperature, max tokens), guardrail rules, and, if you fine-tune, the adapter or checkpoint weights themselves. Each of these can independently regress system behavior, and each therefore needs an independent version identifier, a change history, and a way to be rolled back independently of the others — bundling them into one undifferentiated "the AI feature" makes it impossible to answer "which change caused this regression" when something goes wrong.
+</p>
+
+<h3>4.2 Deterministic Rollback vs. Probabilistic Rollback</h3>
+
+<p>
+A traditional code rollback is exact: redeploy the previous binary, and the system's behavior for the next request is bit-for-bit what it was before the bad change, because a given input always produces the same output. An LLM version or prompt rollback is not exact in that sense — reverting to "prompt version 12" changes the <em>distribution</em> of likely outputs back toward what it was, but does not guarantee any specific future response looks like a specific past one, because the system remains probabilistic. This matters practically: you cannot validate a rollback by re-running one request and confirming it "looks the same" the way you might smoke-test a code rollback — you must re-validate the rolled-back state against the evaluation gate the same way you validated the forward change, because "the version that used to work" is itself a claim about a distribution, not a fact about a specific output.
+</p>
+
+<h3>4.3 Champion/Challenger, Adapted for Open-Ended Text</h3>
+
+<p>
+Classical champion/challenger deployment (Section 2.1) compares two models on a well-defined label — did the challenger's fraud score agree with the eventual chargeback outcome more often than the champion's? LLMOps has no equivalent ground-truth label available in real time; "was this answer good" is exactly the open-ended judgment Chapter 53 built an entire evaluation discipline to approximate. The adaptation, covered mechanically in Section 5, is that the challenger's traffic is scored using the same reference-free, LLM-as-judge metrics Chapter 53 established (faithfulness, answer relevance) rather than a hard ground-truth label, and the comparison decision — "is the challenger meaningfully better or at least not meaningfully worse" — becomes a statistical hypothesis test over noisy scores (Section 6) rather than a simple accuracy comparison.
+</p>
+
+<h3>4.4 Pinned Snapshots vs. Floating Aliases: A Real Trade-off, Not a Mistake to Simply Avoid</h3>
+
+<p>
+Most foundation-model providers offer both a dated, immutable model identifier (a "snapshot") and a floating alias that always points at "whatever we currently consider the best/latest version" of a model family. Floating aliases are not simply a mistake — they get you automatic quality, safety, and sometimes cost improvements with zero engineering effort, which is genuinely valuable for low-stakes, exploratory use cases. But for anything that has passed through an evaluation gate and is running in production, a floating alias silently reintroduces exactly the unvalidated-change risk this entire chapter exists to close: the artifact your evaluation suite approved is no longer the artifact serving traffic, the moment the provider updates the alias, and no deploy event marks the moment it happened. The disciplined default for production traffic is a <strong>pinned, dated snapshot</strong>, with a deliberate, evaluated, versioned upgrade process (Section 5) for moving to a newer pin on your own schedule — and a drift probe (Section 5.2) as a safety net for the cases where you cannot avoid a floating alias, or where the vendor deprecates your pinned version out from under you on their timeline rather than yours.
+</p>
+
+<h3>4.5 The Model Lifecycle as a State Machine</h3>
+
+<p>
+Every versioned artifact in this chapter — a prompt template, a model pin, a fine-tuned checkpoint — moves through the same small set of lifecycle states: <strong>experimentation</strong> (offline, iterated against Chapter 53's golden set, never touching real traffic), <strong>staged</strong> (passed the gate, running as a shadow or small canary), <strong>production</strong> (serving the majority or entirety of real traffic, being actively monitored per Chapter 68), <strong>deprecated</strong> (superseded by a newer version, kept alive only long enough to drain in-flight sessions per Section 5.3), and <strong>retired</strong> (no longer served at all, but its identifier and evaluation history remain in the registry for audit purposes). Naming these states explicitly, and requiring every artifact to have exactly one current state at all times, is what turns "we have several prompt versions floating around in various places" into an answerable question: "what is in production right now, what proved it belonged there, and what came before it."
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+This section walks through the concrete, step-by-step mechanics behind three of this chapter's central processes: rolling out a new model or prompt version safely, detecting a vendor-initiated change you never asked for, and rolling back without corrupting an in-flight conversation.
+</p>
+
+<h3>5.1 Step-by-Step: Canary/Shadow Rollout of a New Model or Prompt Version</h3>
+
+<ol>
+<li><strong>Register the candidate.</strong> The new prompt version, model pin, or fine-tuned checkpoint is committed to the registry (Section 8) with a new version identifier, a description of what changed and why, and a link to the code/config diff that produced it — exactly as a pull request links to the commits it contains.</li>
+<li><strong>Run the offline evaluation gate.</strong> The candidate is run against Chapter 53's golden test set in full — context precision/recall if retrieval config changed, faithfulness and answer relevance always. This is a hard gate: a candidate that regresses beyond the agreed threshold versus the current production baseline does not proceed to the next step, full stop, regardless of how promising it looked in ad hoc testing.</li>
+<li><strong>Shadow deployment.</strong> The candidate receives a mirrored copy of real production traffic — the request is sent to both the current production version and the candidate, but only the production version's response is ever shown to the user. The candidate's responses are scored (using the same reference-free LLM-judge metrics Chapter 68 already runs continuously) purely for comparison, with zero user-facing risk, because nothing the candidate produces is ever actually served.</li>
+<li><strong>Canary release.</strong> Once shadow scores look acceptable over a large enough sample (Section 6.4's sample-size reasoning), the candidate is promoted to receive a small percentage of real traffic directly — commonly 1–5% — with its responses now actually shown to those users, and monitored with the same statistical rigor as any Chapter 68 quality metric: rolling faithfulness/relevance scores compared against the current production baseline using the confidence-interval method in Section 6.2, not eyeballed.</li>
+<li><strong>Progressive rollout.</strong> If the canary holds up over an agreed observation window, traffic is ramped in stages (5% → 25% → 50% → 100%), with an automatic pause-and-alert if any Chapter 68 metric — latency, cost, quality, or safety — regresses beyond its threshold at any stage, and an explicit go/no-go decision point between stages rather than an unattended automatic ramp.</li>
+<li><strong>Deprecate the prior version.</strong> Once the new version is serving 100% of new-session traffic, the previous version is marked deprecated in the registry but kept warm — still callable — until existing sessions pinned to it (Section 5.3) have naturally drained, at which point it is retired.</li>
+</ol>
+
+<h3>5.2 Step-by-Step: Detecting Silent Vendor-Side Model Drift</h3>
+
+<ol>
+<li><strong>Maintain a fixed probe set.</strong> Separately from the production-traffic-sampled monitoring in Chapter 68, maintain a small, stable set of reference prompts (drawn from, or a subset of, Chapter 53's golden set) that never changes and is run on a schedule — hourly or daily — directly against the model alias or pin in question, independent of real user traffic.</li>
+<li><strong>Capture a baseline distribution.</strong> On each scheduled run, record the outputs' key properties: evaluation scores (faithfulness, relevance) against the fixed expected answers, output length distribution, and, where feasible, embedding-space distance between today's outputs and a stored baseline set of outputs from when the pinned version was first validated.</li>
+<li><strong>Compare against the stored baseline statistically.</strong> Using the same statistical-process-control technique Chapter 68 applies to quality metrics (a rolling mean and standard deviation, alerting when a new measurement falls outside an agreed band — Section 6.2 makes this precise for this chapter's specific use), flag any scheduled run whose scores or embedding distances have moved meaningfully away from the stored baseline.</li>
+<li><strong>Distinguish your own changes from the vendor's.</strong> Because this probe runs against the model identifier directly, bypassing your prompt and application layer entirely where possible, a flagged deviation with no corresponding entry in your own deployment log is strong evidence the shift originated upstream, at the provider — which is exactly the signal this mechanism exists to surface, since nothing else in your stack would ever produce it.</li>
+<li><strong>Route the alert appropriately.</strong> A confirmed drift alert should trigger the same investigation Chapter 68's Interview Q4 describes — check the provider's reported model-version metadata field on recent responses for a change, check the provider's status page and changelog, and, if drift is confirmed, either pin to an older still-available snapshot, or formally re-run the full evaluation gate (Section 5.1) against the new de facto model behavior and treat it as a new version entering the lifecycle, rather than silently absorbing the change.</li>
+</ol>
+
+<h3>5.3 Step-by-Step: Rollback That Respects In-Flight Conversations</h3>
+
+<ol>
+<li><strong>Pin each session to the version active at its start.</strong> When a conversation begins, the currently active model/prompt/config version identifiers are stamped onto the session record and used for every subsequent turn in that session, rather than re-resolving "the current production version" on every turn — this is the mechanism that prevents a mid-conversation surprise when a rollout or rollback happens between two turns of the same conversation.</li>
+<li><strong>New sessions immediately pick up the rollback.</strong> The moment a rollback decision is made, any session that has not yet started is created against the restored version, giving you the fast, "next request sees the fix" property a code rollback normally provides — this part of the rollback is instantaneous, just like a traditional deploy rollback.</li>
+<li><strong>In-flight sessions drain rather than snap back.</strong> A session already pinned to the version being rolled back continues on that version until it naturally ends (explicit close, timeout, or a defined maximum session lifetime), rather than being forcibly switched mid-conversation — switching an in-flight session's underlying prompt or model contract can produce answers that contradict or fail to recognize what was said one turn earlier under the old contract, which is frequently more jarring to a user than simply finishing the conversation on the version it started with.</li>
+<li><strong>Cap the blast radius of a bad version with a maximum session lifetime.</strong> Because in-flight sessions on a bad version are allowed to drain rather than being force-switched, a bad version's damage window is bounded by how long a session can live, not by how quickly you notice the problem — this is the direct justification for enforcing an explicit maximum conversation duration/turn-count as an operational control, not just a UX nicety.</li>
+<li><strong>Log which version served which turn.</strong> Every turn's response should be tagged with the exact version identifiers that produced it, so a post-incident review can reconstruct precisely which users were affected by the bad version and for how long — the conversational equivalent of a request trace ID tying a slow HTTP response back to the exact deploy that served it.</li>
+</ol>
+
+<p class="followup">
+<strong>Edge case worth reasoning through:</strong> what happens when the rolled-back version is itself being retired and can no longer be served at all (a vendor has fully deprecated the older snapshot, for instance)? In that case there is no safe "drain in place" option — the practical mitigation is a forced, explicit session-transition message ("this conversation is continuing with an updated assistant") rather than a silent mid-conversation switch, which at least sets user expectations honestly instead of pretending nothing changed.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+The mathematics in this chapter answers one recurring, practical question: given two noisy evaluation scores — the current production version's and a candidate's — is the difference between them real, or is it the kind of noise you'd expect from an LLM-judge scoring process even if nothing had actually changed? Getting this wrong in either direction is costly: promoting a candidate on a difference that is really just noise ships a regression with false confidence; rejecting a genuinely better candidate because you demanded certainty from a small, noisy sample wastes real quality improvements.
+</p>
+
+<h3>6.1 Why a Single Score Comparison Is Not Enough</h3>
+
+<p>
+Because faithfulness and relevance scores from an LLM judge (Chapter 53, Section 5) carry sampling noise — both from which questions happen to be in your evaluation batch and from the judge model's own inconsistency across repeated calls on the same input — comparing "candidate scored 0.89, production scored 0.86" as if those were exact measurements is a mistake. The correct question is not "which number is bigger" but "is this difference larger than we'd expect from noise alone, at the sample size we actually have."
+</p>
+
+<h3>6.2 Confidence Intervals Around a Proportion-Style Score</h3>
+
+<p>
+Many of this chapter's scores (pass rate against a rubric, faithfulness ratio) behave like a proportion — a count of "good" outcomes out of a total. A standard confidence interval for a proportion, using the normal approximation, is:
+</p>
+
+<pre>
+                              ┌─────────────
+                             │  p̂(1 − p̂)
+CI  =  p̂  ±  z · √           │  ──────────
+                             │      n
+                              └─────────────
+
+  p̂ = observed pass rate (e.g., 0.89 faithfulness ratio)
+  n = number of evaluated examples
+  z = 1.96 for a 95% confidence interval
+
+Example — candidate version, faithfulness:
+  p̂ = 0.89,  n = 300
+  CI ≈ 0.89 ± 1.96 · √(0.89 × 0.11 / 300)
+     ≈ 0.89 ± 0.035
+     ≈ [0.855, 0.925]
+
+Example — current production version, faithfulness, same golden set:
+  p̂ = 0.86,  n = 300
+  CI ≈ 0.86 ± 0.039  ≈ [0.821, 0.899]
+</pre>
+
+<p>
+Because these two intervals overlap (production's upper bound, 0.899, sits above candidate's lower bound, 0.855), a difference of 0.89 vs. 0.86 at n = 300 is <strong>not</strong> strong evidence of a real improvement — it is well within the range noise alone could produce. Promoting this candidate on the strength of that single comparison would be shipping on a coin flip dressed up as a data-driven decision.
+</p>
+
+<h3>6.3 A Two-Proportion Significance Test for the Promotion Decision</h3>
+
+<p>
+A more direct way to frame the promotion decision is a two-proportion z-test, asking whether the observed difference between candidate and production pass rates is large relative to their combined standard error:
+</p>
+
+<pre>
+              p̂_candidate − p̂_production
+z  =  ─────────────────────────────────────────
+                   ┌──────────────────────
+                  │      1       1
+       √  p̂(1−p̂) │  ───────  +  ───────
+                   │  n_candidate   n_production
+                    └──────────────────────
+
+  where p̂ = pooled pass rate across both samples combined
+
+Decision rule (two-sided, 95% confidence):
+  |z| ≥ 1.96  →  treat the difference as statistically meaningful
+  |z| <  1.96  →  treat the difference as indistinguishable from noise
+                  at the current sample size — do not promote or reject
+                  on this evidence alone; collect more canary traffic
+</pre>
+
+<p>
+The practical reading of a "not yet significant" result is not "the candidate is bad" — it is "you do not yet have enough evidence either way," which is precisely why Section 5.1's canary stage exists: it accumulates real-traffic sample size specifically so this test can eventually produce a confident answer, rather than promoting or killing a candidate on an underpowered offline batch alone.
+</p>
+
+<h3>6.4 Minimum Sample Size Before a Promotion Decision</h3>
+
+<p>
+Rearranging the confidence-interval formula for a target margin of error <em>E</em> gives a rough minimum sample size, which is what a canary stage's "how long do we wait" question actually reduces to mathematically:
+</p>
+
+<pre>
+      z² · p̂(1 − p̂)
+n  ≈  ────────────────
+             E²
+
+Example — wanting a margin of error of ±2 percentage points around p̂ ≈ 0.90:
+  n ≈ (1.96)² × 0.90 × 0.10 / (0.02)²
+    ≈ 3.8416 × 0.09 / 0.0004
+    ≈ 864 evaluated examples
+
+Practical reading: a canary that only reaches 50–100 scored examples before
+a promotion decision is made cannot responsibly resolve a difference this
+small — either widen the acceptable effect size you require, or extend the
+canary stage until enough traffic (or enough sampled scoring, per Chapter 68 Section 6.4) has accumulated.
+</pre>
+
+<p>
+This is also the mathematical justification for a rule stated informally throughout this chapter: quality-based promotion decisions must be made over a longer observation window than latency or error-rate decisions, because a meaningful sample size for a noisy, sampled quality score simply takes longer to accumulate than a sample size for a metric computed on every single request.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Canary/Shadow Rollout Pipeline for a New Model or Prompt Version</h3>
+
+<pre>
+┌──────────────────┐
+│  Candidate change  │  new prompt template, new model-version pin,
+│  registered         │  new fine-tune checkpoint, or new config
+└─────────┬─────────┘
+          ▼
+┌──────────────────────────┐
+│  OFFLINE EVALUATION GATE    │  Chapter 53 golden set: faithfulness,
+│  (Chapter 53 golden set)    │  answer relevance, context precision/recall
+└─────────┬────────────────┘
+          │ pass                                    │ fail
+          ▼                                          ▼
+┌──────────────────────────┐               ┌──────────────────┐
+│  SHADOW DEPLOYMENT           │               │  Rejected — back to  │
+│  mirrored real traffic,      │               │  experimentation      │
+│  candidate output NEVER      │               │  (Section 4.5 state)  │
+│  shown to users, scored      │               └──────────────────┘
+│  against production           │
+└─────────┬────────────────┘
+          │ scores acceptable, n large enough (Section 6.4)
+          ▼
+┌──────────────────────────┐
+│  CANARY  (1–5% real          │──── quality/cost/latency/safety ────┐
+│  traffic, output SHOWN)       │     regression detected              │
+└─────────┬────────────────┘                                          │
+          │ two-proportion test (Section 6.3) confirms no regression   │
+          ▼                                                            ▼
+┌──────────────────────────┐                                ┌──────────────────┐
+│  PROGRESSIVE ROLLOUT         │                                │  AUTOMATIC ROLLBACK  │
+│  5% → 25% → 50% → 100%,      │                                │  (Section 5.3 —       │
+│  go/no-go gate each stage    │                                │  in-flight sessions   │
+└─────────┬────────────────┘                                │  drain on old version) │
+          ▼                                                    └──────────────────┘
+┌──────────────────────────┐
+│  PRODUCTION (100%)            │  continuously monitored per Chapter 68;
+│  prior version → DEPRECATED   │  drift-probed per Section 5.2 going forward
+└──────────────────────────┘
+</pre>
+
+<h3>7.2 Session Pinning — Why Rollback Cannot Simply "Switch Everyone Back"</h3>
+
+<pre>
+ time ──────────────────────────────────────────────────────────────►
+
+ Session A  [start: v12]════════════turn1════turn2════turn3══(ends, v12)
+                  ▲
+                  │ pinned to v12 for its entire lifetime
+
+ Session B          [start: v13]═══turn1═══turn2═╳ ROLLBACK DECIDED HERE
+                          ▲                       │
+                          │ pinned to v13          ▼
+                          │              continues on v13, drains naturally
+                          │              (NOT force-switched to v12 mid-turn)
+                          └──────────────turn3════(ends, v13)
+
+ Session C                              [start AFTER rollback: v12]
+                                              ▲
+                                              │ new sessions immediately
+                                              │ get the restored version —
+                                              │ this part IS instantaneous
+                                              ▼
+                                         ════turn1════turn2════ ...
+
+   Rollback = instantaneous for NEW sessions, drain-to-completion for
+   sessions already in flight — never a mid-conversation version swap.
+</pre>
+
+<h3>7.3 Drift Detection — A Probe Set Run Independently of Production Traffic</h3>
+
+<pre>
+  Fixed probe set (subset of Chapter 53 golden set, never changes)
+          │
+          ▼  run hourly/daily, directly against the model alias/pin
+  ┌────────────────────────────┐
+  │  Score today's outputs        │
+  │  (faithfulness, length,        │
+  │   embedding distance from       │
+  │   stored baseline outputs)      │
+  └─────────────┬────────────────┘
+                ▼
+  ┌────────────────────────────────────────┐
+  │  Compare against rolling baseline band     │   inside band → no action,
+  │  (mean ± kσ, Chapter 68 §6.2 technique)     │   log and continue
+  └─────────────┬────────────────────────────┘
+                │ outside band, sustained across multiple runs
+                ▼
+  ┌────────────────────────────────────────┐
+  │  ALERT: possible vendor-side model drift   │
+  │  — check provider's reported model-version  │
+  │    metadata on recent responses              │
+  │  — check provider status page / changelog     │
+  │  — if confirmed: treat as a NEW version        │
+  │    entering the lifecycle (Section 5.1),        │
+  │    do not silently absorb the change             │
+  └────────────────────────────────────────┘
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a mature deployment, lifecycle management is infrastructure that sits beside — and feeds into — the observability and cost-governance stacks from Chapters 68 and 70, not a separate manual process tracked in a spreadsheet.
+</p>
+
+<pre>
+                     ┌────────────────────────────────────────────────┐
+                     │              Model / Prompt Registry              │
+                     │  - versioned prompt templates & system prompts    │
+                     │  - versioned model pins (dated snapshots)          │
+                     │  - versioned tool schemas, retrieval config         │
+                     │  - lifecycle state per artifact (Section 4.5)        │
+                     │  - linked evaluation results (Chapter 53) per version │
+                     └───────────────────┬────────────────────────────┘
+                                        ▼
+              ┌──────────────────────────────────────────────────────┐
+              │              Rollout Orchestrator                       │
+              │  drives Section 5.1's pipeline: gate → shadow → canary  │
+              │  → progressive rollout → production → deprecated         │
+              └───────┬─────────────────────────┬───────────────────────┘
+                      ▼                         ▼
+          ┌──────────────────────┐   ┌──────────────────────────┐
+          │  Session Pinning Store │   │  Drift Probe Scheduler     │
+          │  (Section 5.3): maps    │   │  (Section 5.2): runs fixed  │
+          │  session ID → exact      │   │  probe set on a schedule,    │
+          │  version set active at   │   │  compares against stored      │
+          │  session start            │   │  baselines                     │
+          └──────────────────────┘   └──────────────────────────┘
+                      │                         │
+                      └───────────┬─────────────┘
+                                 ▼
+              ┌──────────────────────────────────────────────────────┐
+              │     Chapter 68 Monitoring + Chapter 70 Cost Telemetry     │
+              │  every metric tagged with exact version identifiers,       │
+              │  so a regression can be attributed to the specific         │
+              │  prompt/model/config version that produced it               │
+              └──────────────────────┬───────────────────────────────┘
+                                    ▼
+              ┌──────────────────────────────────────────────────────┐
+              │       Alerting / Rollback Trigger                        │
+              │  automatic rollback proposal on sustained regression;      │
+              │  human approval required to execute (Section 13)            │
+              └──────────────────────────────────────────────────────┘
+</pre>
+
+<p>
+Two architectural decisions recur across real deployments of this pattern. First, the registry is deliberately the single source of truth for "what is running in production right now" — every service that calls a model does so by resolving a version identifier from the registry rather than hardcoding a model string or prompt text inline, which is precisely what makes the tagging in Chapter 68's metrics and the attribution in an incident review possible at all. Second, the drift probe scheduler is architecturally independent of the rollout orchestrator, because its entire purpose is catching change that did not go through the orchestrator in the first place — coupling it to the deploy pipeline would blind it to exactly the vendor-initiated changes it exists to detect.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Building an internal model/prompt registry in a Spring application is a natural extension of patterns you already use for feature flags and configuration management — the registry is simply a database-backed, versioned lookup with an explicit lifecycle state machine layered on top.
+</p>
+
+<h3>9.1 Registry Entity Design</h3>
+
+<pre>
+@Entity
+public class PromptTemplate {
+    @Id @GeneratedValue
+    private Long id;
+
+    private String name;             // e.g. "support-assistant-system-prompt"
+    private String version;          // e.g. "v14", or a content hash
+    @Lob
+    private String templateText;
+    @Enumerated(EnumType.STRING)
+    private LifecycleState state;    // EXPERIMENTATION, STAGED, PRODUCTION,
+                                      // DEPRECATED, RETIRED  (Section 4.5)
+    private String evaluationRunId;  // FK to the Chapter 53 golden-set run
+                                      // that approved this version
+    private Instant createdAt;
+    private String createdBy;
+}
+
+@Entity
+public class ModelVersionPin {
+    @Id @GeneratedValue
+    private Long id;
+
+    private String logicalName;      // e.g. "support-assistant-generator"
+    private String providerModelId;  // dated snapshot, e.g. "model-2026-03-15"
+    @Enumerated(EnumType.STRING)
+    private LifecycleState state;
+    private String evaluationRunId;
+    private Instant pinnedAt;
+}
+</pre>
+
+<h3>9.2 Resolving the Active Version at Request Time — Not Hardcoding It</h3>
+
+<pre>
+@Service
+public class ActivePromptResolver {
+
+    private final PromptTemplateRepository repo;
+
+    public PromptTemplate resolveProduction(String name) {
+        return repo.findByNameAndState(name, LifecycleState.PRODUCTION)
+                .orElseThrow(() -> new IllegalStateException(
+                        "No production prompt registered for " + name));
+    }
+
+    // Canary resolution: route a small percentage of NEW sessions to a
+    // STAGED candidate instead of PRODUCTION, per Section 5.1.
+    public PromptTemplate resolveForNewSession(String name, String sessionId) {
+        Optional<PromptTemplate> canary = repo.findByNameAndState(
+                name, LifecycleState.STAGED);
+        if (canary.isPresent() && canaryBucket(sessionId) < canaryPercentage(name)) {
+            return canary.get();
+        }
+        return resolveProduction(name);
+    }
+}
+</pre>
+
+<h3>9.3 Session Pinning — Stamping the Version at Session Start (Section 5.3)</h3>
+
+<pre>
+@Entity
+public class ConversationSession {
+    @Id
+    private String sessionId;
+
+    private String promptTemplateVersion;  // stamped ONCE, at session creation
+    private String modelVersionPin;        // stamped ONCE, at session creation
+    private Instant startedAt;
+    private Instant lastTurnAt;
+    // ... conversation turns ...
+}
+
+@Service
+public class ConversationService {
+
+    private final ActivePromptResolver promptResolver;
+    private final ActiveModelResolver modelResolver;
+
+    public ConversationSession startSession(String feature) {
+        ConversationSession session = new ConversationSession();
+        session.setSessionId(UUID.randomUUID().toString());
+        // Resolved and stamped ONCE — every later turn in this session
+        // reuses these exact values, never re-resolving "current production."
+        session.setPromptTemplateVersion(
+                promptResolver.resolveForNewSession(feature, session.getSessionId())
+                        .getVersion());
+        session.setModelVersionPin(
+                modelResolver.resolveForNewSession(feature, session.getSessionId())
+                        .getProviderModelId());
+        session.setStartedAt(Instant.now());
+        return session;
+    }
+
+    // Every subsequent turn loads the PINNED version from the session
+    // record, not the current registry state — this is what makes
+    // Section 5.3's "drain, don't switch mid-conversation" guarantee real.
+    public ChatResponse continueTurn(ConversationSession session, String userMessage) {
+        PromptTemplate prompt = promptResolver.byExactVersion(
+                session.getPromptTemplateVersion());
+        ChatModel model = modelResolver.byExactPin(session.getModelVersionPin());
+        // ... build ChatClient from the PINNED prompt + model, invoke ...
+        return ChatClient.create(model)
+                .prompt().system(prompt.getTemplateText())
+                .user(userMessage).call().chatResponse();
+    }
+}
+</pre>
+
+<h3>9.4 Gating Promotion With a JUnit Test, Extending Chapter 53's Pattern</h3>
+
+<p>
+The same <code>Evaluator</code>-based regression test from Chapter 53 becomes, in this chapter, the literal gate a candidate must clear before its lifecycle state can move from <code>EXPERIMENTATION</code> to <code>STAGED</code> — a CI job that runs this test against a candidate's linked <code>evaluationRunId</code> and refuses to allow the state transition on failure, giving you an enforced control rather than a documented-but-optional process step.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Pin production model references to a dated, immutable snapshot, never a floating "latest" alias.</strong> Reserve floating aliases for experimentation environments where automatic drift is an acceptable, even welcome, part of exploring what a provider offers next.</li>
+<li><strong>Version prompts, tool schemas, and retrieval config with the same rigor as code — in a registry, with review, not as inline strings or dashboard edits.</strong> A prompt change with no version identifier and no diff history is undebuggable the moment it causes a regression.</li>
+<li><strong>Never promote a candidate to 100% production traffic without passing through shadow and canary stages first (Section 5.1).</strong> The blast radius of a bad prompt or model change scales directly with how much traffic it reaches before anyone notices.</li>
+<li><strong>Run a scheduled drift probe against every production model pin, independent of real traffic (Section 5.2).</strong> This is your only reliable detector for a change your team never initiated.</li>
+<li><strong>Pin every conversational session to the exact version set active at its start, and let in-flight sessions drain rather than force-switching them (Section 5.3).</strong> Treat this as a hard architectural rule, not an optimization to add later.</li>
+<li><strong>Require a statistical significance check (Section 6.3), not a single-number eyeball comparison, before promoting a canary.</strong> A candidate that "looks a little better" on a small sample is exactly the case this chapter's mathematics exists to keep you from acting on prematurely.</li>
+<li><strong>Feed every rollback and every confirmed drift incident back into the Chapter 53 golden set.</strong> The specific case that caused a regression is the single most valuable new test case your evaluation suite can gain.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Bumping a model version in production with no re-evaluation, on the assumption that "a newer model is always at least as good."</strong> Newer models frequently change tone, verbosity, refusal behavior, and instruction-following characteristics in ways that regress a specific, carefully-tuned prompt even while improving general benchmarks — Section 5.1's gate exists precisely because "newer" and "better for your use case" are not the same claim.</li>
+<li><strong>Treating a prompt edit as "just text" rather than a versioned, tested artifact.</strong> A one-line change to a system prompt can alter behavior as significantly as a code change to a core service method, and shipping it without the same review-and-gate discipline is the single most common source of the "we didn't deploy anything, but the assistant started behaving differently" incident.</li>
+<li><strong>Relying on a floating model alias in production with no drift probe as a safety net.</strong> This combination guarantees that the first time you learn about a vendor-side model swap is from a user complaint or a monitoring dashboard regression, weeks after it happened, rather than from an automated alert within hours.</li>
+<li><strong>Force-switching in-flight conversations to a new or rolled-back version mid-session.</strong> This produces exactly the jarring, self-contradicting behavior Section 5.3 was built to avoid, and it is a common oversight in teams that correctly apply canary/rollback discipline to their code but forget conversational state has its own continuity requirement.</li>
+<li><strong>Promoting a canary based on a single, small-sample score comparison.</strong> As Section 6.2 demonstrated numerically, a difference like 0.89 vs. 0.86 at a few hundred examples is frequently indistinguishable from noise — promoting or rejecting on it without a significance check is a coin flip wearing the costume of a data-driven decision.</li>
+<li><strong>Never retiring deprecated versions, leaving an ever-growing set of "which prompt/model is actually in use where" ambiguity.</strong> A registry that accumulates deprecated-but-never-retired versions with no drained-session confirmation eventually makes it impossible to answer "is it safe to fully remove this" with confidence.</li>
+<li><strong>Confusing this chapter's lifecycle discipline with Chapter 68's monitoring.</strong> Monitoring tells you a metric moved; lifecycle management is the process that decides what changed, whether it was authorized, and what to do about it — a team with excellent dashboards and no versioning/rollback process will see the regression clearly and still have no disciplined way to undo it.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Shadow deployment roughly doubles inference cost for the traffic it covers</strong>, since every mirrored request triggers a real call to the candidate in addition to the production version — this is a deliberate, bounded cost (Chapter 70's lens) paid specifically to de-risk a rollout, and it should be scoped to a sampled fraction of traffic for high-volume features rather than mirroring 100% of requests indefinitely.</li>
+<li><strong>Running two model versions concurrently during a progressive rollout carries real operational overhead</strong> — connection pools, rate-limit budgets, and prompt-caching benefits (Chapter 70, Section 4.4) are effectively split across two versions rather than concentrated on one, which can transiently increase per-request latency or cost until the rollout completes and the prior version is deprecated.</li>
+<li><strong>Registry lookups sit on the hot path of every conversation start</strong>, so the "resolve active version" call from Section 9.2 should be cached with a short TTL or invalidated explicitly on state transitions, rather than hitting the database on every single session creation — this is the same caching instinct already applied to feature-flag resolution in a traditional Spring service.</li>
+<li><strong>Drift probes add a small, fixed, recurring inference cost</strong> — a probe set of even a few dozen prompts run hourly is inexpensive relative to production traffic volume, but it is not free, and probe frequency should be tuned against how quickly you need to detect drift versus how much recurring spend you are willing to dedicate purely to detection.</li>
+<li><strong>Session pinning (Section 5.3) means a slow-draining conversation can keep a deprecated model version's infrastructure warm longer than expected</strong> — teams should track and alert on unusually long-lived sessions still pinned to a deprecated version, since an indefinitely open session is both a lingering cost line and a signal that your maximum-session-lifetime control (Section 5.3) may need tightening.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>A vendor-side model update is a supply-chain event, not just a quality event.</strong> A silent model swap behind a stable alias can change safety behavior — a model that used to reliably refuse a category of harmful request may handle it differently after an update — which means the drift probe from Section 5.2 should include safety-relevant probes (adversarial and policy-boundary test cases from your guardrail suite), not only quality/faithfulness probes, and a confirmed safety-relevant drift should be treated as an incident, escalated the same way a Chapter 68 Layer 4 safety alert would be.</li>
+<li><strong>Unreviewed prompt changes are a direct injection and policy-bypass risk.</strong> A system prompt edit that loosens an instruction ("don't discuss competitor pricing," "never reveal internal document IDs") without security review can reopen a previously closed vulnerability just as effectively as a code change reintroducing a fixed bug — prompt changes belong in the same review pipeline as any change affecting an access-control or data-handling boundary, not a fast-tracked content edit.</li>
+<li><strong>Registry write access — specifically, the ability to promote a version to PRODUCTION state — must be access-controlled and audited as tightly as production deploy permissions.</strong> Because a promoted prompt or model pin takes effect for real users immediately upon reaching that lifecycle state, the registry is functionally a deploy mechanism and should carry the same authorization and audit-log requirements any CI/CD promotion step carries, including for regulated industries where "who approved this change and when" is a compliance requirement, not a nice-to-have.</li>
+<li><strong>Never embed secrets, credentials, or environment-specific configuration directly inside a prompt template stored in the registry.</strong> Prompt templates are frequently copied into evaluation logs, shadow-deployment comparisons, and incident post-mortems (Chapter 68's LLM-specific store) — anything embedded in the template text inherits that same wide, loosely-controlled distribution, which is a poor fit for anything sensitive.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is the difference between a floating model alias (e.g., "model-latest") and a pinned, dated model snapshot, and why does that difference matter for a production system?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A floating alias always resolves to whatever the provider currently considers the latest version of a model family, so its behavior can change without any code change or deploy on your side. A pinned, dated snapshot always refers to the exact same model version until you explicitly change the pin. In production, this matters because a system that passed evaluation against a specific model's behavior can silently start serving a different, unvalidated model the moment a floating alias updates — with no corresponding entry in your deployment history to explain the resulting regression. Pinning to a dated snapshot makes model upgrades a deliberate, versioned, evaluated event instead of something that can happen to you without notice.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why can't a prompt-template change simply be edited directly in a live configuration dashboard and shipped without any review process?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A prompt template is a production artifact that directly controls model behavior for every request that uses it — a single wording change can alter tone, correctness, instruction-following, or safety behavior as significantly as a code change to a core service method. Editing it live with no version history, no diff, and no evaluation gate means a regression it introduces cannot be attributed, reviewed, or rolled back with any confidence — the same reasons you require code review and tests before shipping application code apply directly to prompt templates, which is why they should be versioned, reviewed, and gated through the same evaluation process as any other change.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain why rolling back a bad model or prompt version is fundamentally different from rolling back a bad application code deploy, especially for a system that holds stateful, multi-turn conversations.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A code rollback is exact and instant — the next request after rollback is served by the previous, known-good binary, and behavior for that request is deterministic. A model/prompt rollback is not exact in the same sense, because the system is probabilistic — reverting shifts the distribution of likely outputs back toward what it was, but any specific new response is not guaranteed to match a specific past one, so the rolled-back state still needs re-validation against the evaluation gate rather than being trusted on faith. For stateful conversations specifically, a user can be mid-session, with turns already generated under the version being rolled back, at the moment the rollback happens — forcibly switching that in-flight session to the restored version can produce jarring, self-contradicting behavior (the assistant "forgetting" something it just said or offered). The correct approach is pinning each session to the version active at its start and letting in-flight sessions drain to completion, while new sessions immediately pick up the rollback.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. How would you detect that your model provider has silently changed the model behind a stable API alias, given that no deploy happened on your side?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Because there is no deploy event on your side to anchor an investigation to, detection has to come from continuously probing the live model directly rather than watching your own change log. Maintain a small, fixed set of reference prompts that never changes, run it on a schedule (hourly or daily) directly against the model alias or pin, and score the outputs — evaluation metrics like faithfulness against expected answers, output-length distribution, and embedding-space distance from a stored baseline set of outputs captured when the version was first validated. Apply the same statistical-process-control technique used for production quality monitoring — a rolling baseline band, alerting when new measurements fall outside it for a sustained period — and treat a confirmed, sustained deviation as strong evidence of an upstream change, especially when it correlates with a change in the provider's reported model-version metadata on recent responses and there is no corresponding entry in your own deployment history.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Your canary shows a candidate prompt version scoring 0.89 faithfulness against production's 0.86 on 300 evaluated examples. A colleague wants to promote to 100% rollout immediately. How do you respond?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>A 3-point difference at n=300 needs a significance check before it can drive a promotion decision, because LLM-judge scores carry real sampling noise from both the specific examples in the batch and the judge's own inconsistency. Computing a 95% confidence interval around each proportion (roughly 0.89 ± 0.035 and 0.86 ± 0.039 in this scenario) shows the two intervals overlap substantially — meaning this difference is well within the range ordinary noise could produce, not strong evidence of a real improvement. A two-proportion significance test would formalize this: at this sample size, the z-statistic for this size of difference is very unlikely to clear the threshold for statistical significance. The right response is not to promote or reject outright, but to extend the canary stage until enough traffic has accumulated to either confirm or rule out a real difference — promoting on this evidence alone is shipping a coin flip with a data-driven veneer.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Actually walk through the confidence-interval or z-test arithmetic rather than just asserting "we need more data" — a candidate who can compute that the intervals overlap, and explain what sample size would be needed to resolve a difference of this size, demonstrates the statistical rigor this chapter's Section 6 is built around, rather than a vague appeal to caution.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Design the lifecycle process you would require before any change — a new model version pin, a new prompt template, or a new fine-tuned checkpoint — is allowed to reach 100% of production traffic.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Require every candidate to move through the same sequence of lifecycle states regardless of which artifact type it is: registered in the version registry with a description of what changed and why; passed through the offline evaluation gate against the golden test set, with a hard threshold versus the current production baseline; run as a shadow deployment against mirrored real traffic with zero user-facing risk, scored using the same reference-free metrics as production monitoring; promoted to a small canary (1–5% of real traffic) once shadow scores look acceptable at an adequate sample size; ramped through progressive stages (5% → 25% → 50% → 100%) with an explicit go/no-go checkpoint and automatic pause-and-alert on any regression at each stage; and only then marked fully production, with the prior version marked deprecated and kept warm until in-flight sessions pinned to it have drained. Every stage transition should be logged with who/what approved it, and every stage's evaluation data should be linked back to the registry entry for that version, so the full history — what was tested, what passed, what was rolled back and why — is reconstructible after the fact.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. Your organization runs a dozen different AI features, several sharing the same underlying foundation model provider. How do you design lifecycle governance so a single vendor-side model update doesn't silently regress all of them simultaneously without anyone connecting the dots?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The structural fix is centralizing model-version resolution and drift detection rather than letting each feature team independently reference the provider's model identifiers and independently notice (or fail to notice) a shift. Build a shared, org-wide model registry that every feature resolves its active model pin from, so there is exactly one place recording which dated snapshot is currently authoritative for each logical model role — this alone prevents twelve teams from independently drifting onto twelve different floating aliases with twelve different blind spots. Run drift probes centrally against every distinct model pin in active use, tagged with which features depend on it, so a single detected drift event immediately surfaces every downstream feature it could affect, rather than each team separately rediscovering the same upstream cause in isolation, weeks apart. Route confirmed drift alerts to a cross-team channel or on-call rotation responsible for the shared model dependency, not only to whichever individual feature team happened to notice first. Finally, require every feature's production monitoring (Chapter 68) to tag metrics with the exact model-version identifier it is actually using, so correlating "multiple features degraded at the same time" against "one shared upstream model dependency" is a query against existing telemetry, not a manual cross-team investigation assembled after the fact.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. A regulated-industry stakeholder asks you to prove, for an audit, exactly which model version and prompt template generated a specific customer-facing response from six months ago. How does your lifecycle architecture need to be designed to answer that question with confidence, and what would make it impossible to answer?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Answering this requires two things to have been true at the time the response was generated, and preserved since: every response must have been tagged, at generation time, with the exact version identifiers of every component that could have influenced it — the model pin, the prompt template version, the retrieval/tool configuration version, and the session's pinned version set if it came from a multi-turn conversation (Section 5.3) — and that tagged record must be retained for at least as long as the audit window requires, in a store with integrity guarantees (immutable or append-only, with access controls and an audit log of who queried it, per Section 13). Additionally, the registry itself needs to retain retired versions' full definitions and their linked evaluation results indefinitely, or for a defined retention period, rather than deleting a version's template text or evaluation history once it is no longer serving traffic — you cannot reconstruct "was this prompt version validated, and against what evaluation criteria" if the version's own definition was discarded after retirement. It becomes impossible to answer this question if the system resolved "current production version" freshly at request time without persisting which version that resolution actually returned, if prompt templates were ever edited in place rather than versioned (so the "same" version identifier silently referred to different text at different times), or if a floating model alias was used with no logged record of what it resolved to on the day in question — each of these breaks the traceability chain an audit depends on, and none of them are recoverable after the fact.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why a code rollback can be trusted as "exact" while a model/prompt rollback cannot. What does this imply about whether a rolled-back version needs to be re-validated against the evaluation gate before being trusted in production again?</li>
+<li>A colleague argues that shadow deployment is unnecessary overhead because "the canary stage will catch any problems anyway." Using Section 5.1's pipeline and Section 12's cost framing, write a short argument for why shadow deployment still earns its cost even with a canary stage downstream of it.</li>
+<li>Describe a realistic scenario in which session pinning (Section 5.3) itself becomes a liability rather than a safeguard — for example, a case where letting a session drain on a deprecated or unsafe version is worse than switching it. What operational control (already named in this chapter) mitigates that scenario?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Using the confidence-interval formula from Section 6.2, compute the 95% CI for two hypothetical canary results: (a) p̂ = 0.92, n = 150, and (b) p̂ = 0.90, n = 900. Compare the two intervals' widths and explain, referencing Section 6.4, why the larger sample size at (b) allows a more confident promotion decision even though its point estimate is lower than (a)'s.</li>
+<li>Design (in ASCII, following Section 7's style) the registry schema and lifecycle-state transition diagram you would implement in a Spring Boot application to track prompt template versions, model version pins, and their current lifecycle state (experimentation, staged, production, deprecated, retired). Annotate which state transitions require passing the Chapter 53 evaluation gate, and which require human approval versus can be automated.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>LLMOps applies the version-control, staged-rollout, and rollback discipline of classical MLOps and release engineering to a composite artifact where only part — prompts, config, fine-tunes — is fully under your authorship, and part — the foundation model itself — is a third party's black box you can pin, probe, and react to, but not fully control.</li>
+<li>Every axis that can regress behavior — model version, prompt template, tool schemas, retrieval config, sampling parameters — must be independently versioned and tracked through an explicit lifecycle (experimentation, staged, production, deprecated, retired), never treated as an incidental string or a live-edited dashboard value.</li>
+<li>New versions move through a shadow-then-canary-then-progressive-rollout pipeline gated by Chapter 53's evaluation suite at every stage, with promotion decisions backed by statistical significance testing rather than single-number score comparisons, since LLM-judge scores carry real sampling noise at small sample sizes.</li>
+<li>Rollback for a stateful, multi-turn system is not the instantaneous, consequence-free operation it is for stateless code — sessions must be pinned to the version active at their start and allowed to drain naturally, while new sessions pick up a rollback immediately.</li>
+<li>Vendor-side model drift behind a stable API alias produces no deploy event on your side to anchor an investigation to, which is why a dedicated, scheduled drift probe — run independently of production traffic, against a fixed reference set, compared statistically to a stored baseline — is the only reliable detection mechanism for this specific failure mode.</li>
+<li>In Spring, this discipline is implemented as a database-backed registry (versioned entities with lifecycle state), resolved at request time rather than hardcoded, with session records stamping the exact version set active at conversation start — the same architectural instincts already used for feature flags and configuration management, applied to prompts and model pins.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Chapter 5 of this volume continues the advanced/specialized arc by moving from managing change in a model or prompt you consume as a black box toward the deeper commitment of actually customizing model weights yourself — the governance, data, and evaluation discipline required once your organization starts fine-tuning or training components of the system directly, rather than only versioning the wrapper around someone else's model. Every registry, rollout, and rollback pattern built in this chapter becomes the substrate that discipline is built on top of, since a fine-tuned checkpoint is, in the end, simply one more versioned artifact moving through the same lifecycle.
+</p>
+
+</div>
+
+</body>
+</html>

@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>35-QUERY-KEY-AND-VALUE.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 11 — QUERY, KEY, AND VALUE</h1>
+
+<p class="roi">Volume 1 — AI Foundations · Chapter 8 of 22</p>
+
+<div class="callout">
+The Attention chapter gave you the <em>what</em>: a mechanism that lets every token look at every other token and decide, dynamically, which ones matter right now. This chapter gives you the <em>how</em> — the actual arithmetic machinery of Query, Key, and Value vectors that turns "attention" from a nice idea into something you can compute, differentiate, and implement in a training loop. If you have ever wondered why attention papers are covered in matrices labeled Q, K, and V, or why a database analogy keeps showing up in every tutorial, this chapter is where that vocabulary finally becomes precise enough to reason about edge cases, debug shapes, and eventually read Spring AI's own model-calling code with real understanding.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every mechanism you will meet later in this series that "pays attention" to something — a model deciding which retrieved document chunk is relevant (Volume 3), an agent deciding which tool result matters for its next step (Volume 4), a multimodal model aligning a caption with a region of an image — is, underneath, doing the same three-vector arithmetic you are about to learn in this chapter. Query, Key, and Value are not a transformer-specific curiosity; they are the general-purpose pattern for "computing a weighted combination of things based on relevance," and once you can compute it by hand for a four-word sentence, you will recognize it instantly in every architecture diagram for the rest of your career in this field.
+</p>
+
+<p>
+There is also a very practical reason to slow down here rather than treating attention as a black box you call through a library. The previous chapter established that attention lets a token "look at" other tokens and weight them by relevance. That sentence hides an enormous amount of engineering: <em>relevance according to what measure? weighted how, and combined into what?</em> If you cannot answer those two questions precisely, you cannot debug why a fine-tuned model attends to the wrong tokens, you cannot reason about why longer context windows are computationally expensive (the cost is quadratic specifically because of how Query and Key interact — Section 12 makes this concrete), and you will not understand why multi-head attention (next chapter) is described as "running several of these in parallel with different learned projections." Query, Key, and Value are the load-bearing nouns of the entire Transformer architecture; skipping past them is the single most common reason engineers who "know transformers" still cannot explain what a model is actually doing when it generates the next token.
+</p>
+
+<p>
+Finally, this is where the compression-based definition of intelligence from earlier in this volume gets its most concrete machinery. A model does not "understand" that "it" refers to "the animal" two sentences earlier because someone wrote a coreference-resolution rule. It computes a Query vector for the token "it," compares that Query against Key vectors for every earlier token using a similarity score, and lets the resulting attention weights pull information from the matching token's Value vector. Understanding is, quite literally, implemented as a weighted average selected by learned similarity — and once that clicks, a huge amount of what follows in this book (retrieval, embeddings, semantic search, agent memory) will feel like variations on a single theme rather than unrelated topics.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Before Q/K/V: Fixed-Weight Combination</h3>
+
+<p>
+Before attention existed in its current form, sequence models (recurrent neural networks — RNNs — and their gated variants, LSTMs and GRUs) processed a sequence one token at a time, carrying forward a single fixed-size "hidden state" vector that was supposed to summarize everything seen so far. When the model needed to produce an output — translate a sentence, for instance — it had to squeeze the entire meaning of a source sentence, no matter how long, into that one fixed-size vector, then decode from it. This is called the <strong>encoder bottleneck problem</strong>: a 3-word sentence and a 60-word sentence were both forced through the same size "pipe," and the further back in the sequence a piece of information sat, the more it got diluted or overwritten by the time the model needed it.
+</p>
+
+<h3>2.2 The First Attention Mechanisms (Bahdanau, 2014; Luong, 2015)</h3>
+
+<p>
+The first fix, introduced for neural machine translation, let the decoder look back at <em>all</em> of the encoder's hidden states at every decoding step, rather than relying on a single compressed summary. This early attention computed a relevance score between the decoder's current state and each encoder hidden state, turned those scores into weights, and produced a weighted sum — the "context vector" — to help decide the next output word. Crucially, this early formulation did not yet separate the concepts of Query, Key, and Value as three distinct, independently learned projections. The same hidden state vector was effectively playing multiple roles at once: it was compared for relevance <em>and</em> it was the thing being retrieved. This worked, but it conflated two jobs that, it turns out, benefit from being learned separately.
+</p>
+
+<h3>2.3 The Q/K/V Separation (Transformer, 2017)</h3>
+
+<p>
+The 2017 "Attention Is All You Need" paper made the decisive move covered in the previous chapter: it discarded recurrence entirely and made attention the <em>only</em> mechanism for mixing information across positions. To do that well, it introduced the explicit three-way split that gives this chapter its title: every token produces three separate vectors — a <strong>Query</strong> (what am I looking for?), a <strong>Key</strong> (what do I offer, for the purpose of being matched?), and a <strong>Value</strong> (what do I actually carry, if I am selected?) — each computed by its own learned linear projection of the same input embedding. This separation is the specific engineering insight this chapter is about: it is not enough to know "attention compares tokens for relevance"; you need to know that the comparison uses one learned representation (Key) while the payload transferred uses a completely different learned representation (Value), and the thing initiating the search uses yet a third (Query).
+</p>
+
+<h3>2.4 Where the Terminology Came From</h3>
+
+<p>
+The Query/Key/Value naming was deliberately borrowed from information retrieval and key-value databases, and that borrowing is not just a cute metaphor — it is mathematically exact, which is why Section 4 leans on it hard. A search engine matches your typed <strong>query</strong> against indexed <strong>keys</strong> (document titles, tags, terms) and, for the keys that match well, returns the associated <strong>values</strong> (the actual documents). Attention does precisely the same three-step dance, except every step is soft, differentiable, and learned rather than exact and hand-indexed — a difference that turns out to be the whole reason this mechanism can be trained end-to-end with gradient descent instead of built by hand.
+</p>
+
+<table>
+<tr><th>Era</th><th>How Relevance Was Computed</th><th>Roles Separated?</th><th>Limitation</th></tr>
+<tr><td>Plain RNN/LSTM (pre-2014)</td><td>Implicitly, inside a single recurrent hidden state</td><td>No — one vector did everything</td><td>Fixed-size encoder bottleneck; long-range information decays</td></tr>
+<tr><td>Bahdanau/Luong attention (2014-15)</td><td>Explicit relevance score between decoder state and each encoder state</td><td>Partially — a learned alignment function, but no separate Q/K/V projections</td><td>Query and Key roles conflated; still bolted onto an RNN</td></tr>
+<tr><td>Transformer self-attention (2017)</td><td>Learned dot-product between separately projected Query and Key vectors</td><td>Yes — Q, K, V are three independently learned linear projections</td><td>Quadratic cost in sequence length (Section 12)</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters:</strong> the Q/K/V split is not an arbitrary design choice you should memorize as trivia — it is the specific fix for the specific limitation of every attention mechanism that came before it. Every time you see an architecture that reuses this pattern in a new setting (cross-attention between an image encoder and a text decoder, retrieval-augmented generation's document scoring, agent memory lookup), ask yourself the same three questions this history teaches: what is playing the role of Query, what is playing the role of Key, and what is playing the role of Value? That question alone will let you decode unfamiliar architecture diagrams for the rest of this series.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Strip away the database metaphor and the history, and here is the precise engineering problem Query, Key, and Value solve:
+</p>
+
+<div class="callout">
+<strong>Given a sequence of token representations, compute, for every token, a new representation that is a relevance-weighted mixture of information from every other token — where "relevance" and "the information to mix" are both learned, not hand-specified, and the whole computation must be differentiable so it can be trained by gradient descent.</strong>
+</div>
+
+<p>
+Unpack the three separate jobs buried in that sentence, because conflating them is the single most common source of confusion for engineers new to this topic:
+</p>
+
+<ul>
+<li><strong>Job 1 — decide what I'm looking for.</strong> Every token, based on its own content, needs to express "here is the kind of information that would be useful to me right now." This becomes the <strong>Query</strong>.</li>
+<li><strong>Job 2 — decide how to advertise myself for matching.</strong> Every token needs to express "here is how other tokens should judge whether I am relevant to them." This becomes the <strong>Key</strong>.</li>
+<li><strong>Job 3 — decide what to actually hand over if selected.</strong> Every token needs to express "here is the actual content/information I contribute if someone decides I'm relevant to them." This becomes the <strong>Value</strong>.</li>
+</ul>
+
+<p>
+Notice the problem statement explicitly separates "how you get found" (Key) from "what you deliver once found" (Value). This is not a redundant design choice — a single token might need to be <em>easy to match against a broad range of queries</em> (a general-purpose Key) while <em>carrying very specific content</em> (a narrow, information-dense Value), or vice versa. Forcing one vector to do both jobs, as the pre-2017 attention mechanisms effectively did, limits how independently the model can optimize "matching" behavior from "content transfer" behavior. Query, Key, and Value being three separately learned linear projections is precisely what gives the model that independence.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Database Analogy, Made Precise</h3>
+
+<p>
+You have almost certainly written code against a key-value store — a <code>HashMap</code>, a Redis instance, an index lookup. In that world, retrieval is <strong>exact and hard</strong>: you supply a query key, the store checks it for exact (or exact-hash) equality against stored keys, and returns the value for the single matching key, or nothing at all. Attention performs the conceptually identical three-step operation, but makes every step <strong>soft, continuous, and differentiable</strong>:
+</p>
+
+<table>
+<tr><th>Step</th><th>Classic Key-Value Store (e.g. HashMap)</th><th>Attention (Q/K/V)</th></tr>
+<tr><td>1. Compare</td><td>Exact equality check: does query key == stored key?</td><td>Similarity score: dot product between Query vector and each Key vector (a real-valued number, not true/false)</td></tr>
+<tr><td>2. Select</td><td>Binary: exactly one match wins (or none)</td><td>Soft: every Key gets a nonzero weight via softmax; "selection" is a probability distribution over all tokens, not a single winner</td></tr>
+<tr><td>3. Retrieve</td><td>Return the single matched Value, unchanged</td><td>Return a weighted sum of <em>all</em> Value vectors, weighted by the softmax probabilities from step 2</td></tr>
+</table>
+
+<p>
+That single table is, in a very real sense, the entire Q/K/V mechanism. Everything else in this chapter is either justifying why it works this way, or working out the arithmetic and engineering consequences of doing it this way at scale. Hold onto the phrase "soft, differentiable dictionary lookup" — it is the most useful one-sentence mental model you will carry out of this chapter.
+</p>
+
+<h3>4.2 Why Three Separate Projections, Not One Shared Vector?</h3>
+
+<p>
+Recall from the Embeddings chapters earlier in this volume that a token's input representation is a single vector capturing its meaning in context up to that point. If attention used that raw embedding directly for comparison <em>and</em> for the content being transferred, the model would have no way to separately tune "how should this token be found" from "what should this token deliver once found." The fix is elegant: apply three different learned weight matrices to the same input embedding, producing three different vectors:
+</p>
+
+<pre>
+Input embedding for token x  (dimension d_model)
+        │
+        ├──► × W_Q  ──►  Query vector  q   (dimension d_k)
+        │
+        ├──► × W_K  ──►  Key vector    k   (dimension d_k)
+        │
+        └──► × W_V  ──►  Value vector  v   (dimension d_v)
+
+W_Q, W_K, W_V are learned during training — nobody hand-designs them.
+The SAME input embedding produces three DIFFERENT vectors because
+each weight matrix projects it into a different learned "purpose."
+</pre>
+
+<p>
+Because <code>W_Q</code>, <code>W_K</code>, and <code>W_V</code> are learned independently via backpropagation (the same mechanism covered in the Neural Networks foundations of this volume), the model discovers, purely from data, what makes a good "search query" representation versus a good "advertise yourself for matching" representation versus a good "actual payload" representation — for the specific task of predicting the next token well. Nobody tells the model "Keys should encode part-of-speech" or "Values should encode semantic role"; those behaviors, when they emerge, are discovered because they reduce the training loss, exactly as the "dial-turning" analogy from earlier in this volume described.
+</p>
+
+<h3>4.3 Self-Attention vs. Cross-Attention: Where Q, K, V Come From Matters</h3>
+
+<p>
+One distinction trips up almost everyone the first time: in <strong>self-attention</strong> (the kind used inside a single Transformer encoder or decoder block, and the focus of this chapter), the Query, Key, and Value all come from projections of the <em>same</em> sequence — every token attends to tokens within its own sequence. In <strong>cross-attention</strong> (used, for example, when a decoder attends to an encoder's output in an encoder-decoder architecture, or when a multimodal model aligns text tokens against image patches), the Query comes from one sequence while the Key and Value come from a <em>different</em> sequence. The arithmetic — dot product, softmax, weighted sum — is identical in both cases. Only the <em>source</em> of the three vectors changes. This is worth internalizing now, because Retrieval-Augmented Generation in Volume 3 is best understood as an approximate, external form of exactly this cross-attention idea: the user's query plays the Query role, document embeddings play the Key role, and document content plays the Value role — except computed once via a vector database instead of once per forward pass inside the model.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Here is the mechanism end to end, in the order it actually executes, using a concrete four-token sentence so you can trace real numbers through it rather than staying at the symbolic level.
+</p>
+
+<h3>5.1 Step-by-Step Walkthrough</h3>
+
+<p>
+Take the sentence <em>"The cat sat down."</em> tokenized (simplified) into four tokens: <code>The</code>, <code>cat</code>, <code>sat</code>, <code>down</code>. Assume each token already has an input embedding (from the earlier Embeddings chapters) enriched with positional information (covered in the Positional Encoding chapter). The self-attention computation proceeds as follows:
+</p>
+
+<ol>
+<li><strong>Project every token into Q, K, V.</strong> For each of the four tokens, multiply its embedding by the shared, learned matrices <code>W_Q</code>, <code>W_K</code>, <code>W_V</code>. You now have four Query vectors (q1..q4), four Key vectors (k1..k4), and four Value vectors (v1..v4). Note: the projection matrices are shared across positions — the same <code>W_Q</code> is applied to every token — but because each token's input embedding differs, each token still ends up with its own distinct q, k, and v.</li>
+<li><strong>Score every Query against every Key.</strong> To compute the new representation for <code>sat</code>, take its Query vector <code>q3</code> and compute a dot product against every Key in the sequence: <code>q3·k1</code>, <code>q3·k2</code>, <code>q3·k3</code>, <code>q3·k4</code>. A dot product is large when two vectors point in a similar direction — so this step produces one raw relevance score per token, measuring "how much does this token's Key resemble what <code>sat</code>'s Query is looking for."</li>
+<li><strong>Scale.</strong> Divide every raw score by the square root of the Key dimension, <code>√d_k</code>. Section 6 explains precisely why this specific constant, and what breaks numerically if you skip it.</li>
+<li><strong>Normalize with softmax.</strong> Turn the four scaled scores into a probability distribution — four non-negative numbers that sum to 1 — using the softmax function. This is what makes the selection "soft": every token receives some weight, not just the single best match, but the weights concentrate sharply on whichever tokens scored highest.</li>
+<li><strong>Weighted sum of Values.</strong> Multiply each Value vector by its corresponding softmax weight and sum them: <code>output_sat = w1·v1 + w2·v2 + w3·v3 + w4·v4</code>. This weighted sum <em>is</em> the new, context-aware representation for the token <code>sat</code> — it is no longer just "sat" in isolation, it is "sat, informed by whichever other tokens in the sentence turned out to be relevant to it."</li>
+<li><strong>Repeat for every token, in parallel.</strong> The same five steps run independently and simultaneously for <code>The</code>, <code>cat</code>, and <code>down</code>, each using its own Query but the same shared set of Keys and Values from the whole sequence. This full parallelism (no token has to wait for another to finish) is precisely what makes Transformers dramatically more GPU-friendly than the strictly sequential RNNs they replaced.</li>
+</ol>
+
+<h3>5.2 Reasoning Through an Edge Case</h3>
+
+<p>
+What happens if a token has genuinely nothing useful to attend to elsewhere — a rare word, or the very first token in a sequence with no prior context? The mechanism does not fail or produce an error; softmax always produces a full probability distribution, so the token still receives a weighted sum, typically dominated by attending strongly to itself (a token's Query commonly matches its own Key well, since both are derived from the same embedding). This is why you will hear that "attention includes self-attention to the token itself" almost by default — it falls out of the mechanism, not because of any special-cased rule.
+</p>
+
+<p>
+A second edge case worth reasoning through: what happens at generation time (decoding), when the model must not be allowed to attend to future tokens it hasn't generated yet? This is handled by <strong>masking</strong> — before the softmax step, positions that should be invisible (future tokens, in a decoder) have their raw scores forced to negative infinity, so after softmax their weight becomes exactly zero. The arithmetic pipeline in Section 5.1 is unchanged; masking simply zeroes out entries in the score matrix before normalization. This single trick, applied to the score matrix produced from Q and K, is what turns bidirectional self-attention (used in encoders, and in understanding tasks) into causal self-attention (used in autoregressive decoders like GPT-family models) — the distinction that later chapters on decoder-only architectures will build on directly.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+The intuition from Sections 4 and 5 already contains all the mathematics you need conceptually. This section formalizes it just enough to read a paper or a codebase without translation friction, and to answer the two questions interviewers ask most often about this mechanism: why a dot product, and why scaled.
+</p>
+
+<h3>6.1 The Core Formula</h3>
+
+<p>
+For a sequence with Query matrix <code>Q</code>, Key matrix <code>K</code>, and Value matrix <code>V</code> (each row is one token's vector, stacked into a matrix so the whole sequence is computed in one matrix multiplication rather than token-by-token), the entire mechanism from Section 5 compresses into one line:
+</p>
+
+<pre>
+Attention(Q, K, V) = softmax( (Q · K^T) / √d_k ) · V
+
+Where:
+  Q     is an (n × d_k) matrix — n tokens, each a Query vector of dimension d_k
+  K     is an (n × d_k) matrix — n tokens, each a Key vector of dimension d_k
+  V     is an (n × d_v) matrix — n tokens, each a Value vector of dimension d_v
+  K^T   is K transposed, so Q · K^T is an (n × n) matrix of raw relevance scores —
+        entry (i, j) is how much token i's query matches token j's key
+  √d_k  is the scaling constant (Section 6.2)
+  softmax is applied row-wise, so each row of the (n × n) matrix becomes a
+        valid probability distribution summing to 1
+</pre>
+
+<p>
+Read this formula left to right and it is literally Section 5's five steps written compactly: <code>Q·K^T</code> is "score every Query against every Key" (steps 2), dividing by <code>√d_k</code> is "scale" (step 3), <code>softmax</code> is "normalize" (step 4), and multiplying the result by <code>V</code> is "weighted sum of Values" (step 5). Nothing new is being introduced here — this is notation for something you already understand mechanically.
+</p>
+
+<h3>6.2 Why the Dot Product?</h3>
+
+<p>
+A dot product between two vectors measures both how aligned their directions are and how large their magnitudes are. Two vectors pointing in a similar direction produce a large positive dot product; orthogonal vectors produce roughly zero; opposite directions produce a large negative number. This makes the dot product a computationally cheap, differentiable stand-in for "how similar are these two learned representations" — exactly the notion of similarity you need for a Query to find its most relevant Keys. It is also simply a matrix multiplication, which GPUs and TPUs are extraordinarily optimized to execute in parallel, which is a major reason this specific similarity function was chosen over more expressive but slower alternatives (like a small neural network computing similarity, which the original 1990s-era attention mechanisms sometimes used).
+</p>
+
+<h3>6.3 Why Divide by √d_k? (The Scaling in "Scaled Dot-Product Attention")</h3>
+
+<p>
+This is a subtlety worth understanding precisely, because it is a favorite interview question. As the dimension <code>d_k</code> of the Query and Key vectors grows, a dot product between two random vectors of that dimension grows in expected magnitude roughly proportional to <code>d_k</code> itself — more dimensions means more terms summed, and the variance of that sum grows with dimension. When raw dot-product scores become very large in magnitude, the softmax function saturates: it pushes almost all probability mass onto whichever single score is largest, making the resulting distribution nearly one-hot rather than smoothly weighted. A softmax operating on saturated inputs also has extremely small gradients almost everywhere (the well-known "vanishing gradient" problem, applied here to the attention weights specifically), which makes training slow or unstable. Dividing every score by <code>√d_k</code> counteracts the growth in variance caused by higher dimensions, keeping the softmax input in a numerically well-behaved range regardless of how large <code>d_k</code> is chosen — this is precisely why the mechanism is formally named <strong>Scaled Dot-Product Attention</strong>, and the "scaled" is not decorative, it is load-bearing.
+</p>
+
+<h3>6.4 Parameter Counting (Why This Matters for Cost)</h3>
+
+<p>
+Each of <code>W_Q</code>, <code>W_K</code>, <code>W_V</code> is a learned matrix of size roughly <code>d_model × d_k</code> (or <code>d_model × d_v</code> for the Value projection). For a model with <code>d_model = 768</code> (a common size for smaller Transformer encoders) and <code>d_k = d_v = 64</code> per attention head, each projection matrix has on the order of <code>768 × 64 ≈ 49,000</code> parameters, and this is multiplied by the number of attention heads and the number of layers stacked in the full model — which is why even the Query/Key/Value projections alone, before you count the feed-forward layers, account for a substantial fraction of a Transformer's total parameter budget. This becomes directly relevant in Volume 2 and beyond when you reason about model size, memory footprint, and why larger context windows and larger hidden dimensions increase cost non-trivially.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Full Q/K/V Pipeline for One Token</h3>
+
+<pre>
+                         TOKEN: "sat"  (embedding x3, one row vector)
+
+        x3 ──────┬───────────────┬───────────────┬─────────────
+                  │               │               │
+                  ▼               ▼               ▼
+              × W_Q           × W_K           × W_V
+                  │               │               │
+                  ▼               ▼               ▼
+                 q3              k3              v3
+          (query vector)   (key vector)     (value vector)
+
+
+  Now q3 is compared against EVERY token's key in the sequence:
+
+     q3 · k1  ──►  score_1   ("The")
+     q3 · k2  ──►  score_2   ("cat")
+     q3 · k3  ──►  score_3   ("sat"  — itself)
+     q3 · k4  ──►  score_4   ("down")
+
+              scores ÷ √d_k  ──►  scaled scores
+
+              softmax(scaled scores)  ──►  w1, w2, w3, w4
+                                            (sum to 1.0, e.g. 0.05, 0.55, 0.30, 0.10)
+
+  Final output for "sat" = w1·v1 + w2·v2 + w3·v3 + w4·v4
+
+  Interpretation of the example weights above: when computing the new
+  representation for "sat", the model leans heavily on "cat" (w2 = 0.55) —
+  plausible, since "cat" is the subject performing the action "sat" — while
+  still drawing a little from every other token.
+</pre>
+
+<h3>7.2 The Full (n × n) Attention Matrix for the Whole Sentence</h3>
+
+<pre>
+                  Attending TO (Keys) ──────────────────►
+                  The      cat      sat      down
+             ┌─────────────────────────────────────────┐
+   Q  The    │  0.70     0.10     0.10     0.10         │
+   u  cat    │  0.15     0.60     0.15     0.10         │
+   e  sat    │  0.05     0.55     0.30     0.10         │
+   r  down   │  0.05     0.15     0.50     0.30         │
+   y         └─────────────────────────────────────────┘
+   (Queries)
+
+  Each ROW is one token's Query, matched against every Key (columns).
+  Each row sums to exactly 1.0 — this is the softmax constraint from
+  Section 6.1. Row "down" attending 0.50 to "sat" is exactly the kind of
+  pattern trained Transformers learn on their own: "down" (an adverb
+  modifying the verb) leans most heavily on "sat" (the verb it modifies),
+  without anyone hand-coding a grammar rule to make that happen.
+
+  This entire matrix is produced by ONE matrix multiplication, Q · K^T,
+  followed by row-wise softmax — the (n × n) shape is exactly why cost
+  grows quadratically with sequence length n (Section 12).
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+As an application engineer calling models through Spring AI, you will never hand-implement Q/K/V projections — that arithmetic lives entirely inside the foundation model, executed on the provider's (or your self-hosted) GPU infrastructure. But understanding exactly where this computation sits in the request lifecycle explains several production-facing realities you will encounter directly: why longer prompts cost more and respond slower, why "context window" is a hard architectural limit rather than a configuration knob, and why techniques like retrieval (Volume 3) and prompt compression exist as engineering responses to this specific cost curve.
+</p>
+
+<pre>
+  Your Spring Boot Service                    Model Provider Infrastructure
+  ─────────────────────────                   ──────────────────────────────
+  ChatClient.prompt()
+        │  builds request with
+        │  full prompt text
+        ▼
+  HTTP request  ───────────────────────►   Tokenizer
+  (system + user + context,                    │
+   the full text the model sees)               ▼
+                                          Embedding lookup + positional encoding
+                                                │
+                                                ▼
+                                    ┌──────────────────────────┐
+                                    │  For EACH Transformer      │
+                                    │  layer (dozens of them):   │
+                                    │                            │
+                                    │   compute Q, K, V for       │
+                                    │   every token in the        │  ◄── THIS chapter's
+                                    │   full input sequence       │      mechanism, run
+                                    │                            │      per layer, per
+                                    │   compute (n × n) attention │      attention head
+                                    │   matrix, weighted sum      │
+                                    │                            │
+                                    │   feed-forward network      │
+                                    └──────────────────────────┘
+                                                │
+                                                ▼
+                                     Next-token probability distribution
+                                                │
+                                                ▼
+  HTTP streaming response  ◄───────────────────┘
+        │
+        ▼
+  Advisor chain (logging, memory, guardrails)
+        │
+        ▼
+  Your application logic
+</pre>
+
+<p>
+The box labeled "compute Q, K, V for every token" is where your entire input — system prompt, conversation history, retrieved documents, tool definitions, everything the ChatClient assembled into the request — gets turned into the (n × n) attention computation described in Section 7.2, once per layer, once per attention head (next chapter), for every single token you sent. This is the concrete, mechanical reason "keep your prompts as lean as relevance allows" is not a style preference in production AI Engineering — it is a direct lever on the size of <code>n</code> in an <code>O(n²)</code> computation happening on someone's (possibly your own) GPU bill.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+You will not write Q/K/V matrix multiplications in Java — that computation happens inside the model, whether it's called via a hosted API or run locally through something like ONNX Runtime or a native inference server. What you, as a Spring AI engineer, control is the <em>input sequence</em> that gets fed into that attention mechanism, and understanding the mechanism changes how you think about several very concrete decisions in your code.
+</p>
+
+<table>
+<tr><th>Spring AI / Java Concept</th><th>How the Q/K/V Mechanism Explains It</th></tr>
+<tr><td><code>ChatClient.prompt().messages(...)</code> assembling system, user, and history messages</td><td>Every token across all of these messages becomes part of the single sequence over which Q, K, and V are computed — there is no structural separation once it reaches attention; message boundaries are just more tokens the model learned to interpret.</td></tr>
+<tr><td><code>ChatMemory</code> (conversation history management)</td><td>Every prior turn kept in memory directly increases <code>n</code>, the sequence length attention scores scale quadratically with — this is precisely why memory truncation/summarization strategies exist, covered fully in the Spring AI memory chapters.</td></tr>
+<tr><td>Advisors that inject retrieved context (RAG, covered in Volume 3) before the call</td><td>Retrieved chunks become additional tokens the Query of every generated token can attend to — an Advisor that retrieves too many or too-large chunks is, mechanically, inflating the same <code>n</code> that drives attention cost.</td></tr>
+<tr><td><code>PromptTemplate</code> and careful prompt construction</td><td>Every token of boilerplate in a template (verbose instructions, repeated formatting scaffolding) is a token competing for attention weight against your actually relevant content in the softmax of Section 6.1 — lean prompts are not just cheaper, they can measurably change which tokens the model attends to most.</td></tr>
+<tr><td>Streaming responses (<code>Flux&lt;ChatResponse&gt;</code>)</td><td>Because generation is autoregressive with causal (masked) self-attention (Section 5.2), each new token's Query only ever attends to Keys/Values from tokens already generated — this is why streaming a response token-by-token is architecturally natural rather than a display trick.</td></tr>
+</table>
+
+<p>
+The practical takeaway for a Spring engineer: every abstraction Spring AI gives you for shaping what goes into a model call — message roles, advisors, memory windows, retrieval filters — exists to control the size and quality of the token sequence that this chapter's mechanism has to run attention over. Treat context assembly with the same discipline you would treat constructing a SQL query against a huge table without an index: what you include in the "WHERE clause" of your prompt determines both cost and correctness of what comes back.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Think in terms of "what is this token trying to find" whenever you evaluate model behavior.</strong> When a model attends to the wrong part of a long prompt, the useful debugging question is "what would this token's Query plausibly be matching against here," not "why is the model dumb" — it reframes prompt debugging as a relevance-matching problem you can actually reason about.</li>
+<li><strong>Keep the highest-relevance information dense and unambiguous, since Keys are what get matched against.</strong> Vague, redundant phrasing produces Key representations that match many Queries weakly rather than one Query strongly — this is a mechanistic reason (not just a style reason) why precise prompts and precise retrieved-document chunking (Volume 3) outperform verbose ones.</li>
+<li><strong>Remember that self-attention treats every token in-sequence as a peer, regardless of source.</strong> System instructions, user text, and retrieved/tool content all end up as Keys and Values in the same pool — architecturally, the model has no hard firewall between "trusted instruction" and "untrusted content," which is directly why prompt injection (covered in the Security Considerations section here and in depth in Volume 5) is a structural property of this mechanism, not a bug that will be patched away.</li>
+<li><strong>When reasoning about context window trade-offs, remember cost is driven by the (n × n) score matrix, not just token count linearly.</strong> Doubling your prompt length roughly quadruples the attention computation for that layer — a mental model that will make Volume 5's cost-optimization guidance click immediately rather than feeling arbitrary.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Believing "attention" means the model looks at one most-relevant token.</strong> Softmax never produces a hard, one-hot selection in practice (it approaches one only in extreme, saturated cases) — attention output is always a blend of many tokens' Values, weighted, not a single lookup. Engineers who model this as "the model picks the best match" misunderstand why models can be influenced by seemingly irrelevant context.</li>
+<li><strong>Confusing Key and Value as the same thing.</strong> It is extremely common for newcomers to assume "the model matches a query against content and returns that content" — collapsing Key and Value into one idea. The entire point of the historical development in Section 2 was separating "how you get matched" from "what you deliver," and conflating them again erases exactly the insight that made the 2017 Transformer design better than what preceded it.</li>
+<li><strong>Assuming more context always helps because "the model can just attend to what's relevant."</strong> This ignores two real costs: quadratic compute growth (Section 12), and the fact that irrelevant tokens still receive nonzero softmax weight and can measurably dilute or distract from the tokens that matter — a phenomenon sometimes called "attention dilution" or "context distraction" in the RAG and long-context literature.</li>
+<li><strong>Treating the scaling factor √d_k as a minor implementation detail.</strong> Interviewers specifically probe this because engineers who haven't internalized Section 6.3 will describe attention correctly but be unable to explain why removing the scaling would break training at larger head dimensions — a strong signal of surface-level rather than mechanistic understanding.</li>
+<li><strong>Assuming causal masking is a separate mechanism from attention rather than a modification of the same score matrix.</strong> This leads to confusion later when reading about encoder-only (bidirectional) vs. decoder-only (causal) architectures — both use the exact same Q/K/V/softmax pipeline; only the mask applied to the score matrix before softmax differs.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+The single most important performance fact about this mechanism, and one every AI engineer needs internalized at a reflex level, is this:
+</p>
+
+<div class="callout">
+<strong>Self-attention's compute and memory cost grows quadratically, O(n²), with sequence length n</strong> — because the Q·K^T score matrix at the heart of Section 6.1 has one entry for every pair of tokens in the sequence.
+</div>
+
+<p>
+Concretely, doubling the number of tokens in your prompt (system message + history + retrieved context + user message) does not double the attention workload for that layer — it roughly quadruples it, because both the number of Queries and the number of Keys being compared against doubled. This single fact explains an enormous amount of downstream AI Engineering practice:
+</p>
+
+<ul>
+<li><strong>Why context windows are advertised in tokens, and why bigger windows are disproportionately expensive to serve</strong> — a provider offering a 200K-token context window is committing to infrastructure that can handle a score matrix with on the order of 40 billion entries per attention head, per layer, for a maximally-long request.</li>
+<li><strong>Why retrieval (Volume 3) beats "just paste the whole knowledge base into the prompt."</strong> Retrieving the 5 most relevant chunks instead of feeding in 500 documents is not merely about relevance — it is a direct, deliberate reduction of <code>n</code> to keep the O(n²) cost tractable and keep the softmax distribution from being diluted across irrelevant tokens.</li>
+<li><strong>Why techniques like KV-caching exist at inference time.</strong> During autoregressive generation, the Key and Value vectors for already-generated tokens do not need to be recomputed at every new step — production inference engines cache them and only compute Q/K/V for the newest token, turning what would be repeated O(n²) work across a whole generation into a much cheaper incremental cost. You will not implement this yourself, but it explains why inference servers report metrics like "KV-cache hit rate" and why memory (not just compute) is often the binding constraint on how many concurrent requests a GPU can serve.</li>
+<li><strong>Why research into sub-quadratic and sparse attention variants (e.g., limiting how many Keys a Query is compared against) exists</strong> — it is a direct engineering response to this exact cost curve, motivated by nothing more exotic than "O(n²) becomes painful once n is large."</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+This chapter has a narrower, but real, security surface — it is worth being honest that Q/K/V arithmetic itself is not where most AI security incidents originate (that is more squarely Volume 5's territory), but it is the structural reason one specific class of vulnerability exists at all. Because self-attention treats every token in the input sequence as a peer competing for relevance — system instructions, retrieved documents, tool outputs, and user text all become Keys and Values in the exact same pool, exactly as Section 10 noted — the model has no built-in, tamper-proof mechanism analogous to a parameterized SQL query that keeps "trusted instruction" cryptographically separate from "untrusted data." A cleverly crafted piece of retrieved or user-supplied text can produce a Key/Value pair that a later token's Query matches strongly against, effectively hijacking the attention weighting in the attacker's favor. This is the mechanistic root of <strong>prompt injection</strong>, which Volume 5 covers as a full engineering discipline (input sanitization, privilege separation between instruction and data channels, output validation) — but understanding it starts here, at the level of "there is no hard-coded rule inside softmax that says system-prompt tokens must always outweigh untrusted-content tokens."
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. In your own words, what do Query, Key, and Value each represent in the attention mechanism?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The Query represents what a given token is "looking for" — the kind of information that would be useful to it. The Key represents how a token advertises itself for being matched against other tokens' queries. The Value represents the actual content/information a token contributes if it is selected as relevant. All three are produced by applying three separate learned linear projections (weight matrices) to the same input embedding.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why is the database key-value lookup analogy useful, and where does it break down?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It's useful because the three-step process — compare a query against keys, then retrieve associated values — is structurally identical. It breaks down in that a classic key-value store performs an exact, hard match returning exactly one value (or none), while attention performs a soft, differentiable match: every key gets a nonzero relevance weight via softmax, and the "retrieved" result is a weighted sum of ALL values, not a single one.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Walk through the full mathematical pipeline from Q, K, V matrices to the final attention output.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Compute raw relevance scores as the matrix product of Q and the transpose of K (Q·K^T), giving an n×n matrix where entry (i,j) measures how well token i's query matches token j's key. Scale every entry by dividing by the square root of the key dimension, √d_k, to control variance growth. Apply softmax row-wise so each token's scores become a valid probability distribution summing to 1. Multiply this weighted matrix by V to get a weighted sum of value vectors — the final context-aware output representation for every token, computed for the whole sequence in one set of matrix multiplications.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why do Query, Key, and Value need to be three separate learned projections rather than reusing the same vector for all three roles?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Each role optimizes for a different job: the Query needs to encode "what I'm looking for," the Key needs to encode "how I should be matched against," and the Value needs to encode "what I actually deliver if selected." A token might benefit from being easy to match against a broad range of queries (a general Key) while carrying very specific, dense content (a narrow Value) — forcing one vector to satisfy all three jobs limits how independently the model can optimize matching behavior from content-transfer behavior, which is precisely the limitation that pre-Transformer attention (Bahdanau/Luong) had, since it did not fully separate these roles.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Explain precisely why attention scores are divided by √d_k, and what would go wrong if this scaling were removed.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>As the dimension d_k grows, the dot product between two vectors of that dimension has expected magnitude that grows with d_k (more terms summed into the dot product increases its variance). Without scaling, raw attention scores for larger d_k can become very large in magnitude, which pushes softmax into a saturated regime — the output becomes close to one-hot (nearly all weight on the single largest score) and, critically, the gradients of softmax in that saturated regime become extremely small almost everywhere. This slows or destabilizes training via vanishing gradients specifically in the attention weights. Dividing by √d_k counteracts the variance growth from higher dimensionality, keeping scores in a numerically well-behaved range regardless of the chosen dimension — this is why the mechanism is formally called Scaled Dot-Product Attention.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly connect this to training dynamics, not just numerical stability — mention that saturated softmax produces near-zero gradients, which is the actual mechanism by which skipping the scaling would hurt learning, not just "the numbers get big." This signals you understand the interaction between this specific design choice and backpropagation, not just the forward-pass arithmetic.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. How does self-attention differ from cross-attention in terms of where Q, K, and V come from, and where does this distinction matter in real systems?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>In self-attention, Q, K, and V are all projections of the same sequence — every token attends to tokens within its own sequence. In cross-attention, the Query comes from one sequence while the Key and Value come from a different sequence (for example, a decoder's Query attending to an encoder's output Key/Value in an encoder-decoder architecture, or a text decoder attending to image-patch Keys/Values in a multimodal model). The underlying dot-product/softmax/weighted-sum arithmetic is identical in both cases; only the source of the vectors differs. This distinction matters directly in Retrieval-Augmented Generation: it can be understood as an approximate, externalized form of cross-attention, where the user query plays the Query role, document embeddings play the Key role (compared via vector similarity search instead of an in-model dot product), and document content plays the Value role — computed once via a vector database rather than recomputed inside every forward pass.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q7. Why does self-attention cost grow quadratically with sequence length, and what production techniques exist to manage that cost?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The core score matrix, Q·K^T, has shape (n × n) for a sequence of n tokens — it contains one entry for every pair of tokens, so both compute and memory for this step scale with n². Production mitigations include: retrieval (feeding in only the most relevant chunks instead of an entire knowledge base, directly shrinking n), conversation memory summarization/truncation instead of unbounded history, KV-caching during autoregressive generation (caching already-computed Key/Value vectors for prior tokens so only the newest token's Q/K/V needs computing at each generation step), and architectural research into sparse or sub-quadratic attention variants that limit how many Keys a given Query is compared against.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. A team wants to feed an entire 300-page internal knowledge base directly into every prompt instead of building a retrieval pipeline, arguing "the model can attend to what's relevant automatically." How do you respond from a Q/K/V-mechanism standpoint?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Push back on the framing that "attend to what's relevant" is free or lossless. Mechanically, every token in the 300 pages becomes part of the same Key/Value pool the model's Queries compare against; the compute and memory cost of the Q·K^T score matrix grows quadratically with that sequence length, meaning cost and latency scale far worse than linearly with document count, and many providers' context windows would be exceeded entirely. Even where it technically fits, softmax still distributes some nonzero weight across every irrelevant token, which measurably dilutes the attention mass available for the genuinely relevant passages — a documented cause of degraded accuracy on long-context tasks, sometimes described as "lost in the middle" behavior. The staff-level recommendation is to build a retrieval layer (Volume 3) that pre-filters to a small, high-relevance set of chunks before the prompt is assembled — this keeps the sequence length the attention mechanism has to process small, keeps cost predictable and roughly linear in query volume rather than blowing up with knowledge-base size, and empirically produces better answer quality than relying on attention alone to find the needle in an enormous, mostly-irrelevant haystack.</p>
+</div>
+
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, without using the words "query," "key," or "value," what problem the three-way projection split solves that a single shared vector for comparison-and-content could not. Use your own analogy, different from the database one used in this chapter.</li>
+<li>The chapter states that causal masking is "a modification of the score matrix, not a separate mechanism." Trace through Section 6.1's formula and explain exactly where the mask would be applied and why applying it before softmax (rather than after) is essential for it to work correctly.</li>
+<li>A colleague claims "attention lets the model look up facts, the same way a database lookup does." Using the distinction between hard and soft retrieval from Section 4.1, explain precisely what is wrong with this claim and what a more accurate one-sentence description would be.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>By hand or in a spreadsheet, take four short "embedding" vectors of dimension 4 (you can invent simple numbers) for four tokens of a short sentence. Apply three different small weight matrices (you can also invent these, keeping them simple, e.g. identity-like matrices with small perturbations) to produce Q, K, and V for each token. Compute the (4×4) score matrix, scale by √4 = 2, apply softmax row-wise (approximate by hand or with a calculator), and compute the final weighted-sum output for one token. Compare the resulting attention weights to what you would intuitively expect given the sentence's meaning.</li>
+<li>Using any publicly available tool that visualizes transformer attention weights for a real sentence (many exist as browser-based demos), find a case where a token attends most strongly to a grammatically or semantically sensible other token (e.g., a pronoun attending to its antecedent). Screenshot or record the attention weights, and write two sentences connecting what you observed to Section 7.2's attention matrix diagram.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Query, Key, and Value are three separately learned linear projections of the same input embedding, each serving a distinct role: Query is "what I'm looking for," Key is "how I get matched," and Value is "what I deliver if selected."</li>
+<li>Attention is best understood as a <strong>soft, differentiable dictionary lookup</strong>: unlike a hash map's exact match returning one value, every Key receives a nonzero relevance weight via softmax, and the output is a weighted sum of all Values, not a single retrieved item.</li>
+<li>The full mechanism compresses into one formula, <code>Attention(Q,K,V) = softmax(QK^T / √d_k) · V</code> — every symbol in it maps directly onto the step-by-step process of scoring, scaling, normalizing, and weighted-summing covered in Section 5.</li>
+<li>The √d_k scaling factor is not cosmetic — it prevents softmax saturation and the resulting vanishing gradients as the Key/Query dimension grows, which is essential for stable training.</li>
+<li>Self-attention's cost grows quadratically, O(n²), with sequence length, because the score matrix has one entry per pair of tokens — this single fact is the mechanistic justification for retrieval, memory truncation, and KV-caching as production engineering practices covered later in this series.</li>
+<li>Because every token in a sequence — trusted instruction or untrusted content alike — becomes a Key/Value candidate in the same undifferentiated pool, this mechanism is the structural root cause of prompt injection, a topic Volume 5 treats as a full engineering discipline.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Multi-Head Attention (Chapter 12) takes the single Query/Key/Value pipeline built in this chapter and runs several differently-projected copies of it in parallel within the same layer, letting the model attend to different kinds of relationships — syntax, coreference, semantic similarity — simultaneously rather than being forced to compress all of them into one shared attention pattern. Everything mechanical from this chapter carries over unchanged; multi-head attention is this chapter's formula, run several times per layer with different learned weights, then recombined.
+</p>
+
+</div>
+
+</body>
+</html>

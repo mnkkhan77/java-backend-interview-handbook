@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>149-MODEL-QUANTIZATION-AND-LOCAL-DEPLOYMENT.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 89 — MODEL QUANTIZATION &amp; LOCAL DEPLOYMENT</h1>
+
+<p class="roi">Volume 7 — Advanced &amp; Specialized Topics · Chapter 2 of 6</p>
+
+<div class="callout">
+Every chapter you have read so far that touched a language model — from Spring AI's <code>ChatModel</code> abstraction in Chapter 27 through evaluation, agents, guardrails, and enterprise compliance — assumed the model itself lives somewhere else: behind a hosted API, billed per token, reachable over HTTPS. That assumption is convenient and, for a large share of production systems, correct. But it quietly breaks down under four pressures that every engineer eventually runs into: cost that scales linearly with volume until it dwarfs your infrastructure budget, latency that cannot beat a network round trip to someone else's data center, data residency and compliance rules that forbid sending certain content off-premises at all, and environments — an air-gapped facility, a battery-powered edge device, a laptop on a plane — with no network path to a hosted API in the first place. The moment any of those pressures apply, you must run the model yourself. Doing that responsibly requires two things this chapter teaches together: shrinking a model's weights enough to fit the hardware you actually have (quantization), and choosing and operating an inference server that can serve those shrunk weights efficiently (local deployment). Skip either half and you either can't load the model at all, or you load it and discover it serves one request every four seconds.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Consider the arithmetic a Spring AI engineer runs into the first time a finance or product lead asks "why does our per-request LLM cost keep climbing faster than our user count?" A hosted frontier model might cost somewhere in the range of a few dollars per million tokens. At modest scale that is a rounding error. At the scale of a feature processing millions of requests a day — document summarization, embedding generation, classification, internal copilots — the same per-token price multiplies into a line item large enough to threaten the feature's business case entirely, even though the underlying compute cost of running a smaller, purpose-fit model on owned or reserved hardware would be a fraction of that. This is the same "capability vs. cost" tension you have seen since the earliest chapters of this book, just now applied to infrastructure ownership rather than prompt design.
+</p>
+
+<p>
+Cost is only the first of four independent reasons this chapter matters. <strong>Latency</strong>: a hosted API call is bounded below by a network round trip plus queueing on someone else's shared infrastructure — a local model on local hardware can respond in single-digit milliseconds for small requests, which matters for real-time features (autocomplete, voice pipelines, trading signals) where a 300ms hosted round trip is simply too slow regardless of price. <strong>Data residency and compliance</strong>: Chapter 75 covered the regulatory apparatus around where and how AI decisions are evidenced; for some organizations — healthcare systems bound by data-locality rules, defense contractors, financial institutions in certain jurisdictions — the simplest way to satisfy "this data must never leave our network boundary" is to never send it anywhere, which means the model has to come to the data instead of the data going to the model. <strong>Offline and edge operation</strong>: a manufacturing floor with no reliable uplink, a field application for disaster response, or a privacy-conscious consumer app that must function with the device unplugged from the network all require inference that happens entirely locally, with no fallback to a remote call.
+</p>
+
+<p>
+None of these four reasons work if the model in question requires hardware you don't have. A 70-billion-parameter model stored at its native training precision needs roughly 140 GB of memory just to hold its weights — beyond what all but the most expensive multi-GPU servers carry. Quantization is the engineering discipline that makes "run it yourself" a realistic option rather than a theoretical one: it systematically reduces the numerical precision used to store a model's weights, shrinking memory footprint by 2x to 4x with a controlled, measurable cost to output quality. Local deployment is the complementary discipline of choosing and configuring the software that actually serves that shrunk model — Ollama for developer convenience, llama.cpp for maximum portability including CPU-only environments, or vLLM for production-grade throughput — because the choice of serving stack affects latency and cost every bit as much as the choice of precision does.
+</p>
+
+<p>
+This chapter assumes you already know how to build a working chat feature against a hosted <code>ChatModel</code>. What it adds is the judgment to recognize when self-hosting is the right call, the mechanics of shrinking a model to fit the hardware you have, and the operational knowledge to serve it — while carrying forward Chapter 53's discipline: any change that alters the model itself, including quantization, is a change that must be re-evaluated, not merely assumed safe.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Quantization Before LLMs: Mobile and Edge Inference</h3>
+
+<p>
+Quantization did not originate with large language models — it was a mature technique in classical deep learning years earlier, driven by an entirely different pressure: running convolutional neural networks on phones. TensorFlow Lite and Core ML both shipped INT8 post-training quantization workflows in the late 2010s specifically so image classifiers and speech models could run inside a mobile app's memory and power budget. ONNX Runtime and NVIDIA's TensorRT built similar quantization toolchains for edge and embedded inference. The core finding from that era — that neural network weights tolerate far less numerical precision than the FP32 they were trained in, with only a small, measurable accuracy cost — is the exact finding this chapter's theory section (Section 4) builds on. Nothing about the underlying mathematics of quantization is new to the LLM era; what changed is the scale of the problem and the size of the prize for solving it.
+</p>
+
+<h3>2.2 The Scale Wall: When Models Outgrew Consumer and Even Server Hardware</h3>
+
+<p>
+The GPT-3 era (2020 onward) introduced language models with tens to hundreds of billions of parameters, and the released, open-weight models that followed — LLaMA, Mistral, Falcon, and their successors — inherited that scale. Stored at their native FP16 training precision, a 7B model already needs roughly 14 GB of memory before a single request is served, and a 70B model needs roughly 140 GB — beyond a single consumer GPU, and beyond most single-server GPU configurations without multi-GPU sharding. This created immediate, practical pressure: researchers and hobbyists wanted to run these models on hardware they actually owned, and enterprises wanted to self-host without provisioning a small data center per model.
+</p>
+
+<h3>2.3 GPTQ and AWQ: Post-Training Quantization Gets Serious About Accuracy</h3>
+
+<p>
+2022 brought GPTQ ("Accurate Post-Training Quantization for Generative Pre-trained Transformers"), the first widely adopted technique to push LLM weights down to 4-bit and even lower precision with only a small, measured quality loss, by quantizing layer-by-layer and using a small calibration dataset to correct for the error each quantization step introduces before it compounds into the next layer. 2023 brought AWQ (Activation-aware Weight Quantization), which improved on this by recognizing that not all weights matter equally — a small fraction of weight channels have an outsized effect on activations, and protecting exactly those channels from aggressive rounding preserves far more quality per bit spent than quantizing everything uniformly. Both techniques are covered mechanically in Section 5.
+</p>
+
+<h3>2.4 GGML/GGUF and llama.cpp: Making Local Inference Portable</h3>
+
+<p>
+In parallel, Georgi Gerganov's llama.cpp project (starting March 2023) solved a different half of the problem: even a quantized model needs an inference engine that can actually run it, ideally on ordinary consumer hardware including CPU-only machines with no GPU at all. llama.cpp's GGML tensor library, and its successor file format GGUF, became the de facto portable container format for quantized open-weight models — a single file bundling weights, quantization metadata, and tokenizer, loadable on everything from a Raspberry Pi to a Mac laptop to a data-center server. Ollama (2023) then wrapped llama.cpp in a developer-friendly CLI and daemon — <code>ollama pull</code>, <code>ollama run</code> — turning what had been a manual build-and-configure process into a one-command experience, at the cost of some of llama.cpp's low-level tuning control.
+</p>
+
+<h3>2.5 vLLM and PagedAttention: Local Deployment Grows Up for Production</h3>
+
+<p>
+2023 also brought vLLM out of UC Berkeley, built around a single paper's insight — PagedAttention — that solved the production-serving half of this problem: the KV cache (Section 6.3) that every generation request accumulates was, in earlier serving stacks, allocated in large contiguous blocks per request, wasting enormous amounts of GPU memory to fragmentation and forcing conservative batch sizes. PagedAttention manages the KV cache the way an operating system manages virtual memory — in fixed-size pages that can be allocated non-contiguously and shared across requests — which let vLLM pack dramatically more concurrent requests into the same GPU memory and introduced continuous batching, admitting and completing individual requests within a batch on the fly rather than waiting for a whole batch to finish together. vLLM is now the dominant choice wherever local deployment must serve real production traffic rather than a single developer's terminal.
+</p>
+
+<table>
+<tr><th>Era</th><th>Core Advance</th><th>Good For</th><th>Blind Spot</th></tr>
+<tr><td>Mobile/edge quantization (TFLite, TensorRT, pre-2020)</td><td>INT8 post-training quantization for CNNs</td><td>Proved weights tolerate low precision with small accuracy loss</td><td>Never had to handle billion-parameter generative models</td></tr>
+<tr><td>GPTQ (2022)</td><td>Layer-wise calibrated PTQ down to 4-bit</td><td>High-fidelity 4-bit compression of already-trained LLMs</td><td>Calibration-set dependent; slower to quantize than naive rounding</td></tr>
+<tr><td>AWQ (2023)</td><td>Activation-aware protection of salient weight channels</td><td>Better quality-per-bit than uniform rounding, especially at 4-bit</td><td>Still a PTQ technique — cannot recover quality QAT could preserve</td></tr>
+<tr><td>GGML/GGUF + llama.cpp (2023)</td><td>Portable quantized weight format + CPU/GPU inference engine</td><td>Runs anywhere, including CPU-only and consumer hardware</td><td>Not built for high-concurrency production throughput</td></tr>
+<tr><td>vLLM + PagedAttention (2023–present)</td><td>Memory-efficient KV cache management + continuous batching</td><td>Production-grade throughput serving many concurrent users</td><td>Heavier operational footprint; GPU-oriented, less CPU-first</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> the same bottleneck-relocation pattern from Chapter 53's evaluation history repeats here. Quantization solved "the model doesn't fit in memory" but created "how much quality did we just give up, and did we measure it?" GGUF and llama.cpp solved "how do I run this at all" but did not solve "how do I run this for a thousand concurrent users." vLLM solved that — but at the cost of operational complexity a solo developer running Ollama on a laptop does not want. Section 8 and Section 10 return to exactly this tradeoff when choosing a serving stack.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<p>
+Strip away vendor names and file formats, and self-hosting a language model reduces to one precise engineering problem:
+</p>
+
+<div class="callout">
+<strong>Given a trained model whose native weight file will not fit in the memory of the hardware you have (or would fit but at a cost or latency you cannot accept), reduce its size and choose a serving system such that it runs on that hardware, answers requests fast enough for your use case, and degrades output quality by an amount you have deliberately chosen and measured — not by an amount that surprised you after users started complaining.</strong>
+</div>
+
+<p>
+As in Chapter 53's retrieval/generation split, this problem decomposes into two independently failable halves that demand different fixes:
+</p>
+
+<ul>
+<li><strong>Compression failure:</strong> you quantized the weights (INT8, INT4, or lower) but pushed precision down further than the model's task can tolerate, and output quality silently degraded — wrong facts, broken formatting, garbled reasoning on harder prompts — without anyone noticing until a user did. The fix lives in choosing a less aggressive quantization scheme, a better quantization algorithm (AWQ over naive rounding, for instance), or re-running Chapter 53's evaluation suite against the quantized model before shipping it.</li>
+<li><strong>Serving failure:</strong> the weights are fine — quality holds up under evaluation — but the inference server you chose cannot deliver the throughput or latency your product needs, because it was never designed for concurrent production traffic, or because you under-provisioned the KV cache memory the server needs on top of the weights themselves. The fix lives in Section 8's serving architecture choices, not in touching the model's precision at all.</li>
+</ul>
+
+<p>
+Conflating these two failure modes wastes exactly the kind of engineering effort Chapter 53 warned against: a team that notices "answers got worse and slower" might spend a sprint trying ever-more-aggressive quantization to fix a serving-configuration problem, or rewrite serving infrastructure to fix a genuine quality regression that only a less aggressive quantization setting could repair. Diagnosing which half broke — by checking, independently, "did the compressed model's evaluation scores regress?" and "is the serving stack actually saturating the hardware it has?" — is the entire practical payoff of treating this as two problems rather than one.
+</p>
+
+<p>
+A second dimension of the problem, again echoing Chapter 53's offline/online split: quantization decisions are made once, largely offline, before deployment (you pick a precision, quantize, and evaluate before anything reaches production), while serving decisions must hold up continuously, under real and unpredictable traffic patterns, in a way that a one-time benchmark cannot fully anticipate. A serving stack that handles a smooth trickle of requests well can fall over under a bursty afternoon traffic spike if batch sizing and KV cache headroom were not planned for the peak, not the average.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 Why Quantization Works At All: Weights Don't Need the Precision They Were Trained With</h3>
+
+<p>
+The foundational insight, inherited directly from the mobile/edge era (Section 2.1), is that a trained neural network's weights are highly redundant relative to the numerical precision used to store them. Training happens in FP32 or FP16/BF16 because gradient descent benefits from fine-grained precision to make small, accumulating updates stably — but once training is finished and you only need the model to run forward passes (inference), that same fine-grained precision is mostly wasted. A weight's exact value to five decimal places rarely changes which token the model ultimately predicts; what matters is preserving each weight's approximate magnitude and, critically, its magnitude and sign <em>relative to</em> other weights in the same layer. This is why quantization is a compression technique with a genuinely small, controllable quality cost rather than a lossy hack that happens to sometimes work — it exploits real structure in the weight distributions, not luck.
+</p>
+
+<h3>4.2 Post-Training Quantization (PTQ) vs. Quantization-Aware Training (QAT)</h3>
+
+<p>
+There are two fundamentally different points in a model's lifecycle where quantization can happen, and they trade off effort against quality:
+</p>
+
+<table>
+<tr><th>Approach</th><th>When It Happens</th><th>Cost</th><th>Quality</th></tr>
+<tr><td>Post-Training Quantization (PTQ)</td><td>After training is fully complete, using a small calibration dataset (no gradient updates to the model)</td><td>Cheap — minutes to hours, no GPU cluster for retraining needed</td><td>Good, especially at INT8; can degrade more noticeably at INT4 and below without a careful algorithm (GPTQ/AWQ)</td></tr>
+<tr><td>Quantization-Aware Training (QAT)</td><td>During (or as a fine-tuning continuation of) training, with the model simulating quantized precision in the forward pass while still updating in higher precision</td><td>Expensive — requires training infrastructure and time most teams self-hosting a model do not want to spend</td><td>Best — the model's weights are directly optimized to tolerate the target precision, closing most of the PTQ quality gap</td></tr>
+</table>
+
+<p>
+The overwhelming majority of local-deployment quantization in practice is PTQ, precisely because the whole point of self-hosting is usually to avoid the cost of running your own training infrastructure — you are downloading someone else's already-trained open-weight model and shrinking it, not training one from scratch. QAT is reserved for teams with both the infrastructure and the stakes (a flagship product feature, a model being distributed to millions of edge devices) to justify the extra investment.
+</p>
+
+<h3>4.3 Symmetric vs. Asymmetric, and Per-Tensor vs. Per-Channel/Per-Group Quantization</h3>
+
+<p>
+Two further design axes determine how much quality a given bit-width preserves:
+</p>
+
+<ul>
+<li><strong>Symmetric quantization</strong> maps a float range centered on zero (e.g., [-max, max]) onto a signed integer range centered on zero, using a single scale factor and no zero-point offset — simpler and faster, and a good fit when a weight tensor's distribution is genuinely close to zero-centered, which most trained weight matrices are.</li>
+<li><strong>Asymmetric quantization</strong> maps an arbitrary float range [min, max] (not necessarily centered on zero) using both a scale and a zero-point offset — more accurate for distributions that are skewed, at the cost of a slightly more expensive dequantization step. Activations (as opposed to weights) are frequently asymmetric, which is part of why activation-aware methods like AWQ matter.</li>
+<li><strong>Per-tensor quantization</strong> uses one scale (and optionally one zero-point) for an entire weight matrix — simplest, but forces a single precision/range tradeoff across potentially very differently-scaled rows or columns within that matrix.</li>
+<li><strong>Per-channel or per-group quantization</strong> computes a separate scale for each output channel, or for small groups of weights (commonly 32, 64, or 128 elements per group in GPTQ/AWQ configurations) — this is almost always meaningfully more accurate than per-tensor quantization, because it lets each group's scale fit that group's actual value range rather than being stretched to accommodate the tensor's single largest outlier.</li>
+</ul>
+
+<p>
+The practical rule this section leaves you with: finer granularity (per-group over per-tensor) and activation-awareness (AWQ-style channel protection) both cost a small amount of extra metadata and computation, and both are almost always worth it relative to naive uniform per-tensor rounding, especially once you push down to 4-bit.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+This section walks through what actually happens, mechanically, when you quantize a model and then serve it — because "we ran GPTQ and now it's 4-bit" and "vLLM handles thousands of concurrent requests" both sound like magic until you see the concrete steps.
+</p>
+
+<h3>5.1 Step-by-Step: GPTQ Quantization</h3>
+
+<ol>
+<li><strong>Gather a small calibration set.</strong> A few hundred representative text samples are run through the full-precision model to record the activations each layer actually produces — this is not fine-tuning, no weights are updated yet; it is purely observational.</li>
+<li><strong>Quantize one layer at a time, in order.</strong> GPTQ processes weight matrices column by column within a layer, converting each column to low precision using a second-order (Hessian-based) approximation of how much error that specific rounding will introduce into the layer's output.</li>
+<li><strong>Correct remaining columns for the error just introduced.</strong> After quantizing a column, GPTQ adjusts the still-unquantized columns in the same layer slightly, to compensate for the rounding error already committed — so error does not simply accumulate unchecked across the whole matrix.</li>
+<li><strong>Move to the next layer using the corrected outputs.</strong> Because quantization happens layer-by-layer with correction, errors introduced early are partially absorbed rather than compounding catastrophically by the final layer — this careful, sequential process is exactly why GPTQ preserves noticeably more quality at 4-bit than simply rounding every weight independently and all at once.</li>
+</ol>
+
+<h3>5.2 Step-by-Step: AWQ Quantization</h3>
+
+<ol>
+<li><strong>Run calibration data through the model and record activation magnitudes</strong> per weight channel — the goal is to find which small fraction of input channels consistently produce the largest-magnitude activations, since AWQ's core finding is that these channels matter disproportionately to output quality.</li>
+<li><strong>Identify the salient channels</strong> (commonly around the top 1% by activation magnitude) that deserve protection from aggressive rounding.</li>
+<li><strong>Scale before quantizing, then undo the scale after.</strong> Rather than literally keeping salient weights at higher precision (which would complicate the storage format), AWQ multiplies the salient channels' weights by a per-channel scale factor before quantization, which reduces the relative rounding error those channels experience, and divides the corresponding activations by the same factor at inference time to cancel it out mathematically — the net effect protects the important channels' precision using ordinary uniform-precision storage.</li>
+<li><strong>Quantize the (now scale-adjusted) weights uniformly.</strong> Because the salient channels have already been made more rounding-tolerant by the scaling step, a straightforward per-group quantization pass over the whole tensor preserves noticeably more end-to-end quality than doing the same pass without the protective scaling.</li>
+</ol>
+
+<h3>5.3 Step-by-Step: Loading and Running a GGUF Model in llama.cpp / Ollama</h3>
+
+<ol>
+<li><strong>The GGUF file is memory-mapped, not fully loaded into RAM up front.</strong> This is why llama.cpp starts serving almost instantly even for large files — the operating system pages weight data in from disk as layers are actually needed during the forward pass, rather than blocking on reading the entire file first.</li>
+<li><strong>Layers are assigned to GPU or CPU based on available VRAM.</strong> If the whole model fits in GPU memory, every layer runs on GPU; if it doesn't, llama.cpp can split layers, running as many as fit on GPU and the remainder on CPU — slower, but functional on hardware that could never hold the full model in VRAM alone.</li>
+<li><strong>Ollama wraps this as a model "pull" and "run" pair.</strong> <code>ollama pull llama3:8b-instruct-q4_0</code> downloads a GGUF file plus a manifest describing quantization level, context length, and template; <code>ollama run</code> starts (or reuses) a background server process and exposes both a native API and an OpenAI-compatible HTTP endpoint (Section 9) without the developer touching llama.cpp's build flags directly.</li>
+</ol>
+
+<h3>5.4 Step-by-Step: How vLLM Serves Concurrent Requests</h3>
+
+<ol>
+<li><strong>Incoming requests join a scheduler queue</strong> rather than being processed strictly one-at-a-time or in rigid fixed batches.</li>
+<li><strong>The scheduler forms a batch dynamically each iteration</strong>, admitting new requests and evicting completed ones on every generation step — this is <em>continuous batching</em>: a request that finishes generating its 40th token does not have to wait for every other request in its original batch to also finish before the GPU can start serving a freshly arrived request in that freed slot.</li>
+<li><strong>Each request's KV cache is allocated in fixed-size, non-contiguous pages</strong> (PagedAttention) rather than one large reserved block sized for a worst-case sequence length — so memory that would otherwise sit idle, reserved but unused, for a request that turned out to be short, is available for other requests instead.</li>
+<li><strong>The GPU executes one batched forward pass per step across all currently active requests</strong>, and the scheduler repeats — admit, execute, evict, admit — which is what lets vLLM sustain dramatically higher requests-per-second on the same GPU than a naive request-at-a-time server.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<h3>6.1 The Core Quantization Formula: Scale and Zero-Point</h3>
+
+<pre>
+Given a float weight range [min, max] and a target bit-width b (so integers
+range 0 .. 2^b - 1, e.g. 0..255 for INT8):
+
+                 max - min
+scale       =  ─────────────
+                 2^b - 1
+
+zero_point  =  round( -min / scale )
+
+Quantize:      q  =  round( x / scale ) + zero_point         (store q, a small integer)
+
+Dequantize:    x' =  ( q - zero_point ) * scale               (reconstruct an approximate float)
+
+Symmetric variant (min = -max, zero_point = 0):
+                 max
+scale       =  ─────────────
+                 2^(b-1) - 1
+
+               q  =  round( x / scale )              -- q in [-(2^(b-1)-1), 2^(b-1)-1]
+</pre>
+
+<p>
+Everything downstream — INT8, INT4, GPTQ, AWQ — is a refinement of this same scale/zero-point idea: choose scale (and optionally zero-point) per tensor, per channel, or per small group, then round. The refinements (Section 5) are entirely about <em>how cleverly you choose scale/zero-point and correct for the resulting error</em>, not about a different core formula.
+</p>
+
+<h3>6.2 Mapping a Float Range to Integer Buckets — INT8 Worked Example</h3>
+
+<pre>
+Weight tensor observed range:  [-2.4, 2.4]   (symmetric, typical of a trained weight matrix)
+Target: INT8 symmetric, range -127..127
+
+scale = 2.4 / 127  =  0.0189
+
+Float value    Quantized bucket (round(x / scale))     Dequantized back
+  2.40      →   127                                  →   2.4003
+  1.20      →    63                                  →   1.1907
+  0.05      →     3                                  →   0.0567
+  0.00      →     0                                  →   0.0000
+ -0.87      →   -46                                  →  -0.8694
+ -2.40      →  -127                                  →  -2.4003
+
+Quantization error per value = |original - dequantized| ≤ scale / 2  (≈ 0.0095 here)
+</pre>
+
+<p>
+Notice the error bound: for symmetric INT8, the worst-case rounding error per weight is half the bucket width (scale / 2), a small fraction of the tensor's overall range. Dropping to INT4 (16 buckets instead of 256) makes each bucket sixteen times wider than the INT8 example above for the same range, which is exactly why 4-bit quantization needs the calibrated, error-correcting techniques from Section 5 (GPTQ, AWQ) rather than naive rounding — naive INT4 rounding on a raw weight tensor introduces error large enough to measurably harm output quality.
+</p>
+
+<h3>6.3 Memory Footprint: What a 7B / 13B / 70B Model Actually Costs at Each Precision</h3>
+
+<pre>
+Bytes per parameter by precision:
+  FP32  =  4 bytes/param      FP16/BF16  =  2 bytes/param
+  INT8  =  1 byte/param       INT4       =  0.5 byte/param
+
+Model size (weights only, excluding KV cache and runtime overhead):
+
+  Parameters   FP16 (2B/param)   INT8 (1B/param)   INT4 (0.5B/param)
+  ───────────  ────────────────  ────────────────  ──────────────────
+  7B            14.0 GB            7.0 GB             3.5 GB
+  13B           26.0 GB           13.0 GB             6.5 GB
+  70B          140.0 GB           70.0 GB            35.0 GB
+
+Formula:  weight_memory_GB = (num_parameters_billions * bytes_per_param)
+                              -- e.g. 70e9 params * 0.5 bytes = 35e9 bytes ≈ 35 GB
+</pre>
+
+<p>
+This table is the single most consequential number in this chapter for hardware planning: a 70B model that requires 140 GB at FP16 (well beyond a single 80 GB GPU) fits comfortably in 35 GB at INT4 — inside a single high-end consumer or workstation GPU. Quantization is frequently the difference between "needs a multi-GPU server" and "runs on a machine an individual engineer owns."
+</p>
+
+<h3>6.4 The Cost Nobody Budgets For: KV Cache Memory</h3>
+
+<pre>
+KV cache size (bytes) for ONE sequence =
+
+   2 (K and V)  ×  num_layers  ×  num_heads  ×  head_dim  ×  seq_len  ×  bytes_per_element
+
+Worked example — a 7B-class model (32 layers, 32 heads, head_dim 128),
+FP16 KV cache (2 bytes), context length 4096, batch size 1:
+
+   2 × 32 × 32 × 128 × 4096 × 2 bytes  =  2,147,483,648 bytes  ≈  2.0 GiB
+
+That is the KV cache for a SINGLE sequence. Serving 16 concurrent sequences
+at the same context length multiplies this roughly linearly:
+
+   16 × 2.0 GiB  ≈  32 GiB of KV cache alone — on top of whatever the
+   quantized weights themselves already consume.
+</pre>
+
+<p>
+This is precisely the arithmetic Section 11's "underestimating VRAM" mistake refers to: a team that sizes a GPU purely against the weight table in Section 6.3 and forgets the KV cache will find their server runs a single request fine and then falls over, out of memory, the moment real concurrent traffic arrives — because the KV cache, not the weights, turns out to be the binding constraint at any meaningful batch size or context length.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Float Range to Integer Bucket Mapping</h3>
+
+<pre>
+ Float weight distribution (FP16)
+ ─────────────────────────────────────────────────────────
+   -2.4                    0.0                      2.4
+    │                       │                        │
+    ▼                       ▼                        ▼
+    ├──┬──┬──┬──┬──┬──┬──┬──┼──┬──┬──┬──┬──┬──┬──┬──┬──┤
+    (continuous range, effectively infinite distinct values)
+
+                       quantize (÷ scale, round)
+                                │
+                                ▼
+
+ INT8 symmetric buckets (256 total, -127..127)
+ ─────────────────────────────────────────────────────────
+  -127  ...  -46  ...   0   ...   63  ...  127
+    │          │        │         │        │
+    ├──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+    each bucket width = scale = 0.0189   (Section 6.2)
+
+                       quantize further (÷ larger scale)
+                                │
+                                ▼
+
+ INT4 symmetric buckets (16 total, -7..7)
+ ─────────────────────────────────────────────────────────
+   -7    -4    -1    0    1    4    7
+    │     │     │    │    │    │    │
+    ├─────┼─────┼────┼────┼────┼────┤
+    each bucket width ≈ 16x wider than INT8 above —
+    far less room to represent nuance in the original weight,
+    which is exactly why INT4 needs GPTQ/AWQ-style error
+    correction (Section 5) rather than naive rounding.
+</pre>
+
+<h3>7.2 Choosing a Local Serving Stack — Decision Tree</h3>
+
+<pre>
+                 Do you need to serve MANY concurrent users
+                 in a production system (not just yourself)?
+                          │                        │
+                         NO                        YES
+                          │                        │
+                          ▼                        ▼
+          Do you have a dedicated GPU        Do you need an OpenAI-
+          you want fine-grained control      compatible endpoint with
+          over (custom builds, CPU           continuous batching and
+          fallback, embedded use)?           efficient KV cache use
+              │              │               under real concurrent load?
+             NO             YES                        │
+              │              │                        YES
+              ▼              ▼                         │
+         OLLAMA         LLAMA.CPP                       ▼
+    (simple daemon,   (max control, portable,       vLLM
+     good defaults,    CPU-only capable,       (PagedAttention,
+     OpenAI-compatible  embeddable in other     continuous batching,
+     API out of the      apps, more manual       production-grade
+     box, best for       tuning required)        throughput — the
+     local dev/proto-                            production choice)
+     typing)
+</pre>
+
+<p class="followup">
+This tree is the practical payoff of Section 3's compression/serving decomposition applied to tooling choice: notice that none of these three tools change what quantization format you use — GGUF works with Ollama and llama.cpp, and vLLM consumes GPTQ/AWQ-quantized weights directly. The serving-stack decision and the quantization-format decision are largely independent axes, and conflating them ("we have to use Ollama because we quantized with GPTQ") is a common, avoidable confusion.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+Self-hosting a model is not a one-time script run — in a production system it is infrastructure with two clearly separated phases: an offline compression-and-evaluation pipeline that runs once (or whenever you change model version or quantization settings), and a continuously running serving layer that fronts real traffic.
+</p>
+
+<pre>
+┌──────────────────────────────────────────────────────────────────────┐
+│  OFFLINE: QUANTIZE + EVALUATE (runs once per model version/precision)  │
+│                                                                        │
+│  Base model weights (FP16, downloaded from a model hub)                │
+│         │                                                             │
+│         ▼                                                             │
+│  Calibration dataset (a few hundred representative prompts)            │
+│         │                                                             │
+│         ▼                                                             │
+│  Quantization job (GPTQ or AWQ, chosen bit-width and group size)        │
+│         │                                                             │
+│         ▼                                                             │
+│  Quantized artifact (GGUF for llama.cpp/Ollama, or GPTQ/AWQ            │
+│                       checkpoint for vLLM)                             │
+│         │                                                             │
+│         ▼                                                             │
+│  Chapter 53's evaluation suite, re-run against the QUANTIZED model      │
+│  (faithfulness, task accuracy, golden set pass rate)                    │
+│         │                                                             │
+│         ▼                                                             │
+│  Gate: only promote to serving if quality regression vs. the           │
+│         full-precision baseline stays within an agreed threshold       │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ONLINE: SERVE (runs continuously against live traffic)                │
+│                                                                        │
+│  Client applications (Spring AI ChatModel, other services) ──►         │
+│         │                                                              │
+│         ▼                                                              │
+│  OpenAI-compatible HTTP endpoint                                        │
+│    (Ollama :11434/v1, vLLM :8000/v1, or llama.cpp server :8080)         │
+│         │                                                              │
+│         ▼                                                              │
+│  Request scheduler / continuous batching (vLLM) or                     │
+│  simple queue (Ollama/llama.cpp for lower-concurrency use)              │
+│         │                                                              │
+│         ▼                                                              │
+│  GPU (or CPU) executes forward passes against quantized weights        │
+│    + actively managed KV cache (Section 6.4)                           │
+│         │                                                              │
+│         ├──► Metrics: tokens/sec, time-to-first-token, queue depth,    │
+│         │              GPU memory utilization                          │
+│         └──► Feedback loop: production failures/regressions feed        │
+│                              back into the offline golden set,          │
+│                              exactly as in Chapter 53's Section 8       │
+└──────────────────────────────────────────────────────────────────────┘
+</pre>
+
+<p>
+The gate at the bottom of the offline path is the detail teams most often skip and regret: quantization is a model change, and Chapter 53 already established that any model or pipeline change must clear an evaluation bar before shipping. Treating "we quantized it and it still generates plausible-looking text" as sufficient validation is the local-deployment equivalent of merging a pull request because it compiled — necessary, not sufficient.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+The practical payoff for a Spring engineer is that both Ollama and vLLM expose OpenAI-compatible HTTP APIs, and Spring AI already has first-class support for pointing its abstractions at exactly that shape of endpoint — meaning the <code>ChatClient</code>/<code>ChatModel</code> code you wrote against a hosted provider in earlier chapters barely changes; only the configured base URL and model name do. Spring AI also ships a dedicated <code>OllamaChatModel</code> for Ollama's native API, but the OpenAI-compatible route is often preferred specifically because it lets you swap between a hosted provider and a self-hosted vLLM/Ollama deployment with a configuration change rather than a code change — the same provider-agnostic design philosophy the <code>ChatModel</code> interface was built around from Chapter 27 onward.
+</p>
+
+<pre>
+# application.yml — pointing Spring AI's OpenAI-compatible client at a LOCAL model,
+# instead of the hosted OpenAI API
+
+spring:
+  ai:
+    openai:
+      base-url: http://localhost:11434    # Ollama's OpenAI-compatible endpoint
+      # base-url: http://localhost:8000   # or vLLM's OpenAI-compatible server
+      api-key: not-needed-locally         # some local servers require a placeholder value
+      chat:
+        options:
+          model: llama3:8b-instruct-q4_0  # or the model name vLLM was launched with
+</pre>
+
+<pre>
+// Conceptual sketch — the SAME ChatClient code you already use against a hosted
+// provider, now backed by a local, quantized model with no code change
+
+@Service
+public class LocalInferenceService {
+
+    private final ChatClient chatClient;
+
+    public LocalInferenceService(ChatClient.Builder builder) {
+        // builder is auto-configured from application.yml's spring.ai.openai.*
+        // properties above — it has no idea, and does not need to know,
+        // whether it is talking to OpenAI's cloud or a local Ollama/vLLM process
+        this.chatClient = builder.build();
+    }
+
+    public String summarize(String document) {
+        return chatClient.prompt()
+                .user(u -> u.text("Summarize in 3 bullet points:\n\n{doc}")
+                            .param("doc", document))
+                .call()
+                .content();
+        // Latency, cost, and data-residency profile are now entirely determined
+        // by which local model/precision/server you chose (Sections 6-8) —
+        // the Spring-facing code is unaware of any of that.
+    }
+}
+</pre>
+
+<p>
+This is the direct, concrete answer to Section 3's "how do I move a feature from hosted to self-hosted without a rewrite": because the abstraction boundary already lives at <code>ChatModel</code>, the decision to self-host is almost entirely a deployment and configuration decision, not an application-code decision — provided you resist the temptation to hand-write provider-specific request shapes anywhere in your service layer, exactly the anti-pattern Chapter 27 warned against from the start.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Always re-run your evaluation suite (Chapter 53) against the quantized model before shipping it</strong>, comparing scores directly to the full-precision baseline — never assume a quantization scheme is "safe" because it worked for someone else's model or use case.</li>
+<li><strong>Start at INT8 if you have the memory headroom, and only drop to INT4 if you genuinely need the extra memory savings.</strong> INT8 preserves quality closer to full precision with a simpler quantization process; INT4 should be a deliberate tradeoff, not a default.</li>
+<li><strong>Prefer a calibrated, activation-aware method (GPTQ or AWQ) over naive uniform rounding</strong> for any bit-width at or below INT4 — Section 6.2's bucket-width arithmetic shows exactly why naive rounding degrades badly at low bit-widths.</li>
+<li><strong>Budget hardware for the KV cache, not just the weight table.</strong> Use Section 6.4's formula against your actual expected concurrency and context length before sizing a GPU purchase or cloud instance — the weights are frequently the smaller of the two memory consumers under real load.</li>
+<li><strong>Match the serving stack to the actual concurrency requirement</strong>, not to whichever tool is easiest to install. Ollama for solo development and prototyping; vLLM once you are serving genuine concurrent production traffic (Section 7.2's decision tree).</li>
+<li><strong>Pin and version quantized model artifacts exactly like application code.</strong> A quantized GGUF or GPTQ checkpoint is a build artifact with a specific quality profile — track which base model, which quantization tool version, and which calibration set produced it, the same discipline Chapter 53 demanded for golden sets and judge prompts.</li>
+<li><strong>Benchmark tokens/sec and time-to-first-token on your actual target hardware</strong> before committing to a precision/serving combination — vendor and community benchmarks rarely match your specific GPU, batch size, and context length exactly.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Quantizing too aggressively and never re-evaluating.</strong> Dropping straight to INT4 (or lower) because it's the smallest option, without re-running Chapter 53's evaluation discipline against the compressed model, is the single most consequential mistake in this chapter — quality regressions from aggressive quantization are silent until a user notices, exactly like an unevaluated RAG change.</li>
+<li><strong>Sizing hardware against the weight table alone and ignoring the KV cache.</strong> As Section 6.4 showed, KV cache memory scales with concurrency and context length and can dwarf the weight memory under real traffic — a server that comfortably holds the quantized weights can still run out of memory the moment more than a handful of concurrent requests with long contexts arrive.</li>
+<li><strong>Assuming small batch sizes are "safer" without accounting for their throughput cost.</strong> A conservative, tiny batch size avoids out-of-memory errors but leaves GPU compute badly underutilized — modern GPUs are throughput machines, and serving requests nearly one at a time wastes most of the hardware's capacity, inflating cost-per-token far above what the same GPU could achieve with continuous batching properly tuned (Section 12).</li>
+<li><strong>Treating "it still produces fluent text" as evidence of quality.</strong> Quantized models rarely fail by outputting gibberish; they fail by being subtly less accurate, less faithful to instructions, or worse at edge cases — failures that only a real evaluation suite, not casual inspection, reliably catches.</li>
+<li><strong>Confusing the quantization-format decision with the serving-stack decision.</strong> GGUF, GPTQ, and AWQ are compression formats; Ollama, llama.cpp, and vLLM are serving engines. Assuming a specific format locks you into a specific server (or vice versa) leads to unnecessary re-quantization work when the real constraint was just picking a server that supports the format you already have.</li>
+<li><strong>Benchmarking only single-request latency and extrapolating to production throughput.</strong> A single request's response time tells you almost nothing about how the same server behaves under twenty concurrent requests — continuous batching, queueing, and KV cache pressure only show up under concurrent load.</li>
+<li><strong>Ignoring context length's effect on both quality and memory.</strong> Some quantization and serving configurations degrade more at long context lengths than short ones, and Section 6.4's KV cache formula scales directly with context length — a configuration validated at a 512-token test prompt can behave very differently at the 8,000-token production prompts a real feature actually sends.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Local deployment's performance profile is governed by a handful of levers that interact with each other, and treating any one of them in isolation gives a misleading picture:
+</p>
+
+<ul>
+<li><strong>Throughput vs. latency is a real tradeoff, not a free lunch.</strong> Larger batch sizes improve aggregate tokens/sec (throughput) by keeping the GPU's compute units busier, but can increase the latency any individual request experiences while it waits to be scheduled alongside others — tune batch size against whichever your product actually needs: many cheap background jobs favor throughput, while an interactive chat feature favors low per-request latency.</li>
+<li><strong>GPU inference dramatically outperforms CPU inference for anything beyond small models or low-volume use</strong> — GPUs parallelize the matrix multiplications inference is built from far better than CPUs. CPU inference (via llama.cpp) remains valuable specifically for portability, cost-free hardware you already have, or genuinely low-volume/offline use cases, not as a general production throughput strategy.</li>
+<li><strong>KV cache management is usually the binding constraint on concurrency, not raw compute.</strong> Section 6.4's arithmetic means the practical limit on "how many concurrent users can this GPU serve" is frequently set by available memory for KV cache pages, not by how fast the GPU can compute — this is exactly why PagedAttention's more efficient memory packing (Section 5.4) translates directly into more served concurrent users on identical hardware.</li>
+<li><strong>Time-to-first-token and tokens-per-second-thereafter are different metrics that matter for different features.</strong> A streaming chat UI cares enormously about time-to-first-token (perceived responsiveness); a batch summarization job cares almost entirely about total tokens/sec throughput. Measure and optimize for the one your feature actually needs.</li>
+<li><strong>Quantization itself is usually a net performance win, not just a memory win</strong> — lower-precision weights mean less data to move from memory to compute units per forward pass, which on memory-bandwidth-bound inference workloads (the common case for LLM decoding) directly increases tokens/sec, on top of the memory savings from Section 6.3.</li>
+<li><strong>Context length inflates both memory and latency non-trivially</strong> — attention computation and KV cache size both grow with sequence length, so a feature that can reasonably truncate or summarize long input before it reaches the model often earns a larger performance win than any amount of serving-stack tuning.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Self-hosting trades away some of a hosted provider's built-in security posture and takes on new risks specific to running someone else's model weights on your own infrastructure:
+</p>
+
+<ul>
+<li><strong>Model file supply-chain risk.</strong> A downloaded GGUF, GPTQ, or AWQ checkpoint is a binary artifact from a third party (a model hub or community upload) — historically, some model-serialization formats (raw Python pickle in particular) allowed arbitrary code execution on load. Prefer formats and loaders with no arbitrary-code-execution surface, verify checksums/signatures where the hosting platform provides them, and treat an unfamiliar or unofficial community re-upload of a model with the same suspicion you would apply to an unfamiliar dependency in your build file.</li>
+<li><strong>An unauthenticated local inference endpoint is a real exposure, not a theoretical one.</strong> Ollama's and vLLM's OpenAI-compatible servers do not, by default, require the same authentication and rate-limiting a hosted provider enforces for you automatically — binding one of these servers to a network-reachable interface without adding your own authentication, network policy, or reverse-proxy access control effectively hands anyone on that network unmetered access to your model and, depending on your setup, your GPU's compute budget.</li>
+<li><strong>Self-hosting genuinely improves data residency and confidentiality</strong> — this is one of the four motivating reasons from Section 1 — but only if the operational discipline matches: request logs, prompt content, and any fine-tuning or calibration data used in quantization still need the same access controls, retention limits, and audit posture Chapter 75 required of hosted-model traffic. Moving the model in-house does not automatically make the surrounding pipeline compliant.</li>
+<li><strong>Quantization itself is not a meaningful privacy or safety control.</strong> Reducing a model's numerical precision does not remove memorized training data, does not add content filtering, and does not change what the model is capable of generating — any guardrails (Chapter 65) or content-safety measures your hosted deployment relied on must be re-implemented explicitly for a self-hosted model, since they do not come bundled with the weights.</li>
+</ul>
+
+<p>
+Beyond these, most of the deeper security engineering for an AI feature — prompt injection defenses, guardrails, access control on retrieved data — lives in the layers covered elsewhere in this book (Chapters 64 through 66) and applies identically whether the model behind those layers is hosted or self-hosted; this section focuses only on what changes specifically because the model now runs on infrastructure you operate.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is quantization, and why does reducing a model's numerical precision not destroy its usefulness?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Quantization is the process of storing a model's weights using fewer bits per value — for example, 8-bit or 4-bit integers instead of the 16-bit floating point values used during training — which directly shrinks the memory required to load and run the model. It works because trained weights are highly redundant relative to the precision used to store them: what matters for a correct forward pass is each weight's approximate magnitude and its value relative to other weights in the same layer, not its exact value to many decimal places. This mirrors an insight from mobile and edge deep learning years before large language models existed — quantized image classifiers and speech models already demonstrated that neural network weights tolerate low precision with only a small, measurable accuracy cost.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. What is the practical difference between running a model via Ollama versus calling a hosted API like OpenAI's?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>With a hosted API, the model runs on the provider's infrastructure, billed per token, reached over the network — you never manage hardware, memory, or the serving process. With Ollama, the model (typically a quantized GGUF file) runs on your own machine or server, managed by a local daemon that exposes both a native and an OpenAI-compatible HTTP endpoint. The tradeoff is control and cost structure versus operational responsibility: Ollama removes per-token billing and network dependency and keeps data on your own hardware, but you become responsible for having adequate memory and compute, choosing an appropriate quantization level, and operating the serving process yourself.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain the difference between post-training quantization (PTQ) and quantization-aware training (QAT), and why PTQ is far more common for self-hosted open-weight models.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>PTQ quantizes a model's weights after training is fully complete, typically using a small calibration dataset to inform how to choose scale factors and correct for rounding error, with no gradient updates to the model itself — it is cheap, taking minutes to hours with no training infrastructure required. QAT instead simulates quantized precision during training or fine-tuning, letting the model's weights be directly optimized to tolerate the target precision, which produces noticeably better quality at very low bit-widths but requires the same training infrastructure and time investment as a fine-tuning run. PTQ dominates in practice for self-hosted open-weight models because the entire point of self-hosting is usually to avoid running your own training infrastructure — you are shrinking a model someone else already trained, not training one from scratch, so QAT's added cost rarely fits the use case.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why does dropping from INT8 to INT4 quantization introduce meaningfully more risk to output quality, and what techniques mitigate that risk?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Quantization maps a continuous float range onto a fixed number of integer buckets, and INT4 has only 16 buckets compared to INT8's 256 — for the same value range, each INT4 bucket is roughly sixteen times wider, meaning naive rounding at INT4 introduces far larger error per weight. GPTQ mitigates this by quantizing layer-by-layer using calibration data and a Hessian-based correction that adjusts not-yet-quantized weights to compensate for error already introduced, rather than letting error accumulate unchecked. AWQ mitigates it differently, by identifying the small fraction of weight channels with the largest effect on activations and protecting exactly those channels via a scaling trick before quantization, rather than treating every weight as equally important. Both techniques exist specifically because naive uniform rounding becomes unacceptably lossy once bucket width grows this large.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. A team quantized a 70B model to INT4 to fit it on a single GPU, and users are now reporting subtly wrong answers on complex reasoning tasks that worked fine before. How do you investigate, and what would you check first?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>First check whether the quantized model was ever evaluated against the same golden test set and metrics used for the full-precision model (Chapter 53's discipline) — if it was shipped on the assumption that "it still produces fluent text" was sufficient validation, that is very likely the root cause, since quantized models rarely fail by producing gibberish; they fail by being subtly less accurate on harder tasks, exactly the symptom described. Re-run the evaluation suite against both the full-precision and INT4 versions and compare scores directly to quantify the actual regression, rather than relying on anecdotal user reports alone. If the regression is real and unacceptable, the fix is not to keep the same aggressive INT4 setting and patch prompts around it — the fix is to either use a less aggressive precision (INT8), switch to a more careful calibrated quantization algorithm (AWQ or GPTQ with a better calibration set or finer per-group granularity) if not already using one, or accept the additional hardware cost of running at higher precision for this specific complex-reasoning workload. It's also worth checking whether the regression is concentrated on long-context requests specifically, since some quantization/serving configurations degrade more at long context lengths, which would point to a context-length-specific fix rather than a global precision change.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Lead with "was this ever evaluated post-quantization" rather than jumping straight to a specific quantization algorithm fix — most candidates skip straight to "try AWQ instead of GPTQ" without first establishing that the regression was actually measured and quantified, which is the same evaluation-first discipline Chapter 53 built and this chapter explicitly carries forward.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Your production vLLM deployment runs out of GPU memory under real traffic even though the quantized model's weights comfortably fit in the GPU's VRAM. What is the most likely cause, and how do you fix it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The most likely cause is underestimating KV cache memory, which is allocated per active sequence and scales with the number of layers, attention heads, head dimension, context length, and concurrent batch size — for a 7B-class model at a 4096-token context, a single sequence's KV cache can already consume roughly 2 GiB, and that scales close to linearly with concurrent requests, meaning sixteen concurrent long-context requests can require on the order of tens of gigabytes of KV cache alone, independent of and often larger than the weight memory. The fix is to size hardware using the KV cache formula against realistic expected concurrency and context length, not just the weight table; to cap maximum context length or maximum concurrent sequences to a value the available memory can actually support; and to take advantage of vLLM's PagedAttention memory management, which packs KV cache pages more efficiently than naive contiguous allocation and therefore supports more concurrent sequences on the same hardware than a serving stack without it.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. Design the offline-to-online pipeline you would put in place before your organization self-hosts any quantized model in production, and justify each stage.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The pipeline splits into an offline compression-and-validation phase and a continuously running serving phase, connected by a feedback loop. Offline: start from the full-precision base model, assemble a small representative calibration dataset, run a calibrated quantization algorithm (GPTQ or AWQ, not naive rounding) at the chosen bit-width and group size, and — critically — re-run the exact same evaluation suite (golden set, task-specific metrics, faithfulness checks where applicable) used to validate the full-precision model, gating promotion to serving on the regression staying within an agreed threshold versus the full-precision baseline. Version the quantized artifact, the calibration set, and the quantization tool version together, the same way golden sets and judge prompts are versioned in evaluation infrastructure. Online: front the quantized model with a serving stack matched to actual concurrency needs (vLLM for genuine production load), size hardware using both the weight-memory table and the KV-cache-per-concurrent-sequence formula against realistic peak traffic rather than average traffic, and instrument tokens/sec, time-to-first-token, and queue depth as first-class production metrics. The feedback loop closes by routing any production quality complaint or serving incident back into the offline golden set and hardware sizing assumptions respectively, so the validation bar and capacity plan both stay representative of real usage rather than calcifying at launch-day assumptions.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly separate "did compression hurt quality" (an evaluation question) from "can serving handle real load" (a capacity question) as two independently gated stages rather than one combined "does it work" checkpoint — most candidates conflate them into a single vague validation step and miss that each requires an entirely different kind of evidence.</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. A product leader wants to move a high-volume, cost-sensitive feature from a hosted LLM API to a self-hosted quantized model purely to cut costs, and wants it done in two weeks. What risks would you flag, and how would you structure the migration to manage them?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The core risk is treating this as an infrastructure swap rather than a model change with its own quality and capacity risk profile. Cost savings from self-hosting are real at sufficient volume, but they are contingent on two things that a two-week timeline pressures dangerously: choosing a quantization level aggressive enough to be cost-effective without silently degrading the feature's actual output quality (which requires re-running the feature's evaluation suite against the quantized candidate, not just spot-checking a few examples), and provisioning hardware that accounts for the KV cache cost at the feature's real peak concurrency and context length, not just the weight table, since underestimating that is the most common way a "successful" migration turns into a production outage under real load. I would structure the migration in stages regardless of timeline pressure: first quantize and evaluate offline against the existing golden set with a hard go/no-go quality gate; in parallel, benchmark the chosen serving stack (very likely vLLM, given "high-volume") against realistic concurrent load and context lengths to validate both throughput and memory headroom; then run the self-hosted path alongside the existing hosted path on a small percentage of live traffic, comparing both quality signals and cost-per-request empirically, before fully cutting over. If the two-week deadline cannot accommodate all of that safely, the honest staff-level answer is to say so explicitly and propose either a longer timeline or a smaller, lower-risk subset of the feature's traffic to migrate first — shipping a cost cut that quietly degrades the product, or one that falls over under real traffic, costs the organization far more than the two weeks saved.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Using Section 6.3's memory table and Section 6.4's KV cache formula, explain why a team could correctly conclude "this GPU has enough memory for the model" and still be wrong about whether the GPU can serve their production traffic. What additional inputs does the KV cache formula require that the weight-memory table does not?</li>
+<li>A colleague argues that since GPTQ and AWQ both ultimately produce a low-bit-width weight file, the choice between them "doesn't really matter." Using Section 5.1 and 5.2's step-by-step mechanics, write a short argument for why the two techniques can produce meaningfully different quality outcomes on the same model and bit-width.</li>
+<li>Explain why quantizing a model does not, by itself, provide any additional data privacy or content-safety guarantees, even though self-hosting more broadly can improve data residency. What has to be added separately to get those guarantees?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Using Section 6.3's formula, compute the weight-only memory footprint at FP16, INT8, and INT4 for a hypothetical 34B-parameter model. Then, using Section 6.4's KV cache formula, estimate the additional memory needed to serve 8 concurrent requests at a 8192-token context length, assuming 48 layers, 40 attention heads, and a head dimension of 128, with an FP16 KV cache. State which of the two — weights or KV cache — turns out to be the larger memory consumer, and what that implies for hardware sizing.</li>
+<li>Design (in ASCII, following Section 8's style) the offline quantize-and-evaluate pipeline you would build for a Spring Boot service that currently calls a hosted <code>ChatModel</code> and is being migrated to a self-hosted, quantized model behind vLLM. Include where the golden test set from Chapter 53 plugs in, what the promotion gate condition is, and how the Spring application's configuration (Section 9) changes versus its code.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Self-hosting a model becomes necessary — not merely optional — under cost-at-scale, latency, data-residency/compliance, and offline/edge pressures that a hosted API cannot satisfy, and doing it responsibly requires both shrinking the model (quantization) and serving it well (Ollama, llama.cpp, or vLLM).</li>
+<li>Quantization works because trained weights tolerate far less numerical precision than they were trained with; the scale/zero-point formula (Section 6.1) is the mathematical core underlying every quantization format from plain INT8 through calibrated 4-bit techniques like GPTQ and AWQ.</li>
+<li>Post-training quantization (cheap, no retraining) dominates self-hosted open-weight usage over quantization-aware training (expensive, requires training infrastructure), and calibrated, activation-aware methods (GPTQ, AWQ) meaningfully outperform naive uniform rounding, especially at 4-bit and below.</li>
+<li>Memory planning must account for both the weight table (Section 6.3's 7B/13B/70B arithmetic) and the KV cache (Section 6.4), which scales with concurrency and context length and is frequently the binding constraint under real production load, not the weights.</li>
+<li>Serving-stack choice (Ollama for dev convenience, llama.cpp for maximum portability including CPU-only, vLLM for production-grade continuous batching via PagedAttention) is a largely independent decision from quantization-format choice, and should be matched to actual concurrency requirements rather than ease of installation.</li>
+<li>Because Spring AI's <code>ChatModel</code> abstraction already targets an OpenAI-compatible request shape, moving a feature from hosted to self-hosted is primarily a configuration change (base URL, model name) rather than an application-code rewrite — but every quantization decision must still clear Chapter 53's evaluation bar before it reaches production, exactly as any other model change would.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Fine-Tuning, LoRA &amp; Parameter-Efficient Adaptation (Chapter 90) continues Volume 7 by moving from "run an existing model more cheaply" to "adapt an existing model's behavior to your specific task without the cost of full retraining" — a natural next step once a team controls its own inference stack, since local fine-tuning and local deployment are frequently adopted together, and several of this chapter's memory and hardware-sizing lessons apply just as directly to fine-tuning workloads as they do to inference.
+</p>
+
+</div>
+
+</body>
+</html>

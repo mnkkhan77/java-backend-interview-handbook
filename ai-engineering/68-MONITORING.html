@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>92-MONITORING.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 68 — MONITORING</h1>
+
+<p class="roi">Volume 5 — Enterprise AI Engineering · Chapter 5 of 12</p>
+
+<div class="callout">
+Evaluation at Enterprise Scale (Chapter 67) gave you a way to know, before a release ships, whether a model or prompt change is good or bad against a fixed test set. But an evaluation suite is a photograph taken once, in a lab; production traffic is a live video feed of real users, real cost, and a real model provider that can silently change quality underneath you. Monitoring is the discipline that turns your evaluation criteria into continuously running instruments — dashboards, metrics, and alerts — so that a regression is caught in minutes on a graph, not in weeks from a support ticket. Without it, everything you validated in Chapter 67 is only true on the day you tested it.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every prior chapter in this book has, in one way or another, been about making a single request to a model succeed: writing a good prompt, retrieving the right context, calling the right tool, validating the right output shape. Monitoring is the first topic in this series that is not about any single request at all. It is about the aggregate shape of <em>millions</em> of requests over time — and that shift in unit of analysis is exactly what separates an engineer who ships a working demo from one who runs a production AI system that a business depends on.
+</p>
+
+<p>
+Here is the concrete failure this chapter exists to prevent. A team ships a Spring AI-powered support assistant. It passes every evaluation in Chapter 67's suite. Three weeks later, the upstream model provider quietly updates the model version behind the same API alias, average response length changes, latency per request rises by 400 milliseconds, and token costs for a fixed workload jump 35%. Nobody wrote a bug. Nobody deployed a change. The system that was correct on the day it was tested has drifted into a different system, and without monitoring, the first anyone hears about it is a finance question about a cost overrun, or a customer complaint about slow, oddly-worded replies. Monitoring is the difference between finding that out from a dashboard alert at 9:03 AM and finding it out from an angry stakeholder two sprints later.
+</p>
+
+<p>
+This matters more, not less, than monitoring a traditional service, for a specific reason tied directly back to the "What Is Intelligence" chapter's core distinction: a traditional service fails loudly — a 500 status code, a stack trace, a failed health check. An LLM-backed service degrades <em>quietly</em>. Latency, cost, and token usage are the easy, traditional metrics you already know how to watch. The harder and more novel job of AI monitoring is watching for degradation in things that have no HTTP status code at all: answer quality drifting downward, hallucination rate creeping up, retrieval relevance decaying as your knowledge base grows stale, or a jump in refusals because a safety filter upstream got stricter. None of these throw an exception. All of them show up, if you are watching, as a bend in a line on a graph — and that is precisely what this chapter teaches you to build.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Monitoring Before AI: The APM Lineage</h3>
+
+<p>
+Application Performance Monitoring (APM) as a discipline was built to answer one question for traditional software: is the service up, and is it fast enough? Tools like Nagios (1990s) started with binary up/down checks. The 2000s and 2010s brought time-series metrics platforms — Graphite, then Prometheus (2012, born at SoundCloud, later a CNCF flagship project) — built around the idea that a system's health can be captured as numeric measurements sampled at regular intervals: request count, error rate, p99 latency, CPU, memory. Grafana emerged as the near-universal visualization layer on top of these time series. Micrometer, which every Spring Boot engineer already knows through <code>Actuator</code>, was built specifically to give the JVM ecosystem a vendor-neutral metrics facade over exactly this kind of backend.
+</p>
+
+<p>
+This entire lineage was built on an assumption that held perfectly well for CRUD services, message queues, and databases: <strong>the thing you are monitoring either did its job correctly or it threw an error trying.</strong> A slow SQL query is slow, but its result set is still correct. This assumption is the one that AI monitoring has to break.
+</p>
+
+<h3>2.2 The ML Monitoring Era (2015–2020)</h3>
+
+<p>
+Before generative AI, the machine learning industry had already discovered that classic APM was insufficient for models, through a narrower but related problem: <strong>model drift</strong> in classic ML systems (fraud scoring, credit models, recommendation engines). A fraud model could keep returning HTTP 200 with perfectly formed JSON while its actual predictive accuracy silently degraded because the real-world distribution of transactions shifted away from the distribution it was trained on. This gave rise to a specific vocabulary — <strong>data drift</strong> (the input distribution changes), <strong>concept drift</strong> (the relationship between input and correct output changes), and dedicated ML monitoring platforms (Evidently, WhyLabs, Arize, and similar tools) built specifically to compute statistical distance between live traffic and training/reference data. This is the direct intellectual ancestor of everything in this chapter — generative AI monitoring inherited this "the API can succeed while the answer quality fails" problem and made it worse, because the "correct output" for a generative task is far fuzzier to define than a fraud label.
+</p>
+
+<h3>2.3 The LLM-Specific Turn (2022–present)</h3>
+
+<p>
+The release of widely-used LLM APIs forced a third wave, specific to this book's subject matter. New concerns appeared that neither classic APM nor classic ML monitoring had a ready answer for: <strong>token-based cost</strong> (a single request's cost can vary 50x depending on prompt and completion length, unlike a fixed-cost database query), <strong>provider-side model versioning</strong> (the model behind a stable API name can change without your team deploying anything), <strong>emergent, hard-to-quantify quality dimensions</strong> (tone, faithfulness to retrieved context, refusal rate), and <strong>prompt-injection-driven anomalies</strong> that look statistically like normal traffic. This produced a new generation of purpose-built LLM observability tooling (LangSmith, Langfuse, Arize Phoenix, Datadog's LLM Observability, and OpenTelemetry's emerging GenAI semantic conventions) that layer LLM-specific signals — prompt/completion pairs, token counts, tool-call traces — on top of the same underlying time-series and tracing infrastructure Spring Boot engineers already use via Micrometer and Actuator.
+</p>
+
+<table>
+<tr><th>Era</th><th>Core Question</th><th>What It Measured</th><th>What Carries Into This Chapter</th></tr>
+<tr><td>Classic APM (Nagios → Prometheus/Grafana)</td><td>Is the service up and fast?</td><td>Uptime, latency, error rate, resource usage</td><td>Every "operational" metric in Section 4: latency, throughput, error rate</td></tr>
+<tr><td>Classic ML Monitoring</td><td>Is the model's accuracy still valid in production?</td><td>Data drift, concept drift, prediction distribution shift</td><td>The core insight: 200 OK ≠ correct; drift detection techniques</td></tr>
+<tr><td>LLM/GenAI Monitoring</td><td>Is the model still good, safe, and affordable at scale?</td><td>Token cost, quality/faithfulness scores, tool-call success, refusal rate</td><td>The full metric taxonomy this chapter builds in Section 4</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you as an engineer:</strong> every tool you will touch in this chapter — Micrometer, Prometheus, Grafana — was designed for the first era and is being stretched to cover the third. That stretch is exactly why you, the engineer wiring this up in a Spring Boot application, have to explicitly design AI-specific metrics rather than assuming "we already have Actuator, we're covered." The infrastructure is reused; the metric taxonomy is not.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Continuously measure a probabilistic, cost-variable, provider-dependent system in production, well enough to detect a meaningful degradation in quality, cost, latency, or safety before it materially harms users or the business — using signals that do not require a human to read every response.</strong>
+</div>
+
+<p>
+Unpack each qualifier, because each one rules out a naive approach:
+</p>
+
+<ul>
+<li><strong>Continuously</strong> rules out the Chapter 67 evaluation suite as a sufficient answer on its own — an evaluation run at 2 AM before a release tells you nothing about 2 PM traffic three weeks later.</li>
+<li><strong>Probabilistic</strong> means you cannot alert on "the answer was wrong" the way you alert on "the query threw a SQLException" — you need proxy signals and statistical thresholds, not exact-match checks.</li>
+<li><strong>Cost-variable</strong> means a metric like "requests per minute" that was sufficient for a REST service tells you almost nothing about spend; you need token- and dollar-denominated metrics as first-class citizens, not an afterthought.</li>
+<li><strong>Provider-dependent</strong> means part of what you are monitoring is not even your code — you must detect changes in a dependency you do not control and were never notified about.</li>
+<li><strong>Without requiring a human to read every response</strong> is the hardest constraint: at any real production volume, nobody can eyeball a sample of outputs fast enough to catch a regression before it costs real money or real trust — so this chapter's job is to build automated, quantitative proxies for quality that a human can safely trust between periodic audits.</li>
+</ul>
+
+<p>
+Monitoring, framed this way, is not "add some Grafana panels to the AI feature." It is building the nervous system that tells you, continuously and automatically, whether the probabilistic system you shipped is still behaving the way your Chapter 67 evaluation said it would.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Four Layers of AI Monitoring</h3>
+
+<p>
+The single most useful mental model for this chapter is that AI monitoring is not one thing — it is four distinct layers stacked on top of each other, each answering a different question, each requiring different instrumentation. Confusing these layers is the single most common design mistake teams make (expanded in Section 11).
+</p>
+
+<table>
+<tr><th>Layer</th><th>Question It Answers</th><th>Example Metrics</th><th>Analogy From Traditional Ops</th></tr>
+<tr><td>1. Infrastructure / Operational</td><td>Is the service up, fast, and not falling over?</td><td>Request rate, error rate, p50/p95/p99 latency, thread pool saturation</td><td>Exactly what Actuator + Prometheus already gives you for any Spring service</td></tr>
+<tr><td>2. Usage / Cost</td><td>How much are we using, and what is it costing?</td><td>Prompt tokens, completion tokens, cost per request, cost per user/tenant, model mix</td><td>Cloud billing dashboards, but at request granularity</td></tr>
+<tr><td>3. Quality / Behavior</td><td>Is the model still answering well?</td><td>Hallucination rate proxy, faithfulness/groundedness score, refusal rate, retrieval relevance, user thumbs-down rate</td><td>Closest to classic ML monitoring's "accuracy in production"</td></tr>
+<tr><td>4. Safety / Abuse</td><td>Is anything malicious or policy-violating happening?</td><td>Prompt-injection detection rate, PII leakage flags, jailbreak attempt rate, toxic-output rate</td><td>Security monitoring / SIEM alerting</td></tr>
+</table>
+
+<p>
+The reason this stacking matters: Layer 1 metrics are the ones every engineer already knows how to build, and teams often stop there, declaring the AI feature "monitored" once Grafana shows latency and error rate. But a system can be green on Layer 1 — 100% uptime, fast responses, zero exceptions — while silently failing on Layer 3 or 4. A model that has started hallucinating more, or leaking retrieved PII into responses, produces a perfectly healthy-looking 200 OK with a fast response time. Layer 1 health is necessary but nowhere near sufficient for an AI system; the layers above it are where AI-specific engineering effort actually needs to go.
+</p>
+
+<h3>4.2 Golden Signals, Reinterpreted for LLMs</h3>
+
+<p>
+Google's SRE literature popularized four "golden signals" for monitoring any service: latency, traffic, errors, and saturation. These transfer to AI systems, but each needs an LLM-specific reinterpretation:
+</p>
+
+<ul>
+<li><strong>Latency</strong> — for LLMs this must be split into <em>time-to-first-token</em> (how long before streaming output begins, which dominates perceived responsiveness) and <em>total generation time</em> (which scales with completion length, not just load) — a distinction that does not exist for a typical CRUD endpoint.</li>
+<li><strong>Traffic</strong> — request volume still matters, but so does <em>token volume</em>, which can spike independently of request count (e.g., users pasting longer documents) and drives cost and rate-limit exposure more directly than request count does.</li>
+<li><strong>Errors</strong> — beyond HTTP-level errors, you need "soft errors": empty completions, malformed structured outputs that fail schema validation, tool calls that fail, and refusals — none of which are HTTP failures at all.</li>
+<li><strong>Saturation</strong> — beyond CPU/memory, the meaningful saturation signal is proximity to provider-side rate limits (requests-per-minute, tokens-per-minute quotas) and context-window utilization, both of which cause degraded behavior with no infrastructure alarm firing.</li>
+</ul>
+
+<h3>4.3 Leading vs. Lagging Indicators</h3>
+
+<p>
+A second essential distinction: a <strong>lagging indicator</strong> tells you damage has already happened (a spike in user complaints, a spike in negative feedback ratings). A <strong>leading indicator</strong> gives you warning before damage accumulates (rising average completion length driving up cost before the invoice arrives; a rising refusal rate suggesting an upstream safety filter got stricter; retrieval relevance scores dropping before users notice worse answers). The entire discipline of good AI monitoring design is the search for leading indicators that correlate tightly enough with the lagging ones you actually care about (user trust, cost, safety) that you can act on them early. Section 6's mechanism walks through exactly how such proxy signals are constructed and validated.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Concretely, here is the end-to-end mechanism by which a single LLM call becomes a set of monitored signals, step by step.
+</p>
+
+<h3>5.1 Instrumentation at the Call Site</h3>
+
+<p>
+Every call through your model abstraction (in Spring AI terms, every invocation that ultimately flows through a <code>ChatModel</code>) needs to be wrapped so that, regardless of which business feature triggered it, a consistent set of facts is captured: a request ID, the logical feature/use-case name, the model identifier and version string reported by the provider, prompt token count, completion token count, wall-clock latency split into time-to-first-token and total duration, the finish reason (stop, length, content-filter, tool-call), and — where computed — quality proxy scores. This wrapping is exactly the job of an <strong>Advisor</strong> in Spring AI's terms (covered in the Advisors chapter): a cross-cutting interceptor around every model call, structurally identical to an AOP interceptor you'd write for logging or security.
+</p>
+
+<h3>5.2 Emission Into a Metrics Pipeline</h3>
+
+<p>
+Each captured fact is emitted as one of three metric shapes, which map directly onto Micrometer's own primitives: a <strong>counter</strong> for things you count (requests, errors, tool-call failures, refusals), a <strong>timer/distribution summary</strong> for things with a distribution you need percentiles of (latency, tokens per request, cost per request), and a <strong>gauge</strong> for point-in-time state (current queue depth, current rate-limit budget remaining). These are tagged with dimensions — model name, feature name, tenant, prompt version — so that a dashboard or alert can slice by any of them later. This is identical, mechanically, to how you already instrument a payment or order service with Micrometer; only the tag vocabulary and the extra AI-specific measurements are new.
+</p>
+
+<h3>5.3 Sampling and Scoring for Quality Signals</h3>
+
+<p>
+Layer 3 (quality) metrics cannot usually be computed on every single request at full fidelity — running an LLM-as-judge evaluation (from Chapter 67) on every production response would roughly double your inference cost. The standard mechanism is <strong>tiered sampling</strong>: cheap, deterministic checks (schema validation success, output length within expected bounds, presence of a hedge/refusal phrase, retrieved-context overlap heuristics) run on 100% of traffic because they are nearly free; expensive checks (LLM-as-judge faithfulness scoring, semantic similarity against a reference) run on a statistically meaningful random sample (commonly 1–10%, sometimes stratified to over-sample from higher-risk segments such as new prompt versions or particular tenants) plus a targeted sample of user-flagged responses. This sampled score is then aggregated (e.g., "rolling 1-hour average faithfulness score") and treated as a regular time series alongside Layer 1 and 2 metrics.
+</p>
+
+<h3>5.4 Aggregation, Storage, and Alerting</h3>
+
+<p>
+Time series accumulate in a metrics backend (Prometheus being the default for a Spring Boot shop via Micrometer's registry), get visualized in Grafana, and are evaluated continuously against alert rules. An alert rule is a threshold or anomaly condition over a rolling window — "p95 latency over 5 minutes exceeds 4 seconds," "hourly cost exceeds $X," "sampled faithfulness score drops more than two standard deviations below its 7-day baseline." When a rule fires, it routes to a notification channel (PagerDuty, Slack, email) with enough context (which feature, which model, which tag values) to start triage immediately rather than requiring someone to first go hunting through dashboards to find what broke.
+</p>
+
+<h3>5.5 Closing the Loop Back to Evaluation</h3>
+
+<p>
+The mechanism is incomplete without a feedback path back to Chapter 67's evaluation harness: production requests that trigger quality alerts, receive negative user feedback, or get flagged by sampled scoring should be captured and fed into the evaluation dataset as new test cases. This is how a monitoring system compounds in value over time — every real-world failure becomes a permanent regression test, rather than a one-off incident that is forgotten once the graph goes back to green.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+AI monitoring leans far more on statistics than on the calculus-flavored mathematics of earlier volumes, because the entire point is separating a real degradation from ordinary noise. Three ideas carry almost all of the weight.
+</p>
+
+<h3>6.1 Percentiles, Not Averages</h3>
+
+<p>
+An average latency of 800ms can hide a p99 of 12 seconds affecting one in a hundred users — and because LLM latency scales with completion length, LLM latency distributions are typically far more right-skewed (a long tail of slow requests) than typical web request latency. This is why every latency dashboard in this chapter reports p50/p95/p99, never a bare average: the average is actively misleading for exactly the population you most need to protect — the unlucky tail of users hitting the worst-case behavior.
+</p>
+
+<h3>6.2 Statistical Process Control: Baselines and Standard Deviations</h3>
+
+<p>
+The core technique for turning a noisy metric into a reliable alert is treating it the way manufacturing quality control treats a measured process: compute a rolling baseline (mean and standard deviation over a trailing window, e.g., the last 7 days at the same hour-of-day/day-of-week to account for traffic seasonality), and alert when a new value falls more than <em>k</em> standard deviations from that baseline — commonly k = 2 or 3, trading false positives against detection sensitivity. This intuition is exactly a control chart: a value inside the expected band is noise; a value outside it, especially for several consecutive windows, is signal.
+</p>
+
+<pre>
+   Metric value
+      │                                    ⚠ alert fires here — 3σ below baseline
+      │      ●    ●  ●
+      │   ●    ●      ●  baseline band (mean ± 2σ)
+      │ ●  ─ ─ ─ ─ ─ ─ ─●─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+      │●              ●    ●    ●            │  normal noise stays inside the band
+      │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+      │                                   ●
+      │                                        ● ← sustained drop breaks the band
+      └───────────────────────────────────────────► time
+</pre>
+
+<h3>6.3 Drift as a Distance Between Distributions</h3>
+
+<p>
+Detecting that "the traffic has changed shape" (data drift) — e.g., prompt length distribution shifting, topic mix shifting, retrieval-hit-rate distribution shifting — is formalized as measuring the statistical distance between a reference distribution (last month's traffic, or the evaluation set from Chapter 67) and the current window's distribution. Two measures are common in practice: <strong>Population Stability Index (PSI)</strong>, which buckets values and compares bucket proportions, and <strong>KL divergence</strong> or its symmetric cousin, Jensen-Shannon divergence, which compare probability distributions directly. You do not need to compute these by hand — the same ML-monitoring tooling lineage from Section 2.2 provides libraries for this — but understanding that "drift" is operationally a distance computation between two histograms demystifies what a drift-detection dashboard is actually doing under the hood, and clarifies why it needs a stable reference distribution to compare against.
+</p>
+
+<h3>6.4 Sampling Error and Why Sample Size Matters</h3>
+
+<p>
+Because Layer 3 quality scores are usually computed on a sample (Section 5.3), the sampled average has its own margin of error, roughly proportional to <code>1/√n</code> for sample size <em>n</em>. Sampling 1% of a 10,000-request-per-hour feature gives you only 100 scored responses per hour — enough to detect a large, sustained shift in average quality, but far too noisy to trust a single hour's dip as a real signal. This is the mathematical reason quality alerts should be evaluated over multi-hour or daily rolling windows rather than minute-by-minute, unlike latency and error-rate alerts, which can and should react within minutes.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 End-to-End Signal Flow, One Request to One Alert</h3>
+
+<pre>
+┌───────────┐   ┌───────────────┐   ┌───────────────┐   ┌────────────────┐
+│  Client    │──►│ Spring Boot    │──►│  ChatClient +  │──►│  Foundation     │
+│  request   │   │ Controller     │   │  Advisor chain │   │  Model Provider │
+└───────────┘   └───────────────┘   └───────┬────────┘   └────────┬────────┘
+                                              │ (Advisor wraps call)   │
+                                              ▼                        ▼
+                                    ┌────────────────────────────────────┐
+                                    │  Monitoring Advisor captures:        │
+                                    │  - tokens (prompt/completion)        │
+                                    │  - latency (TTFT + total)            │
+                                    │  - finish reason                     │
+                                    │  - model id/version                  │
+                                    │  - sampled quality score (async)     │
+                                    └───────────────┬──────────────────────┘
+                                                    ▼
+                              ┌─────────────────────────────────────────┐
+                              │  Micrometer Registry (counters, timers,   │
+                              │  gauges, tagged by feature/model/tenant)  │
+                              └───────────────┬───────────────────────────┘
+                                              ▼
+                              ┌─────────────────────────────────────────┐
+                              │  Prometheus (scrape + store time series)  │
+                              └───────────────┬───────────────────────────┘
+                                     ┌─────────┴─────────┐
+                                     ▼                   ▼
+                          ┌───────────────────┐  ┌────────────────────────┐
+                          │  Grafana dashboards │  │  Alertmanager rules     │
+                          │  (humans look here)  │  │  (fires automatically)  │
+                          └───────────────────┘  └───────────┬────────────┘
+                                                              ▼
+                                                  ┌────────────────────────┐
+                                                  │  PagerDuty / Slack /     │
+                                                  │  on-call engineer        │
+                                                  └────────────────────────┘
+</pre>
+
+<h3>7.2 The Four Layers as a Single Panel, Side by Side</h3>
+
+<pre>
+ LAYER 1: OPERATIONAL       LAYER 2: COST            LAYER 3: QUALITY          LAYER 4: SAFETY
+ ──────────────────         ──────────────            ────────────────         ───────────────
+ p99 latency: 1.8s   OK     $ / hour: $42       OK    Faithfulness: 0.91  OK    Injection flags: 2  OK
+ error rate: 0.2%    OK     tokens/req: 640     OK    Refusal rate: 1.1%  OK    PII leaks: 0         OK
+ saturation: 61%     OK     cost/user: $0.02    OK    Thumbs-down: 3.4%  ⚠     Jailbreak attmpt: 0  OK
+                                                        ▲
+                                          A GREEN Layer 1+2 board tells you
+                                          NOTHING about the ⚠ in Layer 3 —
+                                          this is why all four boards must
+                                          be watched, not just the familiar two.
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a real deployment, monitoring is not a bolt-on dashboard — it is a layer that sits beside every AI-facing service and aggregates across all of them, because most organizations run more than one AI feature sharing the same model providers and the same cost budget.
+</p>
+
+<pre>
+                       ┌───────────────────────────────────────────┐
+                       │             API Gateway / LB                │
+                       └───────────────────────┬───────────────────┘
+                    ┌─────────────────────────┼─────────────────────────┐
+                    ▼                          ▼                          ▼
+         ┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
+         │ Support Assistant   │     │ Doc Summarizer     │     │ Code Review Bot     │
+         │ (Spring Boot + AI)  │     │ (Spring Boot + AI)  │     │ (Spring Boot + AI)  │
+         │   + Monitoring       │     │   + Monitoring      │     │   + Monitoring       │
+         │     Advisor          │     │     Advisor          │     │     Advisor           │
+         └──────────┬─────────┘     └──────────┬─────────┘     └──────────┬─────────┘
+                    │  metrics + traces via Micrometer / OpenTelemetry     │
+                    └─────────────────────────┼─────────────────────────┘
+                                              ▼
+                       ┌────────────────────────────────────────────┐
+                       │   Central Metrics Store (Prometheus/Mimir)   │
+                       │   + Trace Store (Tempo/Zipkin)               │
+                       │   + LLM-specific store (prompts, completions,│
+                       │     scores — e.g., Langfuse/Phoenix-style)    │
+                       └───────────────────┬────────────────────────┘
+                     ┌─────────────────────┼─────────────────────────┐
+                     ▼                     ▼                          ▼
+        ┌────────────────────┐  ┌───────────────────┐   ┌─────────────────────────┐
+        │ Grafana: per-team    │  │ Alertmanager: SLO   │   │ Cost & Governance         │
+        │ + org-wide dashboards│  │ + drift + safety     │   │ Dashboards (FinOps team,  │
+        │                      │  │ alert routing         │   │ platform leadership)       │
+        └────────────────────┘  └───────────────────┘   └─────────────────────────┘
+</pre>
+
+<p>
+Two architectural decisions recur across real deployments. First, monitoring instrumentation is built once, centrally (typically as a shared library or a starter dependency published internally), and every feature team consumes it via the Advisor chain rather than each team hand-rolling their own metric names — otherwise you get inconsistent tag naming and dashboards that cannot be compared across teams. Second, the LLM-specific store (capturing full prompt/completion pairs for sampled requests, not just numeric metrics) is deliberately a separate system from the numeric time-series store, because prompts and completions are large, potentially sensitive text blobs with different retention, access-control, and PII-handling requirements than a latency number — this separation is also where Section 13's security concerns become architecturally concrete.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring Boot engineers arrive at this chapter with almost the entire mechanical toolkit already in hand from building and monitoring ordinary microservices — the job here is applying it with an AI-aware metric taxonomy rather than learning new infrastructure from scratch.
+</p>
+
+<ul>
+<li><strong>Spring Boot Actuator</strong> remains the entry point exactly as it is for any service: <code>/actuator/health</code>, <code>/actuator/metrics</code>, and <code>/actuator/prometheus</code> (via the <code>micrometer-registry-prometheus</code> dependency) expose everything described in this chapter with no new transport mechanism required.</li>
+<li><strong>Micrometer</strong> is the instrumentation facade you already use for HTTP and JDBC metrics; AI metrics are added the same way, via <code>MeterRegistry.counter(...)</code>, <code>.timer(...)</code>, and <code>.gauge(...)</code> calls, tagged with dimensions like <code>model</code>, <code>feature</code>, and <code>tenant</code>.</li>
+<li><strong>Advisors</strong> in Spring AI are the natural, idiomatic place to attach this instrumentation, because an Advisor wraps every call made through a <code>ChatClient</code> regardless of which controller or service triggered it — precisely the same cross-cutting placement you would use for logging or auth interception.</li>
+<li><strong>Micrometer Observation API and OpenTelemetry integration</strong> (Spring Boot 3.x's default tracing story) let a single logical request be traced end-to-end — controller, Advisor chain, outbound model call, any tool invocations — as one distributed trace, which is essential for debugging a specific slow or low-quality request rather than only seeing it as one data point in an aggregate metric.</li>
+<li>Spring AI's model call surface (<code>ChatModel</code>, <code>ChatClient</code>, and the response metadata attached to a <code>ChatResponse</code>) typically exposes token usage and finish-reason information returned by the provider, which is exactly the raw material the Monitoring Advisor in Section 5.1 and 8's diagram consumes to populate token and cost metrics — read it from the response metadata rather than estimating it client-side wherever the provider makes it available, since provider-reported counts are the ones your bill is actually based on.</li>
+</ul>
+
+<pre>
+// Illustrative shape of a Monitoring Advisor wrapping every ChatClient call.
+// This is representative pseudocode showing the pattern, not a copy-paste API reference.
+
+public class MonitoringAdvisor implements CallAdvisor {
+
+    private final MeterRegistry registry;
+
+    @Override
+    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
+        String feature = request.context().getOrDefault("feature", "unknown").toString();
+        Timer.Sample sample = Timer.start(registry);
+
+        ChatClientResponse response = chain.nextCall(request);
+
+        sample.stop(registry.timer("ai.chat.latency", "feature", feature));
+
+        var usage = response.chatResponse().getMetadata().getUsage();
+        registry.counter("ai.chat.tokens.prompt", "feature", feature)
+                .increment(usage.getPromptTokens());
+        registry.counter("ai.chat.tokens.completion", "feature", feature)
+                .increment(usage.getCompletionTokens());
+
+        String finishReason = response.chatResponse()
+                .getResult().getMetadata().getFinishReason();
+        registry.counter("ai.chat.finish", "feature", feature, "reason", finishReason)
+                .increment();
+
+        return response;
+    }
+}
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Instrument all four layers from day one, not just Layer 1.</strong> Adding quality and safety metrics after an incident is far more expensive than building the Advisor once, correctly, before the first production traffic arrives.</li>
+<li><strong>Tag every metric with model identifier and prompt/template version.</strong> When a provider silently updates a model, or you ship a new prompt version, the tag is what lets you slice a dashboard and immediately see whether the regression correlates with the change — without this tag, you are reduced to guessing from deploy timestamps.</li>
+<li><strong>Alert on rate-of-change and sustained deviation, not single data points.</strong> A single noisy 1-minute spike in a sampled quality score is expected; three consecutive hours below baseline is a real signal — tune alert windows to the statistical noise level of the underlying sample size (Section 6.4).</li>
+<li><strong>Separate cost dashboards for engineering and for finance/leadership.</strong> Engineers need cost-per-request and token efficiency to optimize prompts; finance needs cost-per-day and cost-per-tenant/business-unit to forecast budgets — one dashboard rarely serves both audiences well.</li>
+<li><strong>Feed every confirmed production failure back into the Chapter 67 evaluation set.</strong> Monitoring without this feedback loop catches the same class of regression forever without ever preventing its recurrence pre-release.</li>
+<li><strong>Track "finish reason" as seriously as HTTP status codes.</strong> A completion that stopped because it hit the max-token limit mid-sentence, or was cut off by a content filter, is a silent failure that never appears as an HTTP error but materially harms the user experience.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Stopping at Layer 1 and calling the feature "monitored."</strong> As Section 4.1 explained, this is the single most common gap — a fully green infrastructure dashboard while quality silently degrades underneath it.</li>
+<li><strong>Alerting on raw averages instead of percentiles.</strong> Because LLM latency and cost distributions are heavily right-skewed, an average can look perfectly healthy while a meaningful fraction of users have a badly degraded experience.</li>
+<li><strong>Treating token counts as a proxy for cost without accounting for the provider's differential pricing.</strong> Prompt and completion tokens are frequently priced differently (often 3–5x apart), and different models on the same provider can differ by an order of magnitude in per-token price; a "tokens per request" chart alone can hide a large cost swing caused purely by a routing change to a pricier model.</li>
+<li><strong>Sampling quality checks too sparsely to be statistically meaningful, then over-reacting to noise.</strong> As shown in Section 6.4, a 1% sample of low-traffic features can produce so few scored responses per hour that ordinary sampling noise gets mistaken for a real regression, causing alert fatigue and eventual alert-ignoring.</li>
+<li><strong>Building dashboards nobody owns an alert response process for.</strong> A beautiful Grafana board that nobody is paged from is a report, not monitoring — every quality and safety metric in Layers 3 and 4 needs an explicit owner and a documented response runbook, not just visibility.</li>
+<li><strong>Forgetting that the model provider is a silent dependency.</strong> Teams often only tag metrics by their own feature/version and never by upstream model version, making it nearly impossible to detect a provider-side model swap as the root cause of a regression, as described in Section 1's opening scenario.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Monitoring itself has a performance and cost budget, and it is easy to let the cure become nearly as expensive as the disease:
+</p>
+
+<ul>
+<li><strong>Synchronous quality scoring adds latency directly to the user-facing request</strong> if implemented naively — the correct pattern is to return the primary response to the user immediately and perform sampled LLM-as-judge scoring asynchronously, off the request's critical path, exactly as shown in the architecture diagram's separation of the monitoring Advisor's cheap synchronous checks from its async sampled scoring.</li>
+<li><strong>High-cardinality tags silently blow up metrics storage and query cost.</strong> Tagging every metric with a raw user ID or full prompt text turns a handful of time series into millions, which both Prometheus and most metrics backends handle poorly; use coarser dimensions (tenant, feature, model, prompt-template-version) and push per-user or per-prompt detail into the separate trace/log store instead.</li>
+<li><strong>Sampled LLM-as-judge scoring itself costs real inference spend</strong> — scoring 10% of traffic with a judge model roughly adds 10% to your total inference bill; the sampling rate in Section 5.3 is therefore a real cost/detection-sensitivity trade-off, not just a statistics knob.</li>
+<li><strong>Dashboard query load scales with retention and cardinality together</strong> — long retention windows needed for weekly/monthly drift baselines (Section 6.3) multiply with tag cardinality to drive storage and query cost; most teams downsample older data (e.g., keep raw 1-minute resolution for 7 days, 1-hour rollups beyond that) to keep this bounded.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Monitoring has a real and specific security surface here, distinct from the model-injection concerns covered in earlier chapters. Because the LLM-specific store described in Section 8 captures actual prompt and completion text for sampled or flagged requests, it becomes a repository of potentially sensitive data by construction — user PII, proprietary business context pulled in by RAG, or confidential internal documents can all end up sitting in a monitoring/debugging tool that was designed with looser access controls than your primary data stores, simply because "it's just for observability." Treat this store with the same access-control, encryption-at-rest, and retention discipline as any system holding customer data — including redaction or hashing of sensitive fields before they are persisted for monitoring purposes wherever feasible, and short, deliberate retention windows rather than "keep everything forever for debugging."
+</p>
+
+<p>
+The second, more novel security angle is Layer 4 itself: monitoring is one of your primary detection mechanisms for prompt injection and jailbreak attempts, which is precisely why Section 4.1 lists it as a distinct layer rather than folding it into "quality." An unusual spike in refusal rate, in tool-calls to unexpected functions, or in flagged-content detections is often the first observable signature of an attack in progress, and alert rules on these signals should route to security response processes, not just engineering on-call, since a sustained pattern here is an incident, not a bug.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is the key difference between monitoring a typical REST service and monitoring an LLM-backed feature?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A REST service's health is largely captured by uptime, latency, and error rate, because a successful HTTP response usually implies a correct result. An LLM-backed feature can return a fast, well-formed 200 OK response that is nonetheless low-quality, hallucinated, or unsafe — so LLM monitoring needs additional layers beyond operational health: cost/usage, quality/behavior, and safety, none of which surface as HTTP errors.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why should latency for an LLM call be measured as both time-to-first-token and total duration, rather than one number?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Time-to-first-token drives perceived responsiveness, especially with streaming UIs, while total duration scales with completion length and is more relevant to throughput and cost. A regression in one without the other points to different root causes — e.g., a slow model queue versus a naturally longer completion — so collapsing both into a single latency number hides which problem you actually have.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain why average latency or average cost is a misleading metric for LLM systems, and what should be used instead.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>LLM latency and token/cost distributions are typically heavily right-skewed — most requests are fast and cheap, but a long tail of requests (long prompts, long completions, retries) can be dramatically slower or costlier. An average is dominated by the bulk of cheap requests and can look healthy while a meaningful fraction of users experience much worse behavior. Percentiles (p50/p95/p99) should be tracked and alerted on instead, because they expose exactly that tail.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. How would you detect that an upstream model provider silently changed the model behind a stable API alias?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Tag every metric with the model version/identifier string returned in the provider's response metadata, not just your own feature/deploy version, and watch for a change in that tag's value correlating with shifts in latency, token usage, or quality scores. Sudden shifts in output-length distribution, cost per request, or sampled quality scores with no corresponding deploy on your side are the classic symptom, and cross-referencing against the reported model-version tag confirms whether the provider is the root cause.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Design a monitoring strategy for a RAG-based support assistant handling 50,000 requests/day. What would you measure at each layer, and how would you sample quality checks?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Layer 1 (operational): request rate, error rate, p50/p95/p99 latency split into time-to-first-token and total, split further by retrieval-step latency vs. generation-step latency. Layer 2 (cost): prompt/completion tokens and cost per request, tagged by model and prompt-template version, plus retrieval index query cost if applicable. Layer 3 (quality): cheap synchronous checks on 100% of traffic — schema validity, output length bounds, presence of a "grounded in retrieved context" heuristic, retrieval-hit relevance score from the vector search itself; expensive checks — an LLM-as-judge faithfulness/groundedness score — on a stratified sample (e.g., 5% overall, oversampling any request the user gave negative feedback on or that used a newly deployed prompt version), aggregated into a rolling daily average with a statistical baseline band. Layer 4 (safety): flag rate for injection patterns in retrieved documents and refusal-rate anomalies. All four surfaced on separate dashboard sections with distinct alert routing, and every confirmed regression fed back into the evaluation dataset.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly connect the RAG-specific detail — separating retrieval latency/relevance from generation latency/quality — back to the retrieval layer covered in Volume 3. A candidate who monitors "the LLM call" as one undifferentiated block, without isolating retrieval as its own instrumented stage, is missing exactly the kind of layered thinking a staff-level reviewer is listening for.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. Your quality-score dashboard shows a sudden drop at 3 AM, but it recovers by 6 AM and no deploy happened. How do you determine whether this is a real incident or noise?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>First check the sample size behind the quality score during that window — low overnight traffic combined with a fixed sampling percentage can produce a handful of scored responses, well within expected sampling-error noise for the statistical baseline (Section 6.4), which would explain a transient dip with no real cause. Second, check whether the dip correlates with any tagged dimension — a specific model version, a specific tenant, a spike in a particular request type — which would suggest a real, if narrow, cause rather than pure noise. Third, check whether Layer 1 or Layer 2 signals moved in the same window (e.g., a provider-side latency blip or partial outage), since real provider incidents often show up briefly across multiple layers simultaneously. Only escalate as an incident if the drop exceeds the statistical noise band for that sample size and correlates with another independent signal.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A VP asks why the team needs a separate "LLM observability" tool when Datadog/Grafana already monitor every other service. How do you justify the investment, and what would you insist on building versus buying?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Existing APM tools cover Layer 1 (and to some extent Layer 2) extremely well — they were not designed to capture full prompt/completion payloads, token-level cost attribution, or quality/faithfulness scoring, and retrofitting that is possible but often reinvents purpose-built functionality. The justification is not "replace Datadog" but "add the missing layers": numeric operational and cost metrics stay in the existing Micrometer/Prometheus/Grafana pipeline the org already operates, while prompt/completion capture, sampled LLM-as-judge scoring, and prompt-version-aware quality trending go into a system built for that specific data shape (whether bought or built), because that data has different volume, sensitivity, and query patterns (searching by prompt content, not by numeric threshold) than a metrics database is optimized for. The build-vs-buy line: buy the LLM-specific trace/scoring UI if a vendor's data-handling and integration model fits your compliance constraints; build only the thin Advisor-level instrumentation layer that emits data into both systems, so you are never locked into a single vendor for the underlying metrics pipeline.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How would you design alert thresholds so that a small team isn't drowning in false-positive pages, while still catching real regressions early, across all four monitoring layers?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Match each alert's statistical rigor to its underlying sample size and business impact rather than using one blanket threshold policy. High-volume, low-noise Layer 1 signals (latency, error rate) can alert on short windows (a few minutes) since sample sizes are large and the cost of a missed operational incident is immediate and visible. Lower-volume, sampled Layer 3 quality signals need multi-hour or daily rolling windows with statistical baselining (mean ± 2–3σ from a seasonally-aware historical baseline) precisely because small-sample noise would otherwise trigger constant false alarms. Route alerts by severity and confidence: a single-window Layer 1 breach can page immediately; a Layer 3 quality dip should first require sustained deviation across multiple windows before paging, with a lower-urgency Slack notification for single-window dips. Finally, treat alert-tuning itself as an ongoing practice — review fired alerts weekly, and any alert that is consistently acknowledged as noise gets either its threshold widened or its window lengthened, since an ignored alert channel is equivalent to no monitoring at all.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why a fully green Layer 1 (operational) dashboard provides almost no evidence that an LLM feature's output quality is acceptable. Use a concrete example of a failure mode that would be invisible to Layer 1 alone.</li>
+<li>For a feature you have worked on (AI-backed or not), identify one leading indicator and one lagging indicator for the same underlying problem. Explain why the leading indicator gives you an earlier warning, and what would need to be true for it to be a reliable proxy.</li>
+<li>Explain why quality-score alert windows generally need to be longer than latency alert windows, connecting your answer to sample size and statistical noise.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Design the Micrometer metric names, types (counter/timer/gauge), and tag sets you would add to a Spring AI-based chat feature to cover all four monitoring layers from Section 4.1. Write them out as a table: metric name, type, tags, and which layer it belongs to.</li>
+<li>Sketch, in the ASCII style of Section 7, an alerting decision flow for a single metric — sampled faithfulness score — starting from "raw sampled score computed" through "baseline comparison" to "alert fires or does not fire," explicitly showing where the statistical baseline window and threshold decision happen.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Monitoring turns the one-time evaluation criteria from Chapter 67 into continuously running instruments, because a probabilistic, provider-dependent system can silently drift after it has already passed every pre-release check.</li>
+<li>AI monitoring is four distinct layers — operational, cost/usage, quality/behavior, and safety/abuse — and a fully healthy operational dashboard says nothing about the other three; teams that stop at Layer 1 are not actually monitoring the AI part of their system.</li>
+<li>The golden signals (latency, traffic, errors, saturation) still apply but need LLM-specific reinterpretation: split latency into time-to-first-token and total duration, track token volume alongside request volume, treat refusals and malformed outputs as errors, and watch provider rate-limit proximity as saturation.</li>
+<li>Quality signals cannot be computed on every request at full fidelity; tiered sampling — cheap deterministic checks on all traffic, expensive LLM-as-judge scoring on a statistically sized sample — is the standard mechanism, and alert windows must be sized to that sample's statistical noise.</li>
+<li>The infrastructure (Micrometer, Prometheus, Grafana, Spring AI Advisors) is largely the same toolkit you already use for any Spring Boot service; what is new is the AI-specific metric taxonomy and the discipline of feeding confirmed production failures back into the evaluation suite.</li>
+<li>Monitoring data itself carries real security and cost weight — sampled prompt/completion capture must be access-controlled and retention-limited like any store of sensitive data, and sampling rates and dashboard cardinality are direct cost levers, not free.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Observability at Scale (Chapter 69) goes one level deeper than the dashboards and alerts built here — it is about being able to answer questions you did not think to build a metric for in advance, through distributed tracing, structured logging, and exploratory querying across an entire fleet of AI features, so that when monitoring tells you <em>something</em> is wrong, observability lets you find out exactly <em>why</em>, down to the individual request.
+</p>
+
+</div>
+
+</body>
+</html>

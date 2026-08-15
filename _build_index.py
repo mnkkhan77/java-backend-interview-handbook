@@ -8,49 +8,62 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # The sidebar renders a bold track heading above the first group of each
 # track, so a technology switch (Java -> React -> AI) is visually obvious,
 # not just implied by group names. Track/group ORDER controls display and
-# reading order only — chapter "num" values are untouched, so existing
-# links (e.g. #105-h5) keep working no matter where a track sits here.
+# reading order.
+#
+# Each track has its OWN chapter files in its own subfolder (java/, react/,
+# ai-engineering/) and its OWN "num" sequence starting back at "01" -- a
+# chapter's on-disk identity is (track, num), not num alone, since the same
+# num string is reused across tracks. TRACK_FOLDER maps a track name to its
+# subfolder; TRACK_SLUG gives the short id used internally by the reader's
+# JS for routing/DOM ids (see chKey() in _handbook_template.html), since
+# num alone is no longer globally unique.
+TRACK_FOLDER = {
+    "Java Backend Interview Handbook": "java",
+    "React & Frontend Interview Handbook": "react",
+    "AI Engineering & Production": "ai-engineering",
+}
+TRACK_SLUG = {
+    "Java Backend Interview Handbook": "java",
+    "React & Frontend Interview Handbook": "react",
+    "AI Engineering & Production": "ai",
+}
+
 TRACKS = [
     ("Java Backend Interview Handbook", [
-        ("Behavioural & HR",       ["01", "14"]),
-        ("Core Java",              ["02", "03", "04", "05", "06"]),
-        ("Spring",                 ["07", "08", "09", "10"]),
-        ("Testing",                ["16"]),
-        ("Design Patterns",        ["18"]),
-        ("APIs & Messaging",       ["21", "22"]),
-        ("Architecture & Design",  ["11", "13"]),
-        ("Database",               ["12", "23"]),
-        ("DevOps & Cloud",         ["19", "20"]),
-        ("Version Control",        ["24"]),
-        ("Problem Solving (DSA)",  ["17"]),
-        ("Mock Interview",         ["15"]),
+        ("Behavioural & HR", ["01", "02"]),
+        ("Core Java", ["03", "04", "05", "06", "07", "08"]),
+        ("Spring", ["09", "10", "11", "12", "13"]),
+        ("Testing", ["14"]),
+        ("Design Patterns", ["15"]),
+        ("APIs & Messaging", ["16", "17", "18"]),
+        ("Architecture & Design", ["19", "20", "21"]),
+        ("Database", ["22", "23"]),
+        ("DevOps & Cloud", ["24", "25", "26"]),
+        ("Version Control & Build Tools", ["27", "28"]),
+        ("Problem Solving (DSA)", ["29"]),
+        ("Mock Interview", ["30"]),
     ]),
-    # --- React / Frontend Interview Handbook (chapter numbers 112-135,
-    # ported from react/*.html) — its own track between the Java interview
-    # handbook above and the AI Engineering track below. ---
     ("React & Frontend Interview Handbook", [
-        ("Behavioural & HR",        ["112", "135"]),
-        ("JavaScript & TypeScript", ["113", "114", "115"]),
-        ("React Core",              ["116", "117", "118", "119"]),
-        ("State & Data",            ["120", "121", "122"]),
-        ("Routing & Rendering",     ["123", "124"]),
-        ("Performance & Internals", ["125", "126"]),
-        ("Styling & UI",            ["127"]),
-        ("Quality & Accessibility", ["128", "129"]),
-        ("Web Platform & Security", ["130", "131"]),
-        ("Tooling & Architecture",  ["132", "133"]),
-        ("Problem Solving (DSA)",   ["134"]),
+        ("Behavioural & HR", ["01", "02"]),
+        ("JavaScript & TypeScript", ["03", "04", "05"]),
+        ("React Core", ["06", "07", "08", "09"]),
+        ("State & Data", ["10", "11", "12", "13"]),
+        ("Routing & Rendering", ["14", "15", "16"]),
+        ("Performance & Internals", ["17", "18"]),
+        ("Styling & UI", ["19", "20"]),
+        ("Quality & Accessibility", ["21", "22", "23"]),
+        ("Web Platform & Security", ["24", "25", "26", "27"]),
+        ("Tooling & Architecture", ["28", "29"]),
+        ("Problem Solving (DSA)", ["30"]),
     ]),
-    # --- Mastering AI Engineering with Java & Spring AI (chapter numbering
-    # continues from 25 onward; one GROUPS entry per volume). Add a chapter's
-    # number to a group only once its file actually exists. ---
     ("AI Engineering & Production", [
-        ("AI Foundations",             ["25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49"]),
-        ("Spring AI",                  ["50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63", "64"]),
-        ("Embeddings & RAG",           ["65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75", "76", "77"]),
-        ("AI Agents & MCP",            ["78", "79", "80", "81", "82", "83", "84", "85", "86", "87"]),
-        ("Enterprise AI Engineering",  ["88", "89", "90", "91", "92", "93", "94", "95", "96", "97", "98", "99"]),
-        ("AI Production Projects",     ["100", "101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "111"]),
+        ("AI Foundations", ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25"]),
+        ("Spring AI", ["26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40"]),
+        ("Embeddings & RAG", ["41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53"]),
+        ("AI Agents & MCP", ["54", "55", "56", "57", "58", "59", "60", "61", "62", "63"]),
+        ("Enterprise AI Engineering", ["64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75"]),
+        ("AI Production Projects", ["76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87"]),
+        ("Advanced & Specialized Topics", ["88", "89", "90", "91", "92", "93"]),
     ]),
 ]
 
@@ -64,150 +77,173 @@ for _track_title, _groups in TRACKS:
         GROUPS.append(_g)
 
 TITLES = {
-    "01": "Introduction & HR",
-    "02": "Core Java",
-    "03": "Collections",
-    "04": "Java 8 – 21",
-    "05": "Concurrency & Multithreading",
-    "06": "JVM & Garbage Collection",
-    "07": "Spring Core",
-    "08": "Spring Boot",
-    "09": "Spring Data JPA & Hibernate",
-    "10": "Spring Security, JWT & OAuth2",
-    "11": "Microservices",
-    "12": "SQL & Database Design",
-    "13": "System Design",
-    "14": "Behavioural & Self-Intro",
-    "15": "Mock Interview — 1000 Questions",
-    "16": "Unit Testing (JUnit & Mockito)",
-    "17": "Data Structures & Algorithms",
-    "18": "Design Patterns",
-    "19": "DevOps, Docker & Kubernetes",
-    "20": "Cloud & AWS",
-    "21": "REST API Design & Documentation",
-    "22": "Messaging & Event Streaming",
-    "23": "NoSQL & MongoDB",
-    "24": "Git & Version Control",
-    "25": "What Intelligence Really Means",
-    "26": "History of AI",
-    "27": "Machine Learning Fundamentals",
-    "28": "Neural Networks",
-    "29": "Deep Learning",
-    "30": "Sequence Models",
-    "31": "RNNs",
-    "32": "LSTMs",
-    "33": "Transformers",
-    "34": "Attention",
-    "35": "Query, Key, and Value",
-    "36": "Multi-Head Attention",
-    "37": "Positional Encoding",
-    "38": "Decoder Architecture",
-    "39": "Tokens",
-    "40": "Embeddings",
-    "41": "Vector Mathematics",
-    "42": "Context Windows",
-    "43": "Sampling",
-    "44": "Hallucinations",
-    "45": "Prompt Engineering",
-    "46": "Context Engineering",
-    "47": "Fine-Tuning",
-    "48": "Reasoning Models",
-    "49": "Introduction to RAG",
-    "50": "Spring AI Architecture",
-    "51": "ChatModel",
-    "52": "ChatClient",
-    "53": "Prompt",
-    "54": "PromptTemplate",
-    "55": "Advisors",
-    "56": "Memory",
-    "57": "Streaming",
-    "58": "Structured Output",
-    "59": "Tool Calling",
-    "60": "Multi-model Support",
-    "61": "MCP Integration",
-    "62": "Observability",
-    "63": "Testing",
-    "64": "Performance Optimization",
-    "65": "Embedding Models",
-    "66": "Chunking",
-    "67": "Vector Databases",
-    "68": "pgvector",
-    "69": "Pinecone",
-    "70": "Qdrant",
-    "71": "Weaviate",
-    "72": "Hybrid Search",
-    "73": "Reranking",
-    "74": "Metadata Filtering",
-    "75": "Retrieval Strategies",
-    "76": "Enterprise RAG",
-    "77": "Evaluation",
-    "78": "Agent Fundamentals",
-    "79": "Planning",
-    "80": "Reflection",
-    "81": "Agent Memory",
-    "82": "Tool Usage",
-    "83": "Agent Orchestration",
-    "84": "Multi-Agent Systems",
-    "85": "MCP Deep Dive",
-    "86": "Agent Architectures",
-    "87": "Enterprise Agents",
-    "88": "Security",
-    "89": "Guardrails",
-    "90": "Prompt Injection",
-    "91": "Evaluation at Enterprise Scale",
-    "92": "Monitoring",
-    "93": "Observability at Scale",
-    "94": "Cost Optimization",
-    "95": "Scaling",
-    "96": "Kubernetes for AI Workloads",
-    "97": "Distributed Systems for AI",
-    "98": "Governance",
-    "99": "Compliance",
-    "100": "AI Chat Platform",
-    "101": "Enterprise Knowledge Assistant",
-    "102": "AI-Powered LMS",
-    "103": "Resume Analyzer",
-    "104": "SQL Copilot",
-    "105": "Coding Assistant",
-    "106": "Customer Support AI",
-    "107": "Incident Analysis System",
-    "108": "Document Intelligence Platform",
-    "109": "Multi-Agent Research System",
-    "110": "AI Voice Assistant",
-    "111": "AI Workflow Automation Platform",
-    "112": "Introduction & HR",
-    "113": "JavaScript Fundamentals",
-    "114": "Advanced JavaScript & Async",
-    "115": "TypeScript for React",
-    "116": "React Fundamentals",
-    "117": "React Hooks",
-    "118": "Advanced Hooks & Custom Hooks",
-    "119": "Component Patterns",
-    "120": "State Management",
-    "121": "Data Fetching & Server State",
-    "122": "Forms & Validation",
-    "123": "React Router & Navigation",
-    "124": "Next.js, SSR & Server Components",
-    "125": "Performance Optimization",
-    "126": "React Internals (Fiber & Reconciliation)",
-    "127": "Styling & CSS Architecture",
-    "128": "Testing (Jest & React Testing Library)",
-    "129": "Accessibility (a11y)",
-    "130": "Browser & Web Platform Fundamentals",
-    "131": "Frontend Security",
-    "132": "Build Tools & Tooling",
-    "133": "Frontend System Design",
-    "134": "Data Structures & Algorithms (JavaScript)",
-    "135": "Behavioural & Self-Introduction",
+    "ai-engineering": {
+        "01": "What Intelligence Really Means",
+        "02": "History of AI",
+        "03": "Machine Learning Fundamentals",
+        "04": "Neural Networks",
+        "05": "Deep Learning",
+        "06": "Sequence Models",
+        "07": "RNNs",
+        "08": "LSTMs",
+        "09": "Transformers",
+        "10": "Attention",
+        "11": "Query, Key, and Value",
+        "12": "Multi-Head Attention",
+        "13": "Positional Encoding",
+        "14": "Decoder Architecture",
+        "15": "Tokens",
+        "16": "Embeddings",
+        "17": "Vector Mathematics",
+        "18": "Context Windows",
+        "19": "Sampling",
+        "20": "Hallucinations",
+        "21": "Prompt Engineering",
+        "22": "Context Engineering",
+        "23": "Fine-Tuning",
+        "24": "Reasoning Models",
+        "25": "Introduction to RAG",
+        "26": "Spring AI Architecture",
+        "27": "ChatModel",
+        "28": "ChatClient",
+        "29": "Prompt",
+        "30": "PromptTemplate",
+        "31": "Advisors",
+        "32": "Memory",
+        "33": "Streaming",
+        "34": "Structured Output",
+        "35": "Tool Calling",
+        "36": "Multi-model Support",
+        "37": "MCP Integration",
+        "38": "Observability",
+        "39": "Testing",
+        "40": "Performance Optimization",
+        "41": "Embedding Models",
+        "42": "Chunking",
+        "43": "Vector Databases",
+        "44": "pgvector",
+        "45": "Pinecone",
+        "46": "Qdrant",
+        "47": "Weaviate",
+        "48": "Hybrid Search",
+        "49": "Reranking",
+        "50": "Metadata Filtering",
+        "51": "Retrieval Strategies",
+        "52": "Enterprise RAG",
+        "53": "Evaluation",
+        "54": "Agent Fundamentals",
+        "55": "Planning",
+        "56": "Reflection",
+        "57": "Agent Memory",
+        "58": "Tool Usage",
+        "59": "Agent Orchestration",
+        "60": "Multi-Agent Systems",
+        "61": "MCP Deep Dive",
+        "62": "Agent Architectures",
+        "63": "Enterprise Agents",
+        "64": "Security",
+        "65": "Guardrails",
+        "66": "Prompt Injection",
+        "67": "Evaluation at Enterprise Scale",
+        "68": "Monitoring",
+        "69": "Observability at Scale",
+        "70": "Cost Optimization",
+        "71": "Scaling",
+        "72": "Kubernetes for AI Workloads",
+        "73": "Distributed Systems for AI",
+        "74": "Governance",
+        "75": "Compliance",
+        "76": "AI Chat Platform",
+        "77": "Enterprise Knowledge Assistant",
+        "78": "AI-Powered LMS",
+        "79": "Resume Analyzer",
+        "80": "SQL Copilot",
+        "81": "Coding Assistant",
+        "82": "Customer Support AI",
+        "83": "Incident Analysis System",
+        "84": "Document Intelligence Platform",
+        "85": "Multi-Agent Research System",
+        "86": "AI Voice Assistant",
+        "87": "AI Workflow Automation Platform",
+        "88": "Fine-Tuning Deep Dive (LoRA, QLoRA & PEFT)",
+        "89": "Model Quantization & Local Deployment",
+        "90": "Multi-Modal Models (Vision & Audio)",
+        "91": "LLMOps & Model Lifecycle Management",
+        "92": "Responsible AI, Safety & Ethics",
+        "93": "AI Engineer Behavioural & Career Interview",
+    },
+    "java": {
+        "01": "Introduction & HR",
+        "02": "Behavioural & Self-Intro",
+        "03": "Core Java",
+        "04": "Collections",
+        "05": "Java 8 – 21",
+        "06": "Concurrency & Multithreading",
+        "07": "JVM & Garbage Collection",
+        "08": "Modern Java Features (Records, Sealed Classes & Pattern Matching)",
+        "09": "Spring Core",
+        "10": "Spring Boot",
+        "11": "Spring Data JPA & Hibernate",
+        "12": "Spring Security, JWT & OAuth2",
+        "13": "Reactive Programming (Project Reactor & WebFlux)",
+        "14": "Unit Testing (JUnit & Mockito)",
+        "15": "Design Patterns",
+        "16": "REST API Design & Documentation",
+        "17": "Messaging & Event Streaming",
+        "18": "Kafka & Event-Driven Architecture Deep Dive",
+        "19": "Microservices",
+        "20": "System Design",
+        "21": "Caching Strategies (Redis, Caffeine, Spring Cache)",
+        "22": "SQL & Database Design",
+        "23": "NoSQL & MongoDB",
+        "24": "DevOps, Docker & Kubernetes",
+        "25": "Cloud & AWS",
+        "26": "Observability & Monitoring",
+        "27": "Git & Version Control",
+        "28": "Build Tools (Maven & Gradle)",
+        "29": "Data Structures & Algorithms",
+        "30": "Mock Interview — 1000 Questions",
+    },
+    "react": {
+        "01": "Introduction & HR",
+        "02": "Behavioural & Self-Introduction",
+        "03": "JavaScript Fundamentals",
+        "04": "Advanced JavaScript & Async",
+        "05": "TypeScript for React",
+        "06": "React Fundamentals",
+        "07": "React Hooks",
+        "08": "Advanced Hooks & Custom Hooks",
+        "09": "Component Patterns",
+        "10": "State Management",
+        "11": "Data Fetching & Server State",
+        "12": "Forms & Validation",
+        "13": "GraphQL & Apollo Client",
+        "14": "React Router & Navigation",
+        "15": "Next.js, SSR & Server Components",
+        "16": "React 19: Server Actions & Concurrent Features",
+        "17": "Performance Optimization",
+        "18": "React Internals (Fiber & Reconciliation)",
+        "19": "Styling & CSS Architecture",
+        "20": "Design Systems & Component Libraries",
+        "21": "Testing (Jest & React Testing Library)",
+        "22": "Accessibility (a11y)",
+        "23": "End-to-End Testing (Cypress & Playwright)",
+        "24": "Browser & Web Platform Fundamentals",
+        "25": "Frontend Security",
+        "26": "Progressive Web Apps & Service Workers",
+        "27": "Internationalization (i18n)",
+        "28": "Build Tools & Tooling",
+        "29": "Frontend System Design",
+        "30": "Data Structures & Algorithms (JavaScript)",
+    },
 }
 
-def find_file(num):
-    # num-width-agnostic: works for "07" (2-digit, chs 01-99) and, once the
-    # AI Engineering track passes chapter 99, "100" (3-digit) alike.
-    matches = glob.glob(os.path.join(ROOT, num + "-*.html"))
+def find_file(folder, num):
+    # num-width-agnostic, though every track currently fits in 2 digits (<=99 chapters)
+    matches = glob.glob(os.path.join(ROOT, folder, num + "-*.html"))
     matches = [m for m in matches if os.path.basename(m)[:len(num)] == num]
     if not matches:
-        raise SystemExit("No file for chapter " + num)
+        raise SystemExit("No file for chapter %s in %s" % (num, folder))
     return os.path.basename(matches[0])
 
 def is_noise(text):
@@ -240,9 +276,11 @@ chapters = []
 
 for group_idx, (group_name, nums) in enumerate(GROUPS):
     track_name = TRACK_OF_GROUP[group_idx]
+    folder = TRACK_FOLDER[track_name]
+    slug = TRACK_SLUG[track_name]
     for num in nums:
-        fname = find_file(num)
-        path = os.path.join(ROOT, fname)
+        fname = find_file(folder, num)
+        path = os.path.join(ROOT, folder, fname)
         with open(path, "r", encoding="utf-8") as fh:
             content = fh.read()
 
@@ -265,7 +303,7 @@ for group_idx, (group_name, nums) in enumerate(GROUPS):
                 fh.write(new_content)
 
         # first h1 is the document title; the rest are navigable sub-sections (minus noise)
-        chapter_title = TITLES.get(num, sections[0]["text"] if sections else fname)
+        chapter_title = TITLES[folder].get(num, sections[0]["text"] if sections else fname)
         subs = []
         for i, s in enumerate(sections):
             if i == 0:
@@ -276,7 +314,8 @@ for group_idx, (group_name, nums) in enumerate(GROUPS):
 
         chapters.append({
             "num": num,
-            "file": fname,
+            "trackSlug": slug,
+            "file": folder + "/" + fname,
             "title": chapter_title,
             "group": group_name,
             "track": track_name,
@@ -296,6 +335,7 @@ with open(os.path.join(ROOT, "_handbook_template.html"), "r", encoding="utf-8") 
     hb_template = fh.read()
 
 hb = hb_template.replace("var CHAPTERS = [];", "var CHAPTERS = " + DATA + ";", 1)
+hb = hb.replace("{{CHAPTER_COUNT}}", str(len(chapters)), 1)
 with open(os.path.join(ROOT, "handbook.html"), "w", encoding="utf-8", newline="\n") as fh:
     fh.write(hb)
 
@@ -303,4 +343,4 @@ total_subs = sum(len(c["sections"]) for c in chapters)
 print("Chapters: %d, total sub-sections: %d" % (len(chapters), total_subs))
 print("Generated: handbook.html (single-file, mobile-friendly)")
 for c in chapters:
-    print("  %s  %-32s  %2d sections  [%s]" % (c["num"], c["title"], len(c["sections"]), c["file"]))
+    print("  %s/%-2s  %-32s  %2d sections  [%s]" % (c["trackSlug"], c["num"], c["title"], len(c["sections"]), c["file"]))

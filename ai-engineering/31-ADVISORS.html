@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>55-ADVISORS.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 31 — ADVISORS</h1>
+
+<p class="roi">Volume 2 — Spring AI · Chapter 6 of 15</p>
+
+<div class="callout">
+<code>PromptTemplate</code> (Chapter 30) solved the problem of building <em>one</em> well-shaped prompt cleanly. But real applications don't send one prompt in isolation — every call needs logging, every conversational call needs history injected, many calls need retrieved context stitched in, and some calls need a safety check before they ever reach the model. If you hand-wire all of that into every controller method that calls <code>ChatClient</code>, you will reinvent, badly, the exact problem Spring's AOP and servlet filters solved for you fifteen years ago. Advisors are Spring AI's answer: a formal interception point around every model call where cross-cutting concerns live once, not everywhere.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Imagine you have just finished wiring a <code>ChatClient</code> call using a clean <code>PromptTemplate</code>. It works. Then product asks for conversation memory — the model needs to remember what the user said three messages ago. Then observability asks for structured logging of every prompt and response, including token counts and latency, for every single call site in the codebase. Then legal asks for a safety check that blocks certain categories of user input before it ever reaches the model. Then the RAG team asks for retrieved documents to be automatically appended to the prompt for a subset of endpoints. If you implement each of these requirements by editing the body of every method that builds a prompt and calls the model, you have just created the AI-era equivalent of copy-pasting authentication logic into every controller method — the exact anti-pattern that authentication filters, method-level security, and AOP were invented to eliminate in traditional Spring applications.
+</p>
+
+<p>
+This is the concrete, inevitable problem every reader of this chapter will hit within their first few weeks of building anything beyond a toy chatbot: <strong>the "core" logic of an AI feature (what question is the user asking, what should the model be told) is a small fraction of the code that actually needs to run around a model call.</strong> Memory injection, retrieval augmentation, logging, safety filtering, re-writing queries, redacting PII, retry-with-fallback logic — none of these are the business logic of any single feature. They are concerns that cut <em>across</em> nearly every feature that touches a <code>ChatClient</code>. Spring AI's <strong>Advisor</strong> abstraction exists precisely to let you write each of these concerns exactly once, register it, and have it apply uniformly to every relevant call — the same architectural instinct that gave you <code>OncePerRequestFilter</code>, <code>HandlerInterceptor</code>, and <code>@Aspect</code> in the web tier of a normal Spring Boot application.
+</p>
+
+<p>
+Getting comfortable with Advisors early matters for a second, less obvious reason: nearly every other capability covered later in this volume — Chat Memory (Chapter 32), Retrieval Augmented Generation wiring, guardrails, and observability — is <em>implemented as an Advisor</em> in Spring AI's own codebase, and is <em>configured by registering an Advisor</em> in yours. If Advisors feel foreign to you, every subsequent chapter in Volume 2 will feel like magic happening behind an API you don't fully trust. If Advisors feel like an old friend — because you've internalized the interceptor-chain mental model from years of Spring MVC and AOP — the rest of Volume 2 becomes mechanical: "which Advisor do I register, and in what order?"
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+The Advisor pattern in Spring AI is not a novel invention — it is a direct, intentional descendant of a lineage of interception patterns that Java engineers have been using for over two decades, and the name itself is a deliberate callback to that lineage.
+</p>
+
+<h3>2.1 Servlet Filters and the Chain of Responsibility</h3>
+
+<p>
+Long before Spring existed, the Servlet specification introduced <code>javax.servlet.Filter</code> — a way to intercept an HTTP request before it reached your servlet, and intercept the response before it reached the client, without the servlet itself knowing or caring that interception was happening. A <code>FilterChain</code> let you stack filters: authentication, then logging, then compression, then your actual handler. This is the textbook <strong>Chain of Responsibility</strong> design pattern: each link in the chain gets a chance to inspect or modify the request/response, and each link decides whether to pass control to the next link or short-circuit the chain entirely (for example, an authentication filter rejecting a request outright without ever invoking the servlet).
+</p>
+
+<h3>2.2 Spring AOP and the "Advice" Vocabulary</h3>
+
+<p>
+When Spring introduced Aspect-Oriented Programming, it borrowed vocabulary directly from AspectJ: an <strong>Advice</strong> is the code that runs at a join point (a method call), and an <strong>Advisor</strong> in classic Spring AOP is specifically the pairing of a <em>pointcut</em> (which join points this applies to) with an <em>advice</em> (what to run there). If you have ever written a <code>@Before</code>, <code>@Around</code>, or <code>@AfterReturning</code> aspect for logging or transaction management, you have already used this exact vocabulary — Spring AI's Advisor abstraction reuses the word "Advisor" precisely because it plays the same architectural role: code that wraps around a call, decides what happens before it, what happens after it, and whether it proceeds at all.
+</p>
+
+<h3>2.3 Middleware in Other Ecosystems</h3>
+
+<p>
+This is not a Java-only idea. Express.js middleware, ASP.NET's middleware pipeline, and gRPC interceptors all solve the identical problem in their own ecosystems: how do you compose independent, reusable pieces of cross-cutting behavior around a core request-handling function, in a defined order, without those pieces knowing about each other? Every mature request-processing framework eventually grows this shape because the underlying problem — cross-cutting concerns around a core operation — is universal. Spring AI's Advisor is the AI-era instance of a pattern this old.
+</p>
+
+<h3>2.4 Why LLM Calls Needed Their Own Version</h3>
+
+<p>
+You might reasonably ask: why not just reuse <code>HandlerInterceptor</code> or AOP directly around the <code>ChatClient</code> bean? Two reasons this doesn't work cleanly. First, a generic AOP <code>@Around</code> advice sees a raw method invocation (arguments, return value) — it has no structured understanding of "this is a system message," "this is conversation history," "this is a user question," or "this is a streaming response versus a single response." An Advisor operating at the <code>ChatClient</code> layer sees a structured request (messages, options, advisor-specific context) and a structured response, which is exactly the granularity cross-cutting AI concerns need — a memory advisor needs to read and rewrite the message list, not an opaque method argument. Second, LLM calls come in two fundamentally different shapes — a single blocking call and a streaming call (a <code>Flux</code> of partial responses) — and generic method interception doesn't naturally distinguish "wrap the one response" from "wrap every chunk of a stream." Spring AI's Advisor API was built with both call shapes as first-class citizens from the start.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Provide a composable, ordered interception mechanism around every <code>ChatClient</code> call — both blocking and streaming — so that cross-cutting concerns (memory, retrieval, logging, safety, rewriting) can be implemented once, registered declaratively, and applied consistently, without modifying the call site's business logic or knowing about each other.</strong>
+</div>
+
+<p>
+Unpack the specific engineering constraints packed into that sentence, because each one rules out a naive alternative you might otherwise reach for:
+</p>
+
+<ul>
+<li><strong>"Composable"</strong> rules out hard-coding a fixed pipeline (e.g., "always log, then always inject memory, then always call the model"). Different endpoints in the same application legitimately need different combinations — a stateless FAQ endpoint has no need for conversation memory; an internal admin tool has no need for a safety filter tuned for public users.</li>
+<li><strong>"Ordered"</strong> rules out treating advisors as an unordered set. Order is semantically load-bearing: a safety-check advisor that inspects raw user input must run before a memory advisor rewrites that input by prepending history, or it will be inspecting the wrong text. A logging advisor that wants to log the <em>final</em> prompt sent to the model must run after retrieval and memory advisors have finished mutating it.</li>
+<li><strong>"Both blocking and streaming"</strong> rules out any design that only knows how to wrap a single request/response pair. A streaming chat response arrives as a sequence of partial chunks over time; an advisor that wants to log the complete final answer, or persist it to conversation memory, has to correctly handle "the response isn't finished yet" without blocking or corrupting the stream.</li>
+<li><strong>"Without modifying the call site"</strong> rules out requiring every controller or service method that calls the model to manually call helper methods for memory, logging, and safety in the right order, every time, correctly, forever, across every developer who touches the codebase.</li>
+<li><strong>"Without knowing about each other"</strong> rules out advisors reaching into each other's internals. A memory advisor and a logging advisor must be able to coexist on the same chain without either one being written with knowledge of the other's existence — the same independence property a servlet filter for gzip compression and a servlet filter for authentication have from each other.</li>
+</ul>
+
+<p>
+This is, structurally, the identical problem the Spring team solved for HTTP requests in 2003 and for method-level cross-cutting concerns even earlier — Advisors are that same solved problem, re-applied to the new unit of work in this domain: a call to a language model.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Core Mental Model: A Pipe with Taps Along It</h3>
+
+<p>
+Picture a <code>ChatClient</code> call as water flowing through a pipe from your application code to the model and back. Without advisors, it's a straight pipe: your request goes in one end, the model's raw response comes out the other. An Advisor is a <strong>tap fitted into that pipe</strong> — it can inspect and alter the water flowing through it on the way in (the request), let it continue further down the pipe, and then inspect and alter the water flowing back on the way out (the response). Multiple advisors are multiple taps fitted in sequence along the same pipe. Each tap only ever sees "whatever came from the tap before it" — it has no idea how many taps came before or will come after, only that it is one link in a chain that eventually reaches the model at the very end.
+</p>
+
+<h3>4.2 Advisor as "Around" Behavior</h3>
+
+<p>
+The crucial theoretical property to internalize is that an Advisor is not "before" logic and "after" logic living in two separate places — it is a single unit of <strong>around</strong> logic that wraps the rest of the chain. This matters because it means an advisor can do things a simple "before hook" and "after hook" pair cannot cleanly do on their own:
+</p>
+
+<ul>
+<li><strong>Short-circuit entirely</strong> — a safety advisor can decide, before ever touching the model, that the request should never proceed, and return a canned response directly, skipping every advisor and the model itself.</li>
+<li><strong>Measure elapsed time around the actual model call</strong> — because the advisor wraps the call to "the rest of the chain," it can start a timer, invoke the rest of the chain, and stop the timer once control returns, capturing true end-to-end latency for everything downstream of it.</li>
+<li><strong>Mutate both directions independently</strong> — rewrite the outgoing request one way and the incoming response a completely different way, using state captured on the way in (e.g., "I stripped these tokens from the request, now let me re-insert something related in the response").</li>
+</ul>
+
+<h3>4.3 The Chain, Not the Individual Advisor, Is the Unit of Execution</h3>
+
+<p>
+No single Advisor ever calls the model directly. Each Advisor is handed a reference to "the rest of the chain" and its job is to decide when (and whether) to invoke it. This is exactly the Chain of Responsibility pattern applied faithfully: the last conceptual link in the chain is the one that actually dispatches to the model (this terminal step is provided by the framework, not something you write yourself). Every advisor you register sits somewhere before that terminal step, each one wrapping everything that comes after it, like nested parentheses: <code>Logging( Safety( Memory( Retrieval( ModelCall ) ) ) )</code>.
+</p>
+
+<h3>4.4 Request-Scoped Shared Context</h3>
+
+<p>
+Because multiple independent advisors may need to pass information to each other without knowing about each other's implementation, the Advisor mechanism carries a shared, request-scoped context (a key-value structure attached to the request/response as it flows through the chain). This is the same idea as a servlet request's attribute map: a memory advisor can stash "the conversation id this request belongs to" into that shared context; a later advisor, or the framework's own memory-persistence step, can read it back out — without either piece of code importing or depending on the other's class.
+</p>
+
+<table>
+<tr><th>Concept</th><th>Servlet Filter World</th><th>Spring AI Advisor World</th></tr>
+<tr><td>Unit of interception</td><td>An HTTP request/response</td><td>A ChatClient request/response (blocking or streaming)</td></tr>
+<tr><td>Ordering mechanism</td><td>Filter registration order / <code>@Order</code></td><td>Advisor order (lower runs earlier, closer to the caller)</td></tr>
+<tr><td>Chain object</td><td><code>FilterChain</code></td><td>Advisor chain passed into each advisor's method</td></tr>
+<tr><td>Short-circuiting</td><td>Don't call <code>chain.doFilter(...)</code></td><td>Don't invoke the chain; return a response directly</td></tr>
+<tr><td>Shared state across links</td><td>Request attributes</td><td>Shared advisor context map</td></tr>
+<tr><td>Two call shapes</td><td>N/A (HTTP is request/response)</td><td>Separate handling for single-call vs. streaming responses</td></tr>
+</table>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through exactly what happens, step by step, when application code executes a <code>ChatClient</code> call that has advisors registered.
+</p>
+
+<ol>
+<li><strong>Assembly.</strong> When you build a <code>ChatClient</code> (via <code>ChatClient.builder(chatModel)</code>), you register a list of advisors — either as defaults on the builder (applying to every call made from that client) or attached per-call via the fluent request spec. Spring AI collects these into an ordered list based on each advisor's declared order (advisors implement an ordering contract; lower values execute closer to the caller, mirroring Spring's general <code>Ordered</code> convention used elsewhere in the framework).</li>
+<li><strong>Chain construction.</strong> At call time, the framework builds an advisor chain object: conceptually a linked sequence where invoking "the chain" from advisor <em>N</em> actually invokes advisor <em>N+1</em>, and invoking it from the last registered advisor invokes the terminal step that performs the actual model call.</li>
+<li><strong>Request-side pass.</strong> Control enters at advisor #1. It receives the current request object (system/user messages, chat options, and the shared advisor context). It may read the request, mutate it (e.g., prepend retrieved documents to the user message, inject prior conversation turns, strip disallowed content), write something into the shared context for later advisors to read, and then decides whether to call the next link in the chain.</li>
+<li><strong>Propagation.</strong> Assuming it chooses to proceed, advisor #1 invokes the chain, which hands the (possibly mutated) request to advisor #2, and so on, until the last advisor invokes the chain and reaches the terminal model-invocation step. This is where the actual network call to the model provider happens.</li>
+<li><strong>Response-side pass, in reverse order.</strong> The model's response travels back up through the same chain in the reverse order it was built — the last advisor to touch the request on the way in is the first to see the raw response on the way out. Each advisor can inspect and mutate the response before returning it to whichever advisor called it, exactly mirroring how a servlet filter's code after <code>chain.doFilter(...)</code> runs on the way back out.</li>
+<li><strong>Streaming divergence.</strong> If the call is a streaming call, the terminal step returns a reactive stream (a <code>Flux</code> of response chunks) rather than a single response object, and advisors that need to observe or mutate a streaming response must operate on that <code>Flux</code> — for example, buffering chunks to reconstruct the full text only once the stream completes, so that a memory-persistence advisor can save the complete assistant turn rather than a stream of half-sentences.</li>
+<li><strong>Short-circuit path.</strong> At step 3, any advisor may choose <em>not</em> to invoke the chain at all, and instead construct and return a response directly. Every advisor further down the chain, and the model itself, is never invoked. This is precisely how a safety/guardrail advisor blocks a disallowed request cheaply, without paying for a model call that would just be discarded.</li>
+</ol>
+
+<h3>5.1 Edge Cases Worth Reasoning Through Yourself</h3>
+
+<ul>
+<li><strong>What if two advisors both want to mutate the same message?</strong> Because each advisor only ever sees the request as handed to it by the advisor before it, mutations compose — but that also means order changes meaning. A "redact PII" advisor placed before a "log the request" advisor logs redacted text; placed after, it logs raw text before redaction ever happens. Ordering is not cosmetic — it changes what data other advisors can see.</li>
+<li><strong>What if an advisor throws an exception mid-chain?</strong> Since each advisor is a normal Java call into the next link, an unhandled exception propagates back up through the chain like any nested method call, unwinding through every advisor's stack frame — advisors that need cleanup semantics regardless of success or failure need to handle that explicitly, the same discipline you'd apply around a try/finally in a servlet filter.</li>
+<li><strong>What happens to shared context between the blocking and streaming paths?</strong> The context map is populated fresh per logical request; it does not leak across unrelated requests, but within one request it is visible to every advisor regardless of position, which is what makes cross-advisor coordination (e.g., "the memory advisor recorded the conversation id, the logging advisor reads it back to tag its log line") possible without coupling.</li>
+<li><strong>What if no advisors are registered at all?</strong> The chain degenerates to a single link — straight from caller to the terminal model-invocation step — with zero overhead beyond an empty iteration, so Advisors impose no tax on the simplest possible use of <code>ChatClient</code>.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Advisors are an architectural, not a mathematical, mechanism — there is no gradient or probability distribution here. The one piece of quantitative reasoning worth doing explicitly is <strong>token-budget accounting</strong>, because it is the most common way an advisor chain silently causes a production incident: every advisor that adds text to the request (memory history, retrieved documents, few-shot examples) is spending from the same finite context window budget covered in earlier chapters, and that spending is additive across the whole chain.
+</p>
+
+<p>
+If <code>T</code> is the model's context window in tokens, and each advisor <em>i</em> in the chain adds <code>a_i</code> tokens to the request on the way in, the effective budget remaining for the user's actual question and the model's own response is:
+</p>
+
+<pre>
+remaining_tokens = T − (system_prompt_tokens + Σ a_i  for every advisor that injects content) − expected_response_tokens
+</pre>
+
+<p>
+This is simple arithmetic, but it is exactly the calculation most teams skip until a production request fails with a context-length error — and it is why later chapters (Memory, RAG) each spend real space on strategies (summarization, top-k retrieval limits, sliding windows) that exist specifically to keep their own <code>a_i</code> term bounded, rather than growing unboundedly with conversation length or corpus size.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 The Advisor Chain, Request Going Down, Response Coming Back Up</h3>
+
+<pre>
+   Application code
+         │
+         │  chatClient.prompt("What did I ask you yesterday?").call()
+         ▼
+ ┌───────────────────────────────────────────────────────────────────┐
+ │ Advisor #1: SimpleLoggerAdvisor (order = high, runs closest to     │
+ │             caller so it sees/logs the FINAL outgoing request)     │
+ │   on the way down: log request  ──────────────────────────┐        │
+ │   on the way up:   log response ◄───────────────────────┐ │        │
+ └───────────────────────────────────────────────────────┬─┼─┼────────┘
+                                                           │ │ ▼
+ ┌─────────────────────────────────────────────────────┐ │ │  (down)
+ │ Advisor #2: MessageChatMemoryAdvisor                  │ │ │
+ │   on the way down: fetch prior turns from ChatMemory, │ │ │
+ │                     PREPEND them to the message list  │◄┘ │
+ │   on the way up:   persist the new user+assistant     │   │
+ │                     turn into ChatMemory               │   │
+ └─────────────────────────────────────────────────────┬─┘   │
+                                                         │     (up)
+ ┌───────────────────────────────────────────────────┐ │     │
+ │ Advisor #3: QuestionAnswerAdvisor (RAG)             │ │     │
+ │   on the way down: query vector store, APPEND        │ │     │
+ │                     retrieved context to the prompt   │◄────┘
+ │   on the way up:   (usually pass-through)              │
+ └───────────────────────────────────────────────────┬───┘
+                                                       │
+                                                       ▼
+                              ┌─────────────────────────────────┐
+                              │  Terminal step: actual call to   │
+                              │  the ChatModel / provider API    │
+                              └─────────────────────────────────┘
+
+   Down-path order:  Logger → Memory → RAG → Model
+   Up-path order:    Model → RAG → Memory → Logger   (exact reverse)
+</pre>
+
+<h3>7.2 Short-Circuiting: A Safety Advisor Blocking Before the Model Ever Runs</h3>
+
+<pre>
+ Application code
+        │
+        ▼
+ ┌────────────────────────────────────────────────────────┐
+ │ Advisor #1: SafeGuardAdvisor                             │
+ │   inspects incoming user message                          │
+ │   finds it matches a disallowed pattern                   │
+ │                                                            │
+ │   ┌──────────────────────────────────────────────────┐   │
+ │   │  DOES NOT call chain.nextCall(request)             │   │
+ │   │  builds and returns a canned refusal response       │   │
+ │   └──────────────────────────────────────────────────┘   │
+ └────────────────────────────────────────────────────────┘
+        │
+        ▼
+   Refusal response returned to caller.
+   Advisor #2, Advisor #3, and the model itself are NEVER invoked —
+   zero tokens spent, zero latency paid for a call that was always
+   going to be rejected.
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+In a real deployed system, the advisor chain is where most of an AI feature's operational behavior actually lives — far more of it than in the prompt template itself. A representative production customer-support assistant typically layers advisors like this:
+</p>
+
+<pre>
+┌───────────────────────────────────────────────────────────────────────┐
+│  Spring Boot Controller (thin: parses request, calls ChatClient)       │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ ChatClient (built once as a singleton bean, advisors as defaults)       │
+│                                                                          │
+│  1. MetricsAdvisor        — emits latency/token counters to Micrometer  │
+│  2. SafeGuardAdvisor       — blocks disallowed input categories         │
+│  3. MessageChatMemoryAdvisor — injects + persists conversation history  │
+│  4. QuestionAnswerAdvisor  — retrieves + injects grounding documents    │
+│  5. SimpleLoggerAdvisor    — structured audit log of final prompt        │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    ▼
+                        ┌───────────────────────┐
+                        │  ChatModel (provider)  │
+                        └───────────────────────┘
+</pre>
+
+<p>
+Two production-relevant properties fall directly out of this diagram. First, this chain is <strong>configured once, at bean-construction time</strong>, typically in a <code>@Configuration</code> class — every controller in the application that injects this <code>ChatClient</code> bean gets the entire chain for free, with zero per-endpoint boilerplate. Second, different endpoints can legitimately use <em>different</em> chains: an internal, trusted admin tool might skip the safety advisor entirely and use a separate <code>ChatClient</code> bean with a leaner chain, while a public-facing endpoint keeps the full stack. This is exactly why Spring AI lets you register advisors both as builder-level defaults (apply-everywhere) and per-request overrides (apply-just-here) — production systems use both.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI models this with a small, focused set of interfaces and a handful of ready-made advisor implementations you will reach for constantly:
+</p>
+
+<ul>
+<li><strong><code>Advisor</code></strong> — the base marker interface every advisor implements, carrying a name and an order.</li>
+<li><strong>Call-time and stream-time advisor contracts</strong> — Spring AI defines separate advisor contracts for the blocking, single-response call path and for the reactive, multi-chunk streaming path (this split exists precisely because, as Section 5 explained, wrapping a single response object and wrapping a <code>Flux</code> of partial chunks require different code). Each contract's method receives the current request, the "rest of the chain" as a callable object, and is responsible for invoking that chain (or not) and returning the eventual response.</li>
+<li><strong><code>SimpleLoggerAdvisor</code></strong> — a ready-made advisor that logs the request sent to and the response received from the model, useful during development and as a baseline audit trail in production.</li>
+<li><strong><code>MessageChatMemoryAdvisor</code></strong> (and related memory advisors) — automatically injects prior conversation turns from a configured <code>ChatMemory</code> implementation before the call, and persists the new turn after it returns. Chapter 32 covers the memory abstraction itself in depth; here, the important point is that memory is <em>implemented as an advisor</em>, not as special-cased logic inside <code>ChatClient</code>.</li>
+<li><strong><code>QuestionAnswerAdvisor</code></strong> — the standard Retrieval-Augmented Generation advisor: it queries a configured vector store for documents relevant to the user's message and augments the prompt with that retrieved context before the call proceeds.</li>
+<li><strong>Custom advisors</strong> — for anything domain-specific (PII redaction, profanity filtering, cost-based routing, per-tenant prompt rewriting), you implement the advisor contract yourself.</li>
+</ul>
+
+<p>
+A representative custom advisor, wired to run early in the chain and reject disallowed input before any downstream work happens:
+</p>
+
+<pre>
+@Component
+public class TopicGuardAdvisor implements CallAdvisor, StreamAdvisor {
+
+    private static final List&lt;String&gt; BLOCKED_PATTERNS =
+            List.of("ignore previous instructions", "system prompt");
+
+    @Override
+    public String getName() {
+        return "topic-guard-advisor";
+    }
+
+    @Override
+    public int getOrder() {
+        return Ordered.HIGHEST_PRECEDENCE; // run first, before memory/RAG mutate the input
+    }
+
+    @Override
+    public ChatClientResponse adviseCall(ChatClientRequest request, CallAdvisorChain chain) {
+        String userText = request.prompt().getUserMessage().getText();
+        if (containsBlockedPattern(userText)) {
+            return refusalResponse(request);
+        }
+        // Not blocked: pass control to the rest of the chain (memory, RAG, model, ...)
+        return chain.nextCall(request);
+    }
+
+    @Override
+    public Flux&lt;ChatClientResponse&gt; adviseStream(ChatClientRequest request, StreamAdvisorChain chain) {
+        String userText = request.prompt().getUserMessage().getText();
+        if (containsBlockedPattern(userText)) {
+            return Flux.just(refusalResponse(request));
+        }
+        return chain.nextStream(request);
+    }
+
+    private boolean containsBlockedPattern(String text) {
+        String lower = text.toLowerCase();
+        return BLOCKED_PATTERNS.stream().anyMatch(lower::contains);
+    }
+
+    private ChatClientResponse refusalResponse(ChatClientRequest request) {
+        // Construct and return a canned response without ever calling chain.nextCall(...)
+        return ChatClientResponse.builder()
+                .chatResponse(ChatResponse.builder()
+                        .generations(List.of(new Generation(new AssistantMessage(
+                                "I can't help with that request."))))
+                        .build())
+                .build();
+    }
+}
+</pre>
+
+<p>
+Registering advisors on a <code>ChatClient</code> bean, mixing built-ins with the custom one, with explicit ordering:
+</p>
+
+<pre>
+@Configuration
+public class ChatClientConfig {
+
+    @Bean
+    ChatClient supportChatClient(ChatModel chatModel,
+                                  ChatMemory chatMemory,
+                                  VectorStore vectorStore,
+                                  TopicGuardAdvisor topicGuardAdvisor) {
+
+        return ChatClient.builder(chatModel)
+                .defaultSystem("You are a support assistant for Acme Cloud.")
+                .defaultAdvisors(
+                        topicGuardAdvisor,                              // order: HIGHEST_PRECEDENCE
+                        MessageChatMemoryAdvisor.builder(chatMemory).build(),
+                        QuestionAnswerAdvisor.builder(vectorStore).build(),
+                        new SimpleLoggerAdvisor()                       // logs the final assembled prompt
+                )
+                .build();
+    }
+}
+</pre>
+
+<p>
+Note the naming intentionally mirrors what Java engineers already know: <code>defaultAdvisors(...)</code> on a builder reads exactly like configuring default interceptors or filters on an HTTP client, and per-call overrides are available through the same fluent request spec used for prompts — <code>chatClient.prompt(userInput).advisors(a -&gt; a.param(...)).call().content()</code> — for the cases where one specific call needs to tweak advisor behavior (for example, supplying a conversation id for that request only) without changing the client-wide defaults.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Keep each advisor doing exactly one thing.</strong> A "memory and logging and safety" mega-advisor is impossible to reorder, test, or reuse independently — split concerns the same way you would split servlet filters.</li>
+<li><strong>Be deliberate and explicit about order.</strong> Don't rely on registration order alone if the framework allows explicit ordering — write down, in a comment or design doc, why safety runs before memory, and why logging runs last, so the next engineer doesn't "helpfully" reorder them and silently change behavior.</li>
+<li><strong>Fail closed in safety/guardrail advisors.</strong> If a safety advisor's own dependency (a moderation API, a policy service) is unavailable, decide explicitly whether that means "block" or "allow" — don't let an exception there accidentally propagate in a way that either crashes the request or silently skips the check.</li>
+<li><strong>Keep the shared advisor context small and well-documented.</strong> Treat it like a request-scoped map in a servlet filter chain: useful for narrow coordination (a conversation id, a feature flag), not a dumping ground for arbitrary state between advisors that should really just be one advisor.</li>
+<li><strong>Test advisors in isolation and as a chain.</strong> Unit test each advisor's logic directly (given this request, does it mutate/block/pass-through correctly), and separately test the assembled chain to catch ordering bugs that only appear when advisors interact.</li>
+<li><strong>Budget tokens per advisor.</strong> Any advisor that injects text (memory, RAG) should have an explicit, configurable cap on how much it injects, tying back directly to the token-budget arithmetic in Section 6.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Assuming advisor order doesn't matter.</strong> Registering a logging advisor before a memory advisor logs the request <em>before</em> history was injected, silently producing misleading audit logs — a subtle bug that only surfaces when someone actually tries to debug a conversation from the logs.</li>
+<li><strong>Forgetting the streaming path exists.</strong> An advisor thoroughly tested against <code>call()</code> can be entirely broken, or simply never invoked correctly, against <code>stream()</code> if its stream-handling logic was never implemented or was implemented as a naive pass-through when real work (e.g., buffering the full response for memory persistence) was required.</li>
+<li><strong>Building an unbounded memory or RAG advisor.</strong> An advisor that injects "the entire conversation history" or "the top 50 retrieved documents" with no cap will work fine in every demo and then fail in production the first time a real user has a long conversation or a broad query — this is the token-budget mistake from Section 6 made concrete.</li>
+<li><strong>Putting expensive I/O in an advisor without async/reactive awareness.</strong> A memory or RAG advisor that performs a blocking database or vector-store call inside a reactive streaming chain can silently block the reactor event loop, degrading unrelated concurrent requests — the same reactive-programming discipline required elsewhere in Spring WebFlux applies here.</li>
+<li><strong>Writing a safety advisor that only checks the first user message.</strong> In a multi-turn conversation with memory injected upstream, disallowed content can appear anywhere in an accumulated message list, not just the newest turn — a guardrail advisor scoped too narrowly gives a false sense of security.</li>
+<li><strong>Sharing one <code>ChatClient</code>/advisor-chain configuration across fundamentally different trust boundaries.</strong> Using the same lenient internal-tool chain for a public endpoint (or vice versa, over-restricting an internal tool) conflates two different risk profiles that deserve two different chains.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Advisors themselves — the mechanism of chaining and dispatch — add negligible overhead; you are looking at a handful of method calls and a map lookup per advisor, dwarfed by the network latency of the model call itself. The performance considerations that actually matter are about <em>what each advisor does</em>, not the chaining mechanism:
+</p>
+
+<ul>
+<li><strong>I/O-bearing advisors dominate latency.</strong> A memory advisor that fetches history from a database, or a RAG advisor that queries a vector store, adds real network round-trip time <em>before</em> the model call even begins — that latency is additive across every I/O-bearing advisor in the chain, and it happens on the critical path of every single request.</li>
+<li><strong>Injected tokens cost money and latency twice over.</strong> Every token a memory or RAG advisor adds to the request is a token the model provider bills you for and a token that increases time-to-first-token on the way in — and, depending on how much it nudges the model toward a longer answer, potentially on the way out as well.</li>
+<li><strong>Short-circuiting is a genuine latency and cost optimization, not just a safety feature.</strong> A guardrail advisor that rejects a request early avoids the memory fetch, the retrieval query, and the model call entirely — in a system serving abusive or malformed traffic at any volume, this materially reduces both cost and load on downstream dependencies.</li>
+<li><strong>Streaming advisors that need the full response (e.g., to persist to memory) must buffer, which delays that specific side-effect without delaying the user-visible stream</strong> — this is a correct and common pattern, but it means "the response was persisted to memory" and "the user finished seeing the response" are not simultaneous events, which matters if some other part of your system expects memory to be immediately consistent with what the user has seen.</li>
+<li><strong>Parallelizable, independent advisor work should not be forced serial.</strong> If a memory fetch and a retrieval query are genuinely independent (neither needs the other's output), consider whether your chain design or an advisor's internal implementation can issue them concurrently rather than paying their latencies back-to-back.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Advisors are not a decorative concern here — they are one of the primary <em>enforcement points</em> for the security posture of an entire AI feature, which makes this section unusually substantive for what might otherwise look like "just an interceptor pattern."
+</p>
+
+<ul>
+<li><strong>The advisor chain is the natural home for prompt-injection defenses.</strong> As covered in the discussion of intelligence and the model's inability to reliably distinguish instructions from data, any untrusted text reaching the model — user input, retrieved documents, tool output — is an attack surface. A guardrail advisor placed early in the chain is where you inspect and, where possible, neutralize suspicious patterns before that text is ever combined with your system prompt.</li>
+<li><strong>Order determines what a security advisor actually sees.</strong> A safety advisor placed <em>after</em> a RAG advisor sees the user's question already mixed with retrieved document content — if that retrieved content itself contains injected instructions (a well-documented attack against RAG systems), a safety check scoped only to "the user's literal typed message" and positioned before retrieval will miss it entirely. This is a direct, concrete reason ordering decisions in Section 4 and Section 10 are a security decision, not just a logic decision.</li>
+<li><strong>Shared advisor context can leak across concerns if misused.</strong> Because the context map is visible to every advisor in the chain, treat anything placed there as available to all of them — don't stash a secret, an internal-only flag, or raw unredacted PII into shared context assuming only "trusted" advisors will read it, unless you have actually verified every advisor registered on that chain.</li>
+<li><strong>Fail-closed behavior in guardrail advisors is a security property, not just a reliability one.</strong> If your moderation/safety check depends on an external service and that service is unreachable, silently allowing the request through because the advisor "failed open" converts an availability incident in a dependency into a security bypass.</li>
+<li><strong>Advisors do not replace defense in depth.</strong> An advisor-level guardrail is one layer; it does not substitute for output-side validation, rate limiting, or the broader guardrail architecture covered as a dedicated topic in Volume 5 — treat it as the earliest, cheapest layer of a multi-layer defense, not the only one.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What problem do Advisors solve in Spring AI, in one sentence?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Advisors let you implement cross-cutting concerns around a model call — logging, memory, retrieval, safety checks — once, and apply them consistently across every relevant <code>ChatClient</code> call, without embedding that logic into every call site's business code.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Name a Java/Spring concept you already know that Advisors are architecturally similar to.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Servlet filters (<code>Filter</code>/<code>FilterChain</code>) and Spring AOP's around-advice are the closest analogues: both wrap a core operation with composable, ordered, independent pieces of behavior that can inspect/mutate the request and response and optionally short-circuit the chain.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Explain what happens, step by step, when a <code>ChatClient</code> call with three registered advisors executes.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The framework builds an ordered chain from the three advisors. Control enters advisor #1 with the request; it may inspect/mutate it and then invoke "the rest of the chain," passing control to advisor #2, then #3, then finally the terminal step that actually calls the model. The response then flows back up through the same three advisors in reverse order, each able to inspect/mutate it before returning it to whichever advisor invoked it, until it reaches the original caller.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why does Spring AI need separate handling for streaming versus blocking calls in its Advisor API?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A blocking call produces one request and one response object, which an advisor can inspect synchronously in one step. A streaming call produces a reactive sequence of partial response chunks over time — an advisor that needs the complete final text (for example, to persist a full assistant turn to memory) must buffer and reconstruct it from the stream rather than acting on a single object, so the API distinguishes call-time and stream-time advisor behavior rather than forcing one shape to awkwardly fit both.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. You need a safety/guardrail advisor and a chat-memory advisor in the same chain. Which should run first, and why does it matter?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The safety advisor should generally run before the memory advisor injects prior conversation history into the request, so that its checks (and any short-circuit refusal) are based on evaluating the actual new user input cleanly, and — depending on the specific threat model — it may also need to run after memory injection if the goal is to catch disallowed content emerging from the combination of history and new input. The general principle: ordering determines what data each advisor can see, so it must be chosen deliberately based on what each advisor needs to observe or is responsible for catching, not left to incidental registration order.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Push further by noting that a RAG advisor injecting retrieved documents introduces a second, often overlooked attack surface — a safety advisor scoped only to "the user's literal message" and positioned before retrieval will never see injected instructions hidden inside retrieved content. Mentioning this unprompted signals you think about advisor ordering as a security decision, not just a data-flow decision.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. How would you prevent an advisor chain from silently blowing the model's context window as conversations grow long?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Treat every advisor that injects content (memory history, retrieved documents) as spending from a shared, finite token budget: cap how many prior turns or how many retrieved documents each advisor injects, prefer summarization or sliding-window strategies over unbounded history for memory, limit top-k for retrieval, and account for the system prompt and expected response length when computing what remains. This budget should be computed and enforced explicitly, not discovered the first time a real user hits a context-length error in production.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A teammate proposes writing one large "MasterAdvisor" that handles logging, memory, retrieval, and safety in a single class to "keep things simple." How do you respond?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Push back and explain the cost: a monolithic advisor cannot be independently ordered, tested, reused across different <code>ChatClient</code> configurations, or selectively disabled for a given endpoint (e.g., an internal tool that needs memory but not safety filtering) — it also becomes a single point of change risk where an edit for one concern (say, tweaking retrieval limits) risks regressing an unrelated concern (say, safety checks) in the same class. The single-responsibility argument that applies to servlet filters and AOP aspects applies identically here: independent concerns should be independent advisors, composed via ordering, exactly because that composability is the entire reason the abstraction exists.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How does the Advisor abstraction affect your team's ability to swap model providers or restructure an AI feature's architecture later?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Because cross-cutting concerns live in advisors registered on the <code>ChatClient</code> rather than scattered through business logic, swapping the underlying <code>ChatModel</code> (provider or model version) requires no changes to memory, retrieval, logging, or safety logic at all — those advisors operate on the framework's own request/response abstractions, not on any provider-specific representation. This directly supports the strategic posture, established when we first discussed why the foundation model is drawn as the smallest box in a production AI architecture: treat the model as the most replaceable dependency, and keep the durable engineering value in the composable layers you control, which the Advisor mechanism is specifically designed to let you build.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why an Advisor is described as "around" logic rather than separate "before" and "after" hooks, and give one concrete capability (from this chapter) that around-style logic enables and a simple before/after hook pair cannot.</li>
+<li>You are told a production incident occurred because a logging advisor recorded a user's raw, un-redacted message even though a PII-redaction advisor exists in the same chain. Using only the ordering concepts from this chapter, diagnose the most likely root cause without seeing any code.</li>
+<li>Compare Spring AI's Advisor chain to a servlet <code>FilterChain</code> point by point: what maps directly, and what is genuinely different because the "request" here is a structured chat prompt rather than an HTTP request?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Design (in prose or as an ordered list, no code required) the advisor chain for a hypothetical internal engineering-support chatbot that needs: request/response logging, a check that blocks questions about a specific list of banned topics, retrieval of internal documentation, and no conversation memory. State the order you chose and justify it using the ordering principles from Sections 4 and 13.</li>
+<li>Sketch, in the ASCII style used in Section 7, the down-path and up-path for a chain of exactly two advisors: a token-counting advisor (order: runs first) and a response-caching advisor (order: runs second, closest to the model) that returns a cached response directly when it detects an identical recent request. Show clearly at which point the caching advisor would short-circuit and what the token-counting advisor would still observe in that case.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Advisors are Spring AI's interceptor mechanism around every <code>ChatClient</code> call — architecturally the same Chain-of-Responsibility idea as servlet filters and Spring AOP's around-advice, applied to model calls instead of HTTP requests or method invocations.</li>
+<li>They exist to let cross-cutting concerns — logging, memory, retrieval augmentation, safety filtering — be written once and composed declaratively, instead of duplicated into every call site's business logic.</li>
+<li>Mechanically, advisors form an ordered chain: each advisor sees the request on the way down, decides whether to invoke the rest of the chain, and sees the response on the way back up in the reverse order, with a shared context map enabling coordination between independent advisors.</li>
+<li>Order is semantically load-bearing, not cosmetic — it determines what data each advisor can see and mutate, with direct correctness, cost, and security consequences (as with a safety advisor that must see a request before or after retrieval augmentation, depending on the threat model).</li>
+<li>Blocking and streaming calls require distinct handling inside an advisor because a single response object and a live sequence of partial chunks are fundamentally different shapes to inspect or mutate.</li>
+<li>Nearly every other Spring AI capability in this volume — chat memory, retrieval augmentation, guardrails — is itself implemented as an advisor, which is why fluency with this chapter pays off directly in every chapter that follows it.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Chapter 32 takes the memory advisor introduced here only as an example and treats it as its own subject in full depth — how <code>ChatMemory</code> actually stores and retrieves conversation state, the trade-offs between in-memory, database-backed, and vector-backed memory implementations, and how to keep growing conversation history from silently violating the token-budget arithmetic introduced in this chapter's Mathematics section.
+</p>
+
+</div>
+
+</body>
+</html>

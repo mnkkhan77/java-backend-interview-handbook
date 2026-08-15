@@ -1,0 +1,1077 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>138-KAFKA-AND-EVENT-DRIVEN-ARCHITECTURE-DEEP-DIVE.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">18 - KAFKA &amp; EVENT-DRIVEN ARCHITECTURE DEEP DIVE</h1>
+
+<p>
+
+This chapter is a deliberate step up from the Messaging chapter (ch. 17) and the Kafka material inside the Microservices chapter. Those chapters cover the vocabulary and the breadth: topic, partition, offset, consumer group, when Kafka beats RabbitMQ, the outbox pattern, and a first pass at sagas and CQRS. This chapter assumes you already have that vocabulary cold and pushes into the internals and production realities that separate a candidate who has "used Kafka" from one who has operated it under load.
+
+For a Senior Java/Spring backend role, this is where interviews get genuinely hard. You should be able to explain, with mechanism-level precision:
+
+* How replication and in-sync replicas actually survive a broker failure without losing committed data
+* What acks=0/1/all really buys you, and why min.insync.replicas is the other half of that story
+* How idempotent producers and Kafka transactions deliver true exactly-once semantics inside Kafka's boundary
+* How Kafka Streams manages state, fault tolerance and windowed aggregation
+* How a schema registry lets you evolve Avro or Protobuf schemas without breaking consumers
+* The difference between an event that only notifies and an event that carries enough state to act on
+* Why choreography and orchestration sagas behave differently once you have twenty steps instead of three
+* How CQRS and event sourcing are actually implemented on top of Kafka's log
+* What happens during a consumer group rebalance, and how static membership avoids it
+* Why "exactly-once" and "effectively-once" are different promises at production scale
+* How MirrorMaker 2 replicates data across clusters and regions
+* How Kafka Connect and Debezium turn a database into a stream of events
+* How to size partitions, replication factor and retention before you ever hit production
+* How to actually debug a live incident: a consumer lag spike or a rebalance storm
+
+If a follow-up question makes you reach for "it depends on the config" without being able to name the config, that is exactly the gap this chapter closes.
+
+</p>
+
+<hr>
+
+<h1 id="h2">TOP ROI KAFKA/EDA QUESTIONS</h1>
+
+<ol>
+
+<li>Replication &amp; In-Sync Replicas (ISR) - How Kafka Survives Broker Failure</li>
+
+<li>Producer Acks &amp; Durability Tradeoffs (acks=0 / 1 / all)</li>
+
+<li>Idempotent Producers &amp; Kafka Transactions (True Exactly-Once Mechanics)</li>
+
+<li>Kafka Streams &amp; Stateful Stream Processing</li>
+
+<li>Consumer Group Rebalancing &amp; Static Group Membership</li>
+
+<li>Exactly-Once vs "Effectively-Once" At Production Scale</li>
+
+<li>Schema Registry &amp; Avro/Protobuf For Safe Schema Evolution</li>
+
+<li>Event-Carried State Transfer vs Event Notification</li>
+
+<li>Choreography vs Orchestration For Sagas (Deeper Treatment)</li>
+
+<li>CQRS &amp; Event Sourcing Built On Kafka</li>
+
+<li>Multi-Cluster / Geo-Replication (MirrorMaker 2)</li>
+
+<li>Kafka Connect &amp; Change Data Capture (Debezium) Pipelines</li>
+
+<li>Capacity Planning: Partition Count, Replication Factor, Retention Sizing</li>
+
+<li>Debugging A Real Production Kafka Incident (Consumer Lag Spike, Rebalance Storm)</li>
+
+</ol>
+
+<hr>
+
+<h1 id="h3">SECTION 1 - KAFKA INTERNALS: REPLICATION, DURABILITY &amp; CONSUMER GROUPS AT SCALE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q1. Replication &amp; In-Sync Replicas (ISR) - How Kafka Survives Broker Failure
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Every partition in Kafka is replicated across <code>replication.factor</code> brokers. One replica is the <b>leader</b>, which handles all reads and writes for that partition; the rest are <b>followers</b>, which continuously fetch from the leader to keep their local log in sync. The set of replicas that are currently "caught up" with the leader, meaning they have replicated everything within the allowed lag window, is the <b>ISR</b> - the in-sync replica set. This is the mechanism that makes broker failure survivable without data loss, and interviewers use it to check whether you understand Kafka as a replicated log rather than just a queue with partitions.
+</p>
+
+<p>
+A follower falls out of the ISR if it does not fetch from the leader within <code>replica.lag.time.max.ms</code> (default 30 seconds), whether because the broker is slow, overloaded, or down. When a leader fails, the controller (in KRaft mode, a Raft-elected controller quorum; historically ZooKeeper-coordinated) picks a new leader <i>from the current ISR</i>. Because every replica in the ISR has, by definition, every message the old leader had acknowledged, promoting any of them loses nothing. This is the entire trick: durability does not come from having many replicas, it comes from only ever electing a leader out of replicas that are provably caught up.
+</p>
+
+<p>
+The dangerous knob here is <code>unclean.leader.election.enable</code>. If it is set to <code>true</code>, Kafka will, as a last resort, elect a leader from an out-of-sync replica when the ISR is empty, which keeps the partition available but silently loses any messages the new leader never received. Modern defaults keep this <code>false</code>, correctly favoring consistency over availability for that edge case, which is a direct, concrete instance of the CAP theorem tradeoff discussed in the Microservices chapter, now applied specifically to Kafka's replication protocol.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Concept</th>
+<th>Role</th>
+</tr>
+
+<tr>
+<td>Leader</td>
+<td>Serves all reads/writes for the partition</td>
+</tr>
+
+<tr>
+<td>Follower</td>
+<td>Replicates the leader's log; candidate for promotion</td>
+</tr>
+
+<tr>
+<td>ISR</td>
+<td>Followers currently caught up within the lag window</td>
+</tr>
+
+<tr>
+<td>replica.lag.time.max.ms</td>
+<td>How long a follower can lag before being dropped from ISR</td>
+</tr>
+
+<tr>
+<td>unclean.leader.election.enable</td>
+<td>false (default) = never elect an out-of-sync replica; loses availability, not data</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The line that shows real depth: "Kafka does not guarantee zero data loss from replication factor alone - it guarantees zero data loss for anything acknowledged by the ISR." A replication factor of 3 with an ISR that has shrunk to 1 (the leader itself) offers no more durability than a single unreplicated broker at that moment. That is exactly why acks and min.insync.replicas (next question) are the other half of this story, not an independent topic.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q2. Producer Acks &amp; Durability Tradeoffs (acks=0 / 1 / all)
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The producer's <code>acks</code> setting controls how many replicas must confirm a write before the producer considers it successful, and it is the single most important lever for trading latency against durability. It only makes sense in combination with the broker-side <code>min.insync.replicas</code> setting, and interviewers who ask about acks are almost always really asking whether you understand that pairing.
+</p>
+
+<p>
+<b>acks=0</b> is fire-and-forget: the producer does not wait for any acknowledgement at all. It is the fastest option and the only one where a broker outage can silently drop messages the producer believes it already sent. <b>acks=1</b> waits for the partition leader to write the message to its own log, but not for followers to replicate it; if the leader crashes before followers catch up, the message is lost even though the producer received a success response. <b>acks=all</b> (equivalently <code>acks=-1</code>) waits for every replica currently in the ISR to acknowledge the write, which is the only setting that gives you durability across a broker failure.
+</p>
+
+<p>
+The trap is that <code>acks=all</code> by itself is not enough if the ISR has shrunk to just the leader - "all of the ISR" can mean "just one broker" during an outage. That is what <code>min.insync.replicas</code> is for: it sets a floor (commonly 2, with replication factor 3) below which the leader will reject writes with <code>NotEnoughReplicasException</code> rather than accept them with a false sense of safety. The standard production-grade durability recipe is <code>replication.factor=3</code>, <code>min.insync.replicas=2</code>, <code>acks=all</code>, which tolerates the loss of exactly one broker without losing acknowledged data and without silently degrading to single-replica durability.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Setting</th>
+<th>Waits for</th>
+<th>Can lose data if...</th>
+<th>Latency</th>
+</tr>
+
+<tr>
+<td>acks=0</td>
+<td>Nothing</td>
+<td>Any network blip or broker issue</td>
+<td>Lowest</td>
+</tr>
+
+<tr>
+<td>acks=1</td>
+<td>Leader write only</td>
+<td>Leader crashes before follower replication</td>
+<td>Low</td>
+</tr>
+
+<tr>
+<td>acks=all</td>
+<td>Every replica in the current ISR</td>
+<td>ISR itself has shrunk below min.insync.replicas</td>
+<td>Highest</td>
+</tr>
+
+</table>
+
+<pre>
+# Producer config for financial/order-critical topics
+acks=all
+enable.idempotence=true
+retries=2147483647
+max.in.flight.requests.per.connection=5
+
+# Broker/topic config that makes acks=all mean something
+min.insync.replicas=2
+replication.factor=3
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Saying "we use acks=all so we never lose data" without mentioning min.insync.replicas. A candidate who names both, and explains that acks=all is only as strong as the ISR floor min.insync.replicas enforces, is demonstrating they have actually configured a durable topic in production, not just read the acks documentation once.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q3. Consumer Group Rebalancing &amp; Static Group Membership
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A rebalance is the process by which a consumer group redistributes partition ownership among its members, triggered whenever a consumer joins, leaves, crashes, or fails to poll within <code>max.poll.interval.ms</code>. Under the original "eager" rebalancing protocol, every consumer in the group revokes <i>all</i> of its partitions before the group re-assigns them, which means the entire group stops consuming during the rebalance, even members whose assignment will not actually change. On a large group with many partitions, this "stop the world" pause is a real, visible dip in throughput and a spike in consumer lag.
+</p>
+
+<p>
+Kafka's <b>cooperative sticky</b> assignor (the default in modern Kafka clients) fixes the worst of this: it computes the new assignment, revokes only the specific partitions that need to move, and lets consumers keep processing the partitions they already own throughout most of the rebalance. It turns one disruptive event into a much smaller, incremental one. This is a low-effort, high-value config change (<code>partition.assignment.strategy=CooperativeStickyAssignor</code>) that is worth naming unprompted.
+</p>
+
+<p>
+The other lever is <b>static group membership</b>, set via <code>group.instance.id</code> on the consumer. Normally, every consumer restart (a rolling deployment, a pod reschedule) looks like a member leaving and a new one joining, which triggers a rebalance. With a stable <code>group.instance.id</code>, Kafka recognizes the returning consumer as the same member within <code>session.timeout.ms</code> and hands its partitions straight back, skipping the rebalance entirely. For a Spring Boot service that rolls ten pods during every deploy, this is the difference between ten rebalances a day and zero.
+</p>
+
+</div>
+
+<pre>
+# application.yml - Spring Kafka consumer, tuned to avoid rebalance churn
+spring.kafka.consumer.group-id: order-fulfilment
+spring.kafka.consumer.properties.group.instance.id: ${HOSTNAME}
+spring.kafka.consumer.properties.partition.assignment.strategy: \
+  org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+spring.kafka.consumer.properties.session.timeout.ms: 45000
+spring.kafka.consumer.properties.max.poll.interval.ms: 300000
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Tie rebalancing directly to <code>max.poll.interval.ms</code>: a rebalance is not only triggered by crashes and deploys, it also fires whenever a consumer's processing loop takes longer than this interval between polls, which is the classic cause of a "rebalance storm" under slow downstream calls. Static membership and cooperative rebalancing reduce the pain of rebalances; fixing a slow poll loop (or raising max.poll.interval.ms alongside lowering max.poll.records) addresses the actual cause.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h4">SECTION 2 - EXACTLY-ONCE MECHANICS &amp; STREAM PROCESSING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q4. Idempotent Producers &amp; Kafka Transactions (True Exactly-Once Mechanics)
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+"Exactly-once" is thrown around loosely, but Kafka's real mechanism for it is two distinct, composable features: the idempotent producer and transactions. Understanding what each one actually does, mechanically, is what interviewers are probing for when they ask you to go beyond the one-liner from the Messaging chapter.
+</p>
+
+<p>
+The <b>idempotent producer</b> (<code>enable.idempotence=true</code>) solves duplicate writes caused by producer-side retries. Kafka assigns the producer a unique <b>Producer ID (PID)</b> and stamps every message with a monotonically increasing <b>sequence number</b> per partition. If a network blip causes the producer to retry a send that actually succeeded, the broker sees the same PID and sequence number again and simply deduplicates it, rather than appending a second copy. This gives you exactly-once <i>writes to a single partition</i>, entirely for free once the flag is set - it does not require transactions and has become the client default.
+</p>
+
+<p>
+<b>Transactions</b> extend that guarantee across multiple partitions and topics, which is what a real "read-process-write" consumer needs: consume from an input topic, produce to one or more output topics, and commit the consumer offset, all as one atomic unit. You configure a stable <code>transactional.id</code>, wrap the produce calls and the offset commit in <code>beginTransaction()</code> / <code>commitTransaction()</code>, and downstream consumers set <code>isolation.level=read_committed</code> so they never see messages from a transaction that later aborted. Internally, a <b>transaction coordinator</b> writes markers to a special internal topic and to every partition involved, so a crash mid-transaction is recoverable: on restart, the coordinator either completes or aborts the in-flight transaction using those markers, and <code>transactional.id</code> continuity fences off any zombie instance of the old producer from writing further.
+</p>
+
+</div>
+
+<pre>
+// Spring Kafka: atomic read-process-write with a transactional producer
+
+@Bean
+public KafkaTransactionManager kafkaTransactionManager(ProducerFactory&lt;String, String&gt; pf) {
+    return new KafkaTransactionManager&lt;&gt;(pf); // producer factory must have a transactionIdPrefix
+}
+
+@KafkaListener(topics = "orders", groupId = "billing")
+@Transactional("kafkaTransactionManager")
+public void onOrder(OrderEvent event) {
+    // Consumer offset commit + these produces are one atomic Kafka transaction
+    kafkaTemplate.send("invoices", event.toInvoice());
+    kafkaTemplate.send("audit-log", event.toAuditRecord());
+    // if this method throws, the transaction aborts:
+    // read_committed consumers downstream never see the partial writes
+}
+
+// producer factory config
+spring.kafka.producer.transaction-id-prefix: billing-tx-
+spring.kafka.producer.properties.enable.idempotence: true
+spring.kafka.consumer.properties.isolation.level: read_committed
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The precise phrase that signals mastery: "Idempotence dedups retries on a single partition using PID plus sequence number; transactions add atomicity across multiple partitions and the consumer offset commit, using a transaction coordinator and read_committed isolation." Also volunteer the boundary: this guarantee is real but it stops at Kafka's edge - the moment a transactional consumer calls an external REST API or writes to a non-Kafka database as a side effect, that call is not part of the transaction and can still be duplicated on retry.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q5. Kafka Streams &amp; Stateful Stream Processing
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Kafka Streams is a client library (not a separate cluster to run) for building stream-processing applications directly on top of Kafka. A topology of processors reads from input topics, applies transformations - map, filter, join, aggregate, window - and writes to output topics, all inside your own JVM process. The interesting part for a senior interview is not the DSL syntax, it is how it manages <i>state</i> and <i>fault tolerance</i>, because a stateful operation like "running total per customer" needs somewhere durable to keep that running total.
+</p>
+
+<p>
+Every stateful operator (aggregate, count, join) is backed by a local <b>state store</b>, typically an embedded RocksDB instance on local disk for speed. Crucially, every write to that local state store is also written to an internal, compacted <b>changelog topic</b> in Kafka. If the instance crashes or is rescheduled, a new instance can rebuild the state store from scratch by replaying the changelog topic, which means the state is never actually at risk of loss - Kafka's replicated log is the source of truth, and RocksDB is just a fast local cache of it. For very large state, Kafka Streams also supports <b>standby replicas</b> - other instances that keep a warm copy of the state store in sync, so a failover does not even require a full changelog replay.
+</p>
+
+<p>
+Windowed aggregations (tumbling, hopping, session windows) let you compute things like "orders per customer per 5-minute window," and Kafka Streams handles late-arriving and out-of-order data via <code>grace period</code> configuration rather than dropping it outright. For exactly-once processing across the whole topology (consume, update state, produce), you set <code>processing.guarantee=exactly_once_v2</code>, which wires the underlying producer and consumer into the same transactional machinery from the previous question - Kafka Streams' exactly-once story <i>is</i> Kafka transactions, not a separate mechanism.
+</p>
+
+</div>
+
+<pre>
+StreamsBuilder builder = new StreamsBuilder();
+
+KStream&lt;String, Order&gt; orders = builder.stream("orders");
+
+KTable&lt;Windowed&lt;String&gt;, Long&gt; ordersPerCustomer = orders
+    .groupBy((key, order) -&gt; order.getCustomerId())
+    .windowedBy(TimeWindows.ofSizeAndGrace(
+        Duration.ofMinutes(5), Duration.ofSeconds(30))) // grace period for late events
+    .count(Materialized.as("orders-per-customer-store")); // backed by RocksDB + changelog topic
+
+ordersPerCustomer.toStream()
+    .to("orders-per-customer-5min", Produced.with(windowedSerde, Serdes.Long()));
+
+// streams-config.properties
+processing.guarantee=exactly_once_v2
+num.standby.replicas=1
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"State in Kafka Streams lives in RocksDB, but RocksDB is disposable - the changelog topic is the actual source of truth." Being able to explain how a crashed streams instance recovers its state (rebuild from changelog, or fail over to a warm standby) is the detail that separates candidates who have written a `.count()` call from candidates who have operated a stateful streams app in production.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q6. Exactly-Once vs "Effectively-Once" At Production Scale
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Now that you know the mechanism (idempotent producer plus transactions), the harder senior question is whether you would actually turn it on everywhere. The honest answer is usually no, and being able to justify that with real cost figures is what this question is testing.
+</p>
+
+<p>
+Kafka transactions are not free. Every transaction requires coordination with the transaction coordinator, writes commit markers to every partition involved, and consumers running <code>read_committed</code> must buffer messages until they see the commit marker, which adds latency and reduces effective throughput, particularly with small, frequent transactions. At high volume, batching more work into fewer, larger transactions helps, but it also increases the blast radius and latency of each one. Teams that naively wrap every single message in its own transaction routinely see throughput drop by 20-50% compared to idempotent-producer-only writes, for a guarantee that, as the previous question stressed, still does not extend past Kafka's own boundary.
+</p>
+
+<p>
+This is why most production systems at scale settle for <b>effectively-once</b>: at-least-once delivery (the default, cheap, and fast) combined with idempotent consumers - a dedup table, a unique constraint, or an upsert-shaped write - as covered in the Messaging chapter. The net observable behavior is the same as exactly-once (no duplicate business effect), but you get it without paying the transactional coordination tax on every message, and it survives failures in systems outside Kafka's control, which true Kafka transactions never could anyway. The pragmatic senior guidance: reserve Kafka transactions for the specific hop where you are doing an atomic multi-topic read-process-write (classic Kafka Streams jobs, or an outbox-relay style fan-out), and default to idempotent consumers everywhere else.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The framing that lands: "Exactly-once is a mechanism Kafka can genuinely provide inside its own log; effectively-once is an architecture pattern that gets you the same observable guarantee everywhere, including systems Kafka does not control, at a fraction of the operational cost." Naming the throughput cost of transactions with an actual number, and knowing which hop in your pipeline is worth paying it for, is what makes this answer senior rather than textbook.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h5">SECTION 3 - SCHEMA EVOLUTION &amp; EVENT-DRIVEN ARCHITECTURE PATTERNS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q7. Schema Registry &amp; Avro/Protobuf For Safe Schema Evolution
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Kafka itself has no opinion on message format - it stores bytes. A schema registry sits alongside the cluster and gives every topic a governed, versioned contract, usually using Avro or Protobuf, so producers and consumers evolving independently over months do not silently break each other. This matters enormously once a topic has more than one consuming team, which is precisely the situation event-driven architecture creates on purpose.
+</p>
+
+<p>
+The registry enforces a <b>compatibility mode</b> per subject (a subject is typically a topic plus key or value). <b>BACKWARD</b> compatibility means new schema versions can read data written with the previous schema - the safe default for evolving producers, since it lets you add optional fields with defaults, or remove fields, as long as old consumers reading new data (with old schema) still work. <b>FORWARD</b> compatibility is the mirror image: old schema can read data written with the new schema, which matters when consumers upgrade before producers do. <b>FULL</b> requires both directions simultaneously, which is the strictest and safest but the most constraining. The registry rejects a schema registration outright if it violates the configured mode, which turns "we broke the downstream consumer" from a production incident into a rejected CI build.
+</p>
+
+<p>
+The practical evolution rules that make BACKWARD compatibility hold in Avro: adding a field is safe only if it has a default value; removing a field is safe only if it had a default in the old schema; renaming a field is never safe on its own (it looks like a remove-plus-add) unless you use Avro aliases. Protobuf's rule of thumb is similar but based on field numbers, not names: never reuse or renumber a field tag, and always add new fields as optional. The choice between Avro and Protobuf is mostly ecosystem-driven - Avro is the more common default in the Kafka/Confluent ecosystem with tight schema registry integration, while Protobuf is often preferred where the same schema is shared with gRPC services.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Compatibility Mode</th>
+<th>Guarantee</th>
+<th>Safe change example</th>
+</tr>
+
+<tr>
+<td>BACKWARD</td>
+<td>New schema reads old data</td>
+<td>Add a field with a default; remove a field</td>
+</tr>
+
+<tr>
+<td>FORWARD</td>
+<td>Old schema reads new data</td>
+<td>Remove a field with a default; add a field</td>
+</tr>
+
+<tr>
+<td>FULL</td>
+<td>Both directions hold</td>
+<td>Only additive/optional changes both ways</td>
+</tr>
+
+<tr>
+<td>NONE</td>
+<td>No enforcement</td>
+<td>Any change (dangerous - breaks silently at runtime)</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating the schema registry as "just a serialization format" rather than a contract-enforcement gate. The senior framing: the registry turns a runtime incompatibility (a consumer crashing on deserialization at 3am) into a compile-time or CI-time rejection, and choosing BACKWARD as your default for producer-owned topics is what lets consumer teams upgrade on their own schedule without coordinating a synchronized release.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q8. Event-Carried State Transfer vs Event Notification
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This distinction is about how much information you put inside an event, and it directly trades coupling against payload size and staleness risk. Both styles are "events," but they solve different problems and mixing them up in a design review is a common mid-level mistake.
+</p>
+
+<p>
+An <b>event notification</b> is deliberately thin: <code>{"orderId": "abc-123", "eventType": "OrderCreated"}</code>. It tells the world that something happened but not what the current data looks like. Any consumer that needs details must call back to the producing service's API to fetch them. This keeps events small and keeps the producing service as the single source of truth for the full record, but it reintroduces a synchronous dependency and a network round trip for every consumer that needs more than the bare fact, which quietly reintroduces the coupling and availability problem that event-driven architecture was supposed to remove.
+</p>
+
+<p>
+<b>Event-carried state transfer</b> puts enough of the actual state inside the event itself - the full (or a substantial denormalized) order payload - so consumers can act without ever calling back. This is what makes CQRS read-model projection and cross-service data replication work well: a consumer builds and maintains its own local copy purely from the event stream, with zero runtime coupling to the producer being available. The cost is that events get larger, that every consumer schema change now potentially affects a bigger payload, and that consumers are working with a snapshot that can be stale by the time they use it, so this only works for domains that can tolerate eventual consistency (which, per the CAP theorem discussion in the Microservices chapter, is most domains except the ones needing strict, immediate invariants).
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Aspect</th>
+<th>Event Notification</th>
+<th>Event-Carried State Transfer</th>
+</tr>
+
+<tr>
+<td>Payload</td>
+<td>Thin (ID + fact)</td>
+<td>Rich (enough state to act)</td>
+</tr>
+
+<tr>
+<td>Coupling</td>
+<td>Reintroduces a callback to the producer's API</td>
+<td>Zero runtime coupling to producer availability</td>
+</tr>
+
+<tr>
+<td>Staleness</td>
+<td>Consumer always fetches current data</td>
+<td>Consumer works off a point-in-time snapshot</td>
+</tr>
+
+<tr>
+<td>Best for</td>
+<td>Rare, cheap-to-fetch details; sensitive data you don't want broadcast</td>
+<td>CQRS read models, cross-service replication, high fan-out</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The one-liner: "A notification tells you something happened; state transfer gives you enough to act on it without calling back." A senior candidate adds the nuance that many production systems use a hybrid - a state-transfer event carrying the commonly needed fields, with an ID included so the rare consumer that needs the full aggregate can still fetch it on demand.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q9. Choreography vs Orchestration For Sagas - A Deeper Treatment
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The Microservices chapter introduces choreography and orchestration at the level of a three-step saga, where the trade-off looks clean: choreography is decoupled, orchestration is visible. At production scale, with a saga spanning eight or ten services and multiple failure branches, the trade-off stops being clean, and this is exactly the territory senior interviewers push into.
+</p>
+
+<p>
+The failure mode of choreography at scale is <b>implicit workflow sprawl</b>. With three services, "who reacts to what" fits in your head. With ten, the actual business process only exists as the sum of everyone's event handlers scattered across ten codebases, and answering "what happens if inventory reservation fails after payment succeeded but before shipping is booked" requires reading through every service's Kafka consumer to reconstruct a flowchart that was never written down anywhere. Debugging a stuck saga means correlating events across ten sets of logs by a correlation ID, and there is no single place to ask "where is order #4471 right now in its lifecycle." Teams that start with choreography for a simple two-step flow and grow the business process organically often find themselves migrating to orchestration specifically because nobody can safely add a new compensating rule to a workflow nobody can see in one place.
+</p>
+
+<p>
+Orchestration scales differently: the saga state machine lives in one place (often backed by a durable workflow engine like Temporal or Camunda, or a Spring state machine backed by its own event-sourced log), which means you can query "show me every order stuck in AWAITING_INVENTORY for more than 10 minutes" as a single query against the orchestrator's own state, and you can add a new compensating step by editing one workflow definition. The cost that grows with scale is that the orchestrator becomes a genuinely critical, stateful service - it needs its own durability, its own scaling story, and a bug in it can stall every in-flight saga at once, versus a choreography bug typically affecting only the events that flow through the buggy handler. The pragmatic large-scale answer many teams land on is a hybrid: orchestrate the handful of steps that need visibility and complex compensation (payment, inventory, shipping), and let peripheral, non-critical reactions (analytics, search indexing, marketing emails) choreograph off the same event stream without being part of the orchestrated saga at all.
+</p>
+
+</div>
+
+<pre>
+Choreography at scale (implicit, event-driven):
+
+OrderCreated --> [Payment] --> PaymentCompleted --> [Inventory] --> InventoryReserved
+                    |                                     |
+                    v                                     v
+              PaymentFailed                     InventoryReservationFailed
+              (who compensates what? spread across N services' handlers)
+
+Orchestration at scale (explicit, centrally visible):
+
+                     +------------------------+
+OrderCreated ------> |   Saga Orchestrator     | <-- queries: "orders stuck > 10min"
+                     | (durable workflow state)|
+                     +------------------------+
+                        |charge   |reserve   |ship
+                        v         v          v
+                    Payment   Inventory   Shipping
+                  (compensation logic lives in ONE place)
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Go beyond "choreography is decoupled, orchestration is visible" - name the specific scaling failure: choreography's cost is workflow logic becoming implicit and undebuggable as step count grows; orchestration's cost is the orchestrator becoming a critical, stateful single component. Then state the senior default: orchestrate the core transactional path where compensation and visibility matter, choreograph the peripheral fan-out that does not need to be part of the saga's success/failure contract.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q10. CQRS &amp; Event Sourcing Built On Kafka
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The Microservices chapter explains CQRS and event sourcing conceptually. The follow-up a senior interview wants is concrete: how do you actually build them on Kafka specifically, rather than a generic "event store" database? The answer leans on two Kafka features that are easy to overlook - <b>log compaction</b> and <b>Kafka Streams materialized views</b>.
+</p>
+
+<p>
+For event sourcing, the write side publishes every domain event (OrderCreated, OrderPaid, OrderShipped) to a Kafka topic keyed by aggregate ID (the order ID). That topic, if configured with time/size retention, is a durable audit log; but the true event-sourcing move is to also maintain the <i>current state</i> as a compacted topic - a changelog where Kafka's log compaction guarantees at least the latest value per key is retained forever, even after time-based retention would otherwise have deleted it. A tombstone (a message with a null value for a given key) tells the compaction process the key has been logically deleted, which is how you express "this aggregate no longer exists" in a log-based store.
+</p>
+
+<p>
+For CQRS, the read side is built by a Kafka Streams application (or a Connect sink) that consumes the raw event topic and folds it into one or more <b>materialized views</b> - a KTable backed by a state store, which can be exposed for point lookups via Kafka Streams' Interactive Queries, or piped into a purpose-built read database (Elasticsearch for search, Postgres for relational queries, Redis for low-latency lookups) via a Connect sink connector. Because the read model is just a projection of the event log, you can always tear it down and rebuild it from scratch by replaying the compacted topic from the beginning - which is the single biggest operational benefit of this design: fixing a bug in a projection does not require a data migration, it requires resetting a consumer group offset and letting the projection rebuild itself.
+</p>
+
+</div>
+
+<pre>
+# Event-sourced aggregate topic: compacted, keyed by aggregate id
+kafka-topics.sh --create --topic order-events \
+  --config cleanup.policy=compact \
+  --config min.compaction.lag.ms=0 \
+  --partitions 12 --replication-factor 3
+
+# Rebuild a read-model projection from scratch after a bug fix:
+# reset the projector's consumer group to earliest, then restart it
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group order-read-model-projector --topic order-events \
+  --reset-offsets --to-earliest --execute
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The detail worth volunteering: "Log compaction is what makes Kafka a viable event store, not just an audit log - it guarantees the latest state per key survives forever, while the full history can still be retained separately if the audit trail itself needs to outlive compaction." That single sentence tells the interviewer you know Kafka's storage engine, not just the CQRS diagram.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h6">SECTION 4 - OPERATIONS AT SCALE: GEO-REPLICATION, CDC &amp; CAPACITY PLANNING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q11. Multi-Cluster / Geo-Replication (MirrorMaker 2)
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A single Kafka cluster does not span regions or clouds well - cross-region replication latency for synchronous ISR acknowledgement would be brutal. MirrorMaker 2 (MM2) solves cross-cluster and cross-region replication by running as a Kafka Connect application: it consumes from a source cluster and produces to a target cluster asynchronously, rather than trying to make one cluster physically span two data centers.
+</p>
+
+<p>
+The two common topologies are <b>active-passive</b>, where one region is primary and a second region is a warm standby fed by MM2 for disaster recovery, and <b>active-active</b>, where both regions serve live traffic and replicate to each other, usually for regional locality of reads and writes with eventual cross-region consistency. Active-active is meaningfully harder because you must guard against infinite replication loops (region A replicates to B, which replicates back to A) - MM2 handles this by prefixing replicated topic names with the source cluster's alias (for example <code>us-east.orders</code> as seen in <code>eu-west</code>), so a topic never re-replicates into itself.
+</p>
+
+<p>
+The trickiest part operationally is <b>offset translation</b>. Consumer offsets are meaningless across clusters - "offset 4471 in us-east" and "offset 4471 in eu-west" refer to different physical positions in different logs, because messages land at different offsets after being replicated. MM2 solves this with an internal offset-sync mechanism and a <code>MirrorCheckpointConnector</code> that periodically translates a consumer group's committed offsets in the source cluster into equivalent offsets in the target cluster, which is what lets a consumer group failing over to the DR region resume roughly where it left off instead of restarting from the beginning or the end of the topic.
+</p>
+
+</div>
+
+<pre>
+# MirrorMaker 2 connector config (mm2.properties) - active-passive DR
+clusters = us-east, eu-west
+us-east.bootstrap.servers = us-east-broker:9092
+eu-west.bootstrap.servers = eu-west-broker:9092
+
+us-east-&gt;eu-west.enabled = true
+us-east-&gt;eu-west.topics = orders, payments
+
+# offsets for failover: translates consumer group offsets between clusters
+sync.group.offsets.enabled = true
+emit.checkpoints.enabled = true
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Name offset translation specifically - it is the detail that trips up candidates who only know MM2 as "Kafka's cross-region copy tool." Without it, failing over a consumer group to the DR cluster means either reprocessing everything from the start (duplicate side effects downstream) or skipping to the end (silent data loss), and the checkpoint connector is what avoids both.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q12. Kafka Connect &amp; Change Data Capture (Debezium) Pipelines
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Kafka Connect is Kafka's framework for moving data in and out of Kafka without hand-writing producer/consumer code: <b>source connectors</b> pull data into Kafka from external systems, <b>sink connectors</b> push data from Kafka out to external systems, and it runs in <b>distributed mode</b> across a cluster of worker JVMs for scalability and fault tolerance, with connector configuration submitted via a REST API rather than deployed as code.
+</p>
+
+<p>
+Debezium is the connector that turns Kafka Connect into a full <b>Change Data Capture (CDC)</b> pipeline. Instead of polling a database's tables (which misses deletes and can miss fast updates between polls), Debezium reads the database's own replication log directly - the MySQL binlog, the Postgres logical replication slot, and so on - and turns every insert, update and delete into a Kafka event, in commit order, with before/after row images. This is a fundamentally different, more reliable data source than application-level polling, because it captures every committed change exactly as the database itself recorded it.
+</p>
+
+<p>
+CDC is the most direct real-world alternative to the transactional outbox pattern from the Microservices chapter: instead of an application explicitly writing an outbox row in the same transaction as its business change, Debezium captures the business table's changes directly from the database log, so you get "publish this as an event" without the application code needing to know about Kafka at all. The trade-off is that a raw CDC event exposes your database schema directly to consumers (tight coupling to internal table structure, versus a deliberately designed outbox event schema), which is why many teams still use the outbox <i>table</i> pattern but let Debezium be the reliable relay that reads that specific table's log, combining a clean event contract with CDC's guarantee of never missing a committed row.
+</p>
+
+</div>
+
+<pre>
+{
+  "name": "orders-outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "orders-db",
+    "database.dbname": "orders",
+    "table.include.list": "public.outbox_event",
+    "topic.prefix": "orders-cdc",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.route.by.field": "aggregate_type"
+  }
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The connection to draw explicitly: "Debezium reading a dedicated outbox table combines the reliability of CDC (nothing is ever missed, because it reads the database's own commit log) with the clean contract of the outbox pattern (consumers see a deliberately designed event, not raw table rows)." That sentence links this question directly back to the dual-write problem and outbox pattern already covered in the Microservices chapter, which is exactly the kind of cross-chapter synthesis senior interviewers reward.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q13. Capacity Planning: Partition Count, Replication Factor, Retention Sizing
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Capacity planning for Kafka is one of the few interview topics where being able to reason through actual numbers, not just names of configs, is the differentiator. There are three independent decisions - partition count, replication factor, and retention - and each has a real cost on both sides of getting it wrong.
+</p>
+
+<p>
+<b>Partition count</b> should be derived from target throughput, not guessed. If a single partition can sustain roughly 10 MB/s of producer throughput and 20 MB/s of consumer throughput (rough, hardware-dependent figures used purely for planning), and you need to sustain 100 MB/s produced, you need at least 10 partitions, then round up for headroom and for the maximum consumer parallelism you want (partition count is the hard ceiling on active consumers in a group). The trap on the other side is over-provisioning: every partition costs open file handles on every broker, adds metadata the controller must track, and increases the time a leader election or a full rebalance takes, so "just use 200 partitions to be safe" has a real, cumulative operational cost across hundreds of topics.
+</p>
+
+<p>
+<b>Replication factor</b> of 3 is the standard production default: it tolerates one broker failure while keeping <code>min.insync.replicas=2</code> satisfiable, per the durability discussion in Q2. Going to 2 saves storage and network but means losing a single broker can drop you to a single in-sync replica, one failure away from unavailability; going to 5 is rare and mostly reserved for the most critical topics, since it multiplies both storage and cross-broker replication network traffic. <b>Retention sizing</b> is simple arithmetic once you know your ingest rate: daily volume in bytes times retention days times replication factor gives total cluster disk footprint for a topic - a topic ingesting 50 GB/day with 7-day retention and replication factor 3 needs roughly 1.05 TB of cluster-wide disk, which is the number you actually take to a capacity-planning conversation, not "we set retention to a week."
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Decision</th>
+<th>Formula / rule of thumb</th>
+<th>Cost of over-provisioning</th>
+<th>Cost of under-provisioning</th>
+</tr>
+
+<tr>
+<td>Partition count</td>
+<td>target throughput / per-partition throughput, rounded up for consumer parallelism</td>
+<td>File handles, controller metadata, slower rebalances</td>
+<td>Throughput ceiling; consumer parallelism capped</td>
+</tr>
+
+<tr>
+<td>Replication factor</td>
+<td>3 is standard; matches min.insync.replicas=2</td>
+<td>Storage + network cost multiplies</td>
+<td>Fewer broker failures tolerated before unavailability</td>
+</tr>
+
+<tr>
+<td>Retention</td>
+<td>daily bytes &times; retention days &times; replication factor</td>
+<td>Disk cost; longer/slower re-replication after failure</td>
+<td>Cannot replay far enough back to recover from a bug</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Setting partition count once at topic creation and never revisiting it - increasing partitions later changes the key-to-partition hash mapping for every existing key, which silently breaks per-key ordering for any consumer relying on it, since messages for the same key can now land in a different partition than before. The senior answer plans partition count for expected peak load up front specifically because it is expensive and disruptive to change later, unlike replication factor or retention which can be adjusted with far less blast radius.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h7">SECTION 5 - DEBUGGING PRODUCTION KAFKA INCIDENTS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question">
+Q14. Debugging A Real Production Kafka Incident (Consumer Lag Spike, Rebalance Storm)
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is the question that separates a candidate who can define terms from one who has actually been paged at 2am. A strong answer narrates a diagnostic process, not a list of facts, and it should sound like something you have actually lived through rather than a checklist recited from memory.
+</p>
+
+<p>
+The first move is always to look, not guess: <code>kafka-consumer-groups.sh --describe --group X</code> tells you, per partition, the current offset, the log-end offset, and the lag between them. If lag is climbing uniformly across every partition, the consumers are simply too slow for the incoming rate - the fix is scaling out consumers (up to partition count), or speeding up the per-record processing (batching downstream calls, async I/O). If lag is climbing on a small subset of partitions while others are fine, that points to a "hot key" - one partition receiving disproportionate traffic because of a skewed partition key, or a single consumer instance stuck on a slow downstream dependency for records only it happens to own.
+</p>
+
+<p>
+A <b>rebalance storm</b> is a distinct and nastier failure mode: the consumer group's broker logs show repeated JoinGroup/SyncGroup cycles, and lag spikes not because processing got slower but because the group keeps stopping to reassign partitions. The classic root cause is a processing loop that occasionally exceeds <code>max.poll.interval.ms</code> - a slow downstream call, a large GC pause, or a spike in <code>max.poll.records</code> combined with per-record latency - which Kafka interprets as "this consumer is dead," evicts it, and triggers a rebalance; the evicted consumer then rejoins, triggering a second rebalance, and if several consumers are marginal at once you get a storm where the group barely spends any time actually consuming. The fix is rarely "increase max.poll.interval.ms" alone (that just delays the pain); it is finding and fixing the actual slow path in the poll loop, lowering max.poll.records so each poll cycle is bounded, and moving to CooperativeStickyAssignor so the rebalances that do still happen are cheaper.
+</p>
+
+<p>
+A full incident narrative ties this together: lag alert fires, <code>--describe</code> shows lag concentrated on 3 of 12 partitions, broker logs show that consumer group repeatedly rebalancing, application logs show p99 processing latency on those partitions spiking because of a downstream payment-gateway timeout, thread dumps confirm the consumer thread is blocked in that call past max.poll.interval.ms. The fix applied under pressure is to bump max.poll.interval.ms as a stopgap to stop the bleeding immediately, then the actual remediation is moving the slow downstream call off the consumer thread (or adding a timeout with circuit breaking per the Microservices chapter's resilience patterns) so the poll loop reliably returns well within the interval, followed by a retro that adds an alert on rebalance rate itself, not just on lag, so the next occurrence is caught before lag has a chance to build up.
+</p>
+
+</div>
+
+<pre>
+# Step 1: is the group actually behind, and where?
+kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+  --describe --group order-fulfilment
+
+# Step 2: is it rebalancing repeatedly? check broker logs for the group
+grep "order-fulfilment" /var/log/kafka/server.log | grep -E "Rebalance|JoinGroup"
+
+# Step 3: is a specific consumer instance blocked past max.poll.interval.ms?
+# thread dump the JVM, look for the KafkaConsumer poll thread's stack
+
+# Stopgap while root-causing:
+# raise max.poll.interval.ms and lower max.poll.records so each
+# poll cycle is smaller and less likely to exceed the interval
+max.poll.interval.ms=600000
+max.poll.records=100
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Distinguish the two failure signatures out loud: uniform lag growth is a throughput problem (scale consumers, speed up processing); lag growth correlated with repeated rebalance events in the broker logs is a poll-loop problem (something inside processing is occasionally too slow, and Kafka is evicting the consumer). Interviewers specifically listen for whether you reach for the broker/group logs to tell these apart, rather than reflexively throwing more consumer instances at every lag alert regardless of its actual cause.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h8">QUICK REVISION SHEET</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="answer">
+
+<ul>
+
+<li>ISR = followers caught up within replica.lag.time.max.ms; new leader always elected from ISR so committed data survives broker failure (unless unclean.leader.election.enable=true)</li>
+
+<li>acks=0 (fire and forget) / acks=1 (leader only) / acks=all (whole ISR) - acks=all only means something when paired with min.insync.replicas as a floor</li>
+
+<li>Rebalances stop consumption for affected partitions; CooperativeStickyAssignor limits this to only the partitions moving; group.instance.id (static membership) skips rebalances entirely across restarts/deploys</li>
+
+<li>Idempotent producer (PID + per-partition sequence number) dedups producer retries on one partition; transactions extend atomicity across partitions + offset commit via a transaction coordinator and read_committed isolation</li>
+
+<li>Kafka Streams state lives in RocksDB but is backed by a changelog topic - state is rebuildable from the log; standby replicas avoid a full replay on failover; processing.guarantee=exactly_once_v2 reuses Kafka transactions</li>
+
+<li>Exactly-once is real but scoped to Kafka's boundary and costs throughput; effectively-once (at-least-once + idempotent consumers) is what most production systems actually run at scale</li>
+
+<li>Schema registry enforces BACKWARD/FORWARD/FULL compatibility per subject so producer and consumer teams can evolve Avro/Protobuf schemas independently without a synchronized release</li>
+
+<li>Event notification (thin, needs callback) vs event-carried state transfer (rich, no callback needed) - trades payload size and staleness against runtime coupling</li>
+
+<li>Choreography breaks down at scale via implicit, undebuggable workflow sprawl across many services; orchestration concentrates that risk into one critical, stateful orchestrator - hybrid (orchestrate the core saga, choreograph peripheral fan-out) is common at scale</li>
+
+<li>CQRS/event sourcing on Kafka = compacted topic as the source-of-truth log (tombstones for deletes) + Kafka Streams KTable/state store as the rebuildable read-model projection</li>
+
+<li>MirrorMaker 2 replicates across clusters/regions asynchronously; topic-name prefixing avoids replication loops in active-active; offset translation (checkpoint connector) is what makes consumer group failover to a DR cluster actually work</li>
+
+<li>Kafka Connect (source/sink, distributed mode) + Debezium (reads the DB's own commit log) = reliable CDC; Debezium reading a dedicated outbox table combines CDC reliability with a clean event contract</li>
+
+<li>Partition count from target throughput (hard to change later - repartitioning breaks per-key ordering); replication factor 3 + min.insync.replicas 2 is the standard durability baseline; retention = daily bytes x days x replication factor</li>
+
+<li>Uniform lag growth = throughput problem (scale/speed up consumers); lag plus repeated rebalances in broker logs = poll-loop problem (something inside processing exceeds max.poll.interval.ms and gets evicted)</li>
+
+</ul>
+
+</div>
+
+</div>
+
+<hr>
+
+</body>
+</html>

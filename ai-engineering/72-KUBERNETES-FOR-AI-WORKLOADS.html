@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>96-KUBERNETES-FOR-AI-WORKLOADS.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 72 — KUBERNETES FOR AI WORKLOADS</h1>
+
+<p class="roi">Volume 5 — Enterprise AI Engineering · Chapter 9 of 12</p>
+
+<div class="callout">
+Scaling (Chapter 71) taught you <em>what</em> to scale — replicas, queues, autoscaling signals — but stopped short of the substrate that actually schedules those replicas onto machines, holds a GPU steady for a model server, and decides what happens when a pod serving live inference traffic suddenly dies. That substrate, for the overwhelming majority of production AI systems today, is Kubernetes. This chapter is where your Spring Boot deployment habits meet a scheduler that was designed for stateless web pods and now has to be persuaded, configured, and sometimes fought, into safely running GPU-bound, latency-sensitive, expensive AI workloads.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every chapter in this volume so far has assumed a running platform underneath your application — something that keeps your Spring Boot service alive, restarts it when it crashes, and spreads traffic across instances. Up to now that platform could have been almost anything: a handful of EC2 instances behind a load balancer, an App Engine deployment, a PaaS. For AI workloads specifically, that assumption stops being safe. The moment your architecture includes a self-hosted embedding model, a fine-tuned Llama variant, a vector database with persistent state, or even just a fleet of stateless Spring AI services that need to autoscale sharply and safely around unpredictable LLM-call latency, you are running workloads with resource shapes and failure modes that generic PaaS abstractions were never designed for.
+</p>
+
+<p>
+Kubernetes has become the default answer not because it is the simplest tool for the job, but because it is the only widely adopted platform that natively expresses the primitives AI workloads actually need: fine-grained, hardware-aware scheduling (a GPU is not a CPU core you can slice arbitrarily); the ability to describe long, cold-start-heavy container images loaded with multi-gigabyte model weights; readiness semantics that must account for a model server that takes ninety seconds to warm up before it can serve a single token; and horizontal/vertical scaling policies that must key off custom signals like queue depth and GPU utilization rather than plain CPU percentage. Every major inference-serving framework you will encounter later in this series — vLLM, Triton, TorchServe, Ray Serve — assumes it is being orchestrated by Kubernetes, and every managed AI platform (SageMaker, Vertex AI, Azure ML, KServe, Seldon) is, underneath its friendly API, a Kubernetes control plane wearing a costume.
+</p>
+
+<p>
+For you, a Java/Spring engineer, the stakes are concrete and immediate. The Spring Boot service you build with <code>ChatClient</code> in front of a self-hosted model is not "done" when it compiles and passes its tests — it is done when it survives a node failure at 2 a.m. without dropping in-flight requests, scales out fast enough to absorb a traffic spike without your p99 latency exploding, and does not silently route requests to a GPU pod that has not finished loading its weights. None of that is Spring AI's job. All of it is Kubernetes' job, configured correctly by you. This chapter builds the mental model and the concrete manifests you need to do that correctly, rather than by trial and error in production.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Before Orchestration: Pets, Not Cattle</h3>
+
+<p>
+Before container orchestration existed as a discipline, deploying a machine-learning model into production typically meant provisioning a dedicated, hand-configured server — often a physical or virtual machine with a GPU attached, set up once by an ML engineer or ops specialist, and then treated as a fragile, irreplaceable "pet." If that box died, someone paged in the middle of the night to rebuild it by hand: reinstall CUDA drivers, reinstall the correct version of a deep learning framework, re-download model weights, and hope the configuration matched what was documented (it rarely fully did). Scaling out meant manually cloning that fragile setup, which was slow, error-prone, and expensive in engineering time. This is the same "pets vs. cattle" problem that drove general infrastructure toward containers and orchestration in the mid-2010s — AI infrastructure simply arrived at the same wall a few years later, once models grew large and expensive enough that treating GPU servers as disposable, identical, orchestrated units became economically necessary rather than optional.
+</p>
+
+<h3>2.2 Kubernetes' Own Origin, and Why It Wasn't Built for This</h3>
+
+<p>
+Kubernetes itself descends from Google's internal Borg system, open-sourced in 2014, and its founding design center was stateless, horizontally scalable web and batch workloads — think web servers, not GPU-bound model servers holding tens of gigabytes of weights in device memory. Early Kubernetes had no first-class concept of a GPU at all; a pod could request CPU and memory, full stop. GPU support arrived later, bolted on through a mechanism called <strong>device plugins</strong> (introduced around Kubernetes 1.8, roughly 2017) that let a vendor (NVIDIA, AMD) advertise specialized hardware to the scheduler as an opaque, non-shareable, non-fractional resource. This history matters because it explains a limitation you will hit directly: out of the box, Kubernetes treats a GPU as an all-or-nothing resource — one pod, one whole GPU — because the original design never anticipated needing to time-slice or fractionally share accelerators the way it already knew how to share CPU cores.
+</p>
+
+<h3>2.3 The Rise of AI-Native Layers on Top of Kubernetes (2018–present)</h3>
+
+<p>
+As GPU-bound and LLM-serving workloads became mainstream, the ecosystem responded not by replacing Kubernetes but by building specialized layers on top of it: <strong>Kubeflow</strong> for ML pipelines and training jobs, <strong>KServe</strong> (formerly KFServing) and <strong>Seldon Core</strong> for standardized model-serving abstractions, the <strong>NVIDIA GPU Operator</strong> to automate driver and device-plugin installation, and inference-specific serving engines like <strong>vLLM</strong> and <strong>Triton Inference Server</strong> that are typically deployed as Kubernetes Deployments with GPU resource requests. This "layers on top" pattern is the same evolutionary shape you have already seen in this series with Spring AI sitting on top of raw model provider SDKs — a general-purpose substrate gets specialized libraries and operators built on it rather than being replaced, because the underlying scheduling, networking, and lifecycle-management problems Kubernetes solves are still exactly the right problems to solve for AI workloads; only the resource model needed extension.
+</p>
+
+<table>
+<tr><th>Era</th><th>Approach</th><th>Failure Mode</th><th>What Survives Today</th></tr>
+<tr><td>Pet servers (pre-2015)</td><td>Hand-configured GPU boxes, manually maintained</td><td>Unscalable, slow recovery, config drift</td><td>Nothing directly — fully superseded</td></tr>
+<tr><td>Early container orchestration (2015–2017)</td><td>Kubernetes for stateless web workloads only; GPUs unsupported</td><td>No hardware-aware scheduling for ML</td><td>Core scheduler, Deployment/Service/Pod primitives — still the foundation</td></tr>
+<tr><td>GPU device plugins (2017–2019)</td><td>Vendor plugins expose whole GPUs as schedulable resources</td><td>No fractional/shared GPU allocation</td><td>Device plugin API — still how GPUs are exposed today</td></tr>
+<tr><td>AI-native operators (2019–present)</td><td>Kubeflow, KServe, GPU Operator, Ray on Kubernetes</td><td>Added operational complexity, steep learning curve</td><td>The layer this chapter teaches you to reason about and configure directly</td></tr>
+</table>
+
+<p class="followup">
+<strong>Why this history matters to you:</strong> when you hit a limitation — "why can't I just ask for half a GPU?", "why does my pod get killed instead of gracefully drained?" — it is almost never a Kubernetes bug. It is a direct echo of the fact that Kubernetes' resource model was designed for CPU-and-memory-shaped workloads and extended, not redesigned, for GPU-shaped ones. Knowing this saves you from assuming a missing feature is a misconfiguration you can fix; sometimes it is a genuine platform gap you must engineer around (Section 9 and 12 cover the concrete workarounds).
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Given a fleet of heterogeneous, expensive, and failure-prone compute nodes (some with GPUs, some without), reliably schedule, scale, network, and recover AI workloads — model servers, inference gateways, and the Spring AI services that call them — so that the system as a whole stays available and cost-efficient even as individual nodes, pods, and models fail or change.</strong>
+</div>
+
+<p>
+Unpack the specific sub-problems hiding inside that sentence, because each one maps directly to a Kubernetes feature you will configure later in this chapter:
+</p>
+
+<ul>
+<li><strong>Placement:</strong> a pod that needs a GPU must land only on a node that has one, and ideally a node whose GPU has enough free memory for that specific model's weights and KV cache — a much sharper constraint than "any node with free CPU."</li>
+<li><strong>Slow, resource-heavy startup:</strong> a model server pulling a 15 GB container image and loading multi-gigabyte weights into GPU memory can take tens of seconds to minutes before it can serve a single request — traffic must not be routed to it before that point.</li>
+<li><strong>Asymmetric cost of failure:</strong> restarting a stateless Spring Boot pod is nearly free; restarting a GPU pod mid-inference wastes an expensive, scarce resource and can drop in-flight generations, so recovery policy must be tuned differently.</li>
+<li><strong>Non-CPU scaling signals:</strong> the thing that predicts whether you need more capacity is rarely CPU utilization for an LLM-serving pod — it is GPU utilization, request queue depth, or tokens-per-second throughput, none of which the default autoscaler understands without help.</li>
+<li><strong>Mixed-criticality traffic:</strong> a single platform typically runs cheap, latency-tolerant batch embedding jobs alongside expensive, latency-sensitive chat inference, and the scheduler needs to be told which is which so it does not starve the wrong one under resource pressure.</li>
+</ul>
+
+<p>
+This is the precise problem this chapter solves: not "how do I run a container" (you already know that), but "how do I express AI-specific constraints and failure semantics in a system whose native vocabulary was built for stateless CPU workloads."
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Core Mental Model: Declarative Desired State, Reconciled Continuously</h3>
+
+<p>
+If you take away exactly one idea from Kubernetes theory, make it this one: <strong>you never tell Kubernetes what to do — you tell it what should be true, and a set of tireless control loops continuously compares that description against reality and takes action to close the gap.</strong> This is a sharp departure from the imperative scripts you may have used to deploy a Spring Boot app in the past ("SSH in, stop the old jar, copy the new jar, start it"). You instead write a YAML manifest declaring "there should be 3 running copies of this container, each with 1 GPU and 16 GB of memory," submit it to the API server, and a component called the <strong>controller manager</strong> spends forever afterward making that statement true — creating pods when there are too few, deleting them when there are too many, rescheduling them when a node dies.
+</p>
+
+<p>
+This "declare desired state, reconcile continuously" loop is called the <strong>control loop</strong> pattern, and it is the single mechanism underneath almost everything Kubernetes does: Deployments reconcile replica count, the Horizontal Pod Autoscaler reconciles replica count against a metric target, the scheduler reconciles "pending pods" against "nodes with capacity." Once this clicks, most of Kubernetes stops looking like a grab-bag of YAML kinds and starts looking like the same idea, applied repeatedly, to different resources.
+</p>
+
+<h3>4.2 The Object Hierarchy You Actually Need for AI Workloads</h3>
+
+<p>
+Analogy first: think of a <strong>Pod</strong> as a single running instance of your process — the AI-workload equivalent of one JVM instance running your Spring Boot jar, plus any tightly-coupled sidecar containers (a metrics exporter, a model-loading init container). A Pod is deliberately ephemeral and disposable; you almost never create one directly in production. A <strong>Deployment</strong> is the durable declaration "keep N healthy copies of this Pod template running at all times" — it is what actually reconciles replica count, performs rolling updates, and replaces failed Pods. A <strong>Service</strong> is a stable network identity and load-balancing rule in front of a changing set of Pod IPs — because Pod IPs are not stable (a rescheduled Pod gets a new IP), your Spring AI client should never talk to a Pod directly, only to a Service.
+</p>
+
+<p>
+On top of that base triad, AI workloads specifically add: a <strong>StatefulSet</strong> instead of a Deployment when Pods need stable identity and durable per-instance storage (a vector database shard, a model cache volume that should survive a restart of that specific instance); a <strong>Job</strong> or <strong>CronJob</strong> for one-shot or scheduled work like a nightly batch embedding pipeline or a fine-tuning run, which is fundamentally different from a Deployment because it is expected to <em>finish</em>, not run forever; and a <strong>Custom Resource Definition (CRD)</strong>, which is how AI-native operators like KServe extend Kubernetes' vocabulary with new kinds such as <code>InferenceService</code> that bundle Deployment, Service, autoscaling, and traffic-splitting concerns into one AI-shaped object.
+</p>
+
+<h3>4.3 Requests, Limits, and Why GPUs Break the Usual Rules</h3>
+
+<p>
+Every container in Kubernetes states two numbers per resource type: a <strong>request</strong> (the amount it is guaranteed, used by the scheduler to decide placement) and a <strong>limit</strong> (the hard ceiling it may never exceed, enforced by the kernel/runtime). For CPU and memory, requests can be fractional and the scheduler can pack many pods with modest requests onto one node, over-committing lightly and relying on the kernel to time-slice CPU fairly. GPUs do not work this way by default: a GPU is requested as a whole integer (<code>nvidia.com/gpu: 1</code>), it cannot be fractionally requested out of the box, and the Kubernetes scheduler treats it as an opaque, indivisible resource it does not understand the internals of — it just marks it consumed. This single asymmetry — CPU is a shareable, divisible resource; a GPU by default is not — is the theoretical root of nearly every "GPU utilization is embarrassingly low" complaint in real AI platforms, and Section 12 covers the concrete mitigations (MIG, time-slicing, batching).
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Walk through what actually happens, mechanically, from the moment you submit a manifest for a GPU-backed model-serving Deployment to the moment it is safely serving traffic — because the edge cases live in this sequence, not in the YAML syntax.
+</p>
+
+<ol>
+<li><strong>Submission:</strong> you run <code>kubectl apply -f model-server.yaml</code>. The manifest is sent to the <strong>API server</strong>, validated, and persisted into <strong>etcd</strong> (Kubernetes' distributed key-value store, the single source of truth for all cluster state).</li>
+<li><strong>Deployment controller reacts:</strong> a watch-loop notices a new Deployment object exists with zero matching Pods, and creates the requested number of Pod objects (still unscheduled — no node assigned yet), each carrying the resource request <code>nvidia.com/gpu: 1</code>.</li>
+<li><strong>Scheduling:</strong> the <strong>scheduler</strong> watches for Pods with no assigned node. For each pending Pod it filters nodes by hard constraints (does this node have a free, schedulable GPU? does it satisfy any <code>nodeSelector</code>/affinity rules you wrote, like "only nodes labeled <code>gpu-type=a100</code>"?), then scores the remaining candidates (spread pods across nodes/zones, prefer bin-packing or spreading depending on configured priorities) and binds the Pod to the winning node.</li>
+<li><strong>Kubelet takes over:</strong> the <strong>kubelet</strong> daemon on the chosen node sees a new Pod bound to it, pulls the container image (this step alone can take minutes for a multi-gigabyte AI serving image — a real, frequently underestimated source of slow rollouts), and asks the container runtime to start the container.</li>
+<li><strong>Device plugin allocation:</strong> because the container requested a GPU, the kubelet consults the <strong>NVIDIA device plugin</strong> (a special pod running on that node that advertises available GPU units to the kubelet) to get the specific device ID, and injects the right environment variables/device files so the container can actually see and use that physical GPU.</li>
+<li><strong>Container starts, but is not yet "ready":</strong> the process inside the container starts — for an inference server this typically means: initialize the runtime, load model weights from disk or a mounted volume into GPU memory, warm up any JIT-compiled kernels. This can take anywhere from a few seconds to several minutes depending on model size.</li>
+<li><strong>Readiness probing gates traffic:</strong> Kubernetes will not send Service traffic to this Pod until its configured <strong>readiness probe</strong> succeeds (commonly an HTTP health endpoint that only returns 200 once weights are fully loaded). This is the single most important, most frequently misconfigured mechanism for AI workloads — get it wrong and users get routed to a pod that is still loading, receiving connection resets or multi-minute hangs.</li>
+<li><strong>Liveness probing guards against silent hangs:</strong> separately, a <strong>liveness probe</strong> continuously checks whether the process is still functioning at all; if it fails repeatedly, the kubelet kills and restarts the container — useful for catching a model server wedged in a deadlock, but dangerous if configured too aggressively against a server that is merely slow under heavy load (Section 11 covers this exact trap).</li>
+<li><strong>Ongoing reconciliation:</strong> from this point on, the Deployment controller, the Horizontal Pod Autoscaler (if configured), and the node's own health monitoring continue running their independent control loops indefinitely, reacting to node failures, scale-metric changes, or manual scaling commands — nothing about this is a one-shot deployment event; it never stops running.</li>
+</ol>
+
+<p>
+Every one of these nine steps is a place where a generic, copy-pasted Kubernetes manifest silently does the wrong thing for an AI workload: default readiness probes assume near-instant startup, default rolling-update strategy assumes replacing a pod is cheap, default scheduling has no concept of "this GPU already has another model loaded and cannot fit a second." The remainder of this chapter is about closing those gaps deliberately rather than discovering them in an incident.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Kubernetes for AI workloads is overwhelmingly a systems and control-theory topic rather than a mathematically dense one, so this section stays deliberately light — the goal is intuition for the one piece of math that actually drives operational decisions: <strong>autoscaling as a feedback control loop.</strong>
+</p>
+
+<p>
+The Horizontal Pod Autoscaler (HPA) computes a desired replica count from a simple ratio-based formula:
+</p>
+
+<pre>
+desiredReplicas = ceil( currentReplicas × ( currentMetricValue / desiredMetricValue ) )
+
+Example — scaling a Spring AI inference gateway on request queue depth:
+  currentReplicas      = 4
+  currentMetricValue   = 40   (average pending requests per pod, observed)
+  desiredMetricValue   = 10   (target pending requests per pod, configured)
+
+  desiredReplicas = ceil( 4 × (40 / 10) ) = ceil(16) = 16
+</pre>
+
+<p>
+The intuition matters more than the formula: this is a proportional controller — it scales replicas in direct proportion to how far the current metric is from target, the same "how far off am I, correct proportionally" logic you may already know from PID-style feedback loops in other systems. The practical trap is entirely about <strong>signal choice and latency</strong>, not the arithmetic: if the metric you feed this formula (say, CPU) does not actually correlate with the thing you care about (GPU saturation, or LLM latency), the formula will confidently compute a precisely wrong answer. Equally important is the lag baked into the loop — metrics are typically scraped and averaged over a window (commonly 15–60 seconds), and a new replica for a GPU-backed model server can take minutes to become ready (Section 5's startup sequence), so the effective response time of this "instant-looking" formula can be several minutes end to end. Designing for that lag — over-provisioning a buffer, or scaling on a leading indicator like queue depth rather than a lagging one like current latency — is the real engineering skill; the formula itself is almost incidental.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Pod Lifecycle for a GPU-Backed Model Server, End to End</h3>
+
+<pre>
+ kubectl apply             API Server            Scheduler                Node (has GPU)
+ ────────────    ───►    ──────────────   ───►   ───────────    ───►    ──────────────────
+ manifest                writes to etcd          filters nodes           kubelet pulls image
+ (Deployment,             │                       by GPU + labels        (can take minutes for
+  requests: 1 GPU)        │                       scores + binds          multi-GB AI images)
+                          │                       Pod → Node                    │
+                          ▼                                                    ▼
+                 Deployment controller                                device plugin allocates
+                 sees 0/3 Pods running,                                specific GPU device ID
+                 creates 3 Pod objects                                        │
+                 (status: Pending)                                            ▼
+                                                                       container process starts
+                                                                       loads weights → GPU mem
+                                                                              │
+                                                                              ▼
+                                                              ┌─────────────────────────────┐
+                                                              │  readinessProbe: NOT ready    │──X── Service
+                                                              │  (still loading weights)      │      ignores
+                                                              └─────────────────────────────┘      this pod
+                                                                              │  (30–120s later)
+                                                                              ▼
+                                                              ┌─────────────────────────────┐
+                                                              │  readinessProbe: READY        │──✓── Service
+                                                              │  (model warm, serving)         │      routes
+                                                              └─────────────────────────────┘      traffic here
+</pre>
+
+<h3>7.2 Traffic Path Through a Real AI-on-Kubernetes Cluster</h3>
+
+<pre>
+                              ┌───────────────────────────┐
+                              │   Ingress / API Gateway     │   (TLS termination, auth,
+                              └──────────────┬────────────┘    rate limiting)
+                                             ▼
+                              ┌───────────────────────────┐
+                              │  Service: spring-ai-app      │   (stable virtual IP,
+                              └──────────────┬────────────┘    load-balances to Pods)
+                                             ▼
+              ┌──────────────────────────────┼──────────────────────────────┐
+              ▼                              ▼                              ▼
+      ┌───────────────┐             ┌───────────────┐             ┌───────────────┐
+      │ Pod: spring-ai │             │ Pod: spring-ai │             │ Pod: spring-ai │
+      │ (CPU only,      │             │ (CPU only,      │             │ (CPU only,      │
+      │  ChatClient →)  │             │  ChatClient →)  │             │  ChatClient →)  │
+      └───────┬───────┘             └───────┬───────┘             └───────┬───────┘
+              └──────────────────────────────┼──────────────────────────────┘
+                                             ▼
+                              ┌───────────────────────────┐
+                              │  Service: model-server        │
+                              └──────────────┬────────────┘
+                                             ▼
+              ┌──────────────────────────────┼──────────────────────────────┐
+              ▼                                                             ▼
+      ┌────────────────────────┐                            ┌────────────────────────┐
+      │ Node A (has GPU)          │                            │ Node B (has GPU)          │
+      │ ┌─────────────────────┐  │                            │ ┌─────────────────────┐  │
+      │ │ Pod: vLLM server      │  │        node affinity /     │ │ Pod: vLLM server      │  │
+      │ │ nvidia.com/gpu: 1     │  │◄────  taints/tolerations  ►│ │ nvidia.com/gpu: 1     │  │
+      │ └─────────────────────┘  │        keep non-GPU pods    │ └─────────────────────┘  │
+      └────────────────────────┘        off these nodes       └────────────────────────┘
+</pre>
+
+<p class="followup">
+Notice the two-Service hop in the second diagram: the Spring AI application tier and the GPU model-serving tier are separate scaling domains with separate Deployments, separate Services, and separate node pools. This separation is deliberate and important — it lets you scale the cheap, CPU-only orchestration layer independently and much more aggressively than the expensive GPU layer, and it lets you keep GPU nodes reserved exclusively for GPU-needing pods via taints and tolerations, discussed concretely in Section 9.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+A production Kubernetes cluster serving real AI traffic is never one homogeneous pool of identical nodes — it is deliberately partitioned by hardware and workload criticality, and the manifests below are the concrete, minimal shape of that partitioning.
+</p>
+
+<p>First, keep GPU nodes reserved for workloads that actually need them, using a <strong>taint</strong> on the node and a matching <strong>toleration</strong> on the Pod — without this, the scheduler is free to pack ordinary CPU-only pods onto your expensive GPU nodes, wasting the very resource you provisioned them for:</p>
+
+<pre>
+# Applied once to every GPU node (e.g., via node pool config or kubectl taint)
+kubectl taint nodes gpu-node-1 workload=gpu-inference:NoSchedule
+</pre>
+
+<pre>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-model-server
+  labels:
+    app: vllm-model-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vllm-model-server
+  template:
+    metadata:
+      labels:
+        app: vllm-model-server
+    spec:
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "gpu-inference"
+          effect: "NoSchedule"
+      nodeSelector:
+        gpu-type: "a100"
+      containers:
+        - name: vllm
+          image: registry.internal/vllm-server:2.3.0
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              memory: "32Gi"
+              cpu: "4"
+            limits:
+              nvidia.com/gpu: 1
+              memory: "40Gi"
+              cpu: "8"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 18   # allow up to 3 minutes of warm-up
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server
+spec:
+  selector:
+    app: vllm-model-server
+  ports:
+    - port: 80
+      targetPort: 8000
+</pre>
+
+<p>
+Notice three deliberate choices that a copy-pasted generic Deployment would get wrong: the <strong>toleration + nodeSelector pair</strong> pins this workload precisely to tainted GPU nodes labeled for the right accelerator type; the <strong>readiness probe's generous <code>failureThreshold</code></strong> gives the model server minutes, not seconds, to load weights before being marked unready, directly reflecting the startup sequence from Section 5; and <strong>requests equal to limits for the GPU</strong> is not optional the way it might be for CPU — Kubernetes requires GPU requests and limits to match exactly, because GPUs cannot be overcommitted or throttled the way CPU can.
+</p>
+
+<p>
+Sitting in front of this, the Spring Boot application tier runs as an entirely separate, much more elastic Deployment with no GPU dependency at all, scaled by its own HorizontalPodAutoscaler keyed on request concurrency rather than CPU, and reaching the model tier purely through the stable <code>model-server</code> Service DNS name — it never needs to know how many replicas exist, which node they are on, or that a GPU is involved at all.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+The good news for you specifically: almost none of Kubernetes' AI-specific complexity needs to leak into your Spring AI code. A well-designed Spring Boot service treats the model tier exactly the way it already treats any other network dependency — through a <code>ChatModel</code> implementation configured with a base URL, which in a Kubernetes-hosted setup is simply the internal Service DNS name from Section 8:
+</p>
+
+<pre>
+spring:
+  ai:
+    openai:
+      base-url: http://model-server.default.svc.cluster.local
+      chat:
+        options:
+          model: local-vllm-model
+</pre>
+
+<pre>
+@Service
+public class InferenceService {
+
+    private final ChatClient chatClient;
+
+    public InferenceService(ChatClient.Builder builder) {
+        this.chatClient = builder.build();
+    }
+
+    public String generate(String userMessage) {
+        return chatClient.prompt()
+                .user(userMessage)
+                .call()
+                .content();
+    }
+}
+</pre>
+
+<p>
+Nothing about this code changes whether the model server behind that URL is a single Docker container on your laptop or a fleet of GPU pods behind a Kubernetes Service — that decoupling is precisely the point of the <code>ChatModel</code>/<code>ChatClient</code> abstraction discussed earlier in this series, and Kubernetes is simply the mechanism that makes the right-hand side of that URL reliable at scale.
+</p>
+
+<p>
+Where Kubernetes does become directly relevant to your Spring Boot configuration is in three places you should treat as first-class production concerns, not afterthoughts: first, <strong>graceful shutdown</strong> — set <code>server.shutdown=graceful</code> and a sensible <code>spring.lifecycle.timeout-per-shutdown-phase</code> so that when Kubernetes sends a Pod a <code>SIGTERM</code> during a rolling update or scale-down, in-flight requests (including ones waiting on a slow LLM call) finish before the process exits, rather than being cut off mid-response. Second, <strong>Spring Boot Actuator health endpoints</strong> should be wired directly into your Kubernetes readiness and liveness probes — Spring Boot ships dedicated <code>/actuator/health/readiness</code> and <code>/actuator/health/liveness</code> groups specifically designed for this integration, and your readiness check should genuinely verify the downstream model server is reachable, not just that the JVM is up, otherwise Kubernetes will happily route traffic to a Spring AI pod that cannot actually reach its model. Third, <strong>resource requests/limits on the Spring Boot container itself</strong> should be set with JVM heap sizing in mind — an undersized memory limit combined with a JVM that does not respect container cgroup limits (rare on modern JDKs, but worth verifying) is a classic cause of pods being OOMKilled under load that looks, from the outside, like a Kubernetes bug rather than a JVM configuration gap.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Separate GPU and non-GPU workloads into distinct node pools with taints/tolerations from day one.</strong> Retrofitting this separation after a cluster is already mixed is far more disruptive than designing it in up front.</li>
+<li><strong>Size readiness probes around your actual model load time, measured, not guessed.</strong> Time a cold start end to end and set <code>initialDelaySeconds</code>/<code>failureThreshold</code> with real headroom — a probe that fires before the model can respond causes flapping restarts that make the real problem (slow startup) look like an unrelated crash loop.</li>
+<li><strong>Scale the application tier and the model-serving tier independently, with independent autoscalers keyed on the right signal each.</strong> Spring AI gateway pods scale well on concurrency/CPU; GPU model servers should scale on GPU utilization or request queue depth, exposed via a custom metrics adapter feeding the HPA.</li>
+<li><strong>Use <code>PodDisruptionBudget</code>s on GPU-backed Deployments</strong> so voluntary disruptions (node upgrades, cluster autoscaler scale-downs) never take down every replica of a model server simultaneously.</li>
+<li><strong>Pin exact GPU driver and CUDA library versions across the cluster</strong> (typically via the NVIDIA GPU Operator) rather than letting nodes drift — a driver mismatch between nodes is one of the most time-consuming classes of "works on one node, not the other" incidents in AI-on-Kubernetes deployments.</li>
+<li><strong>Set requests and limits identically for GPUs, and set memory limits generously for model containers.</strong> An OOMKilled model server mid-generation is a worse user experience than a slightly over-provisioned node.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Copy-pasting a generic web-app readiness/liveness probe configuration onto a model server.</strong> Default probe timings assume near-instant startup; applied unchanged to a GPU pod loading weights, this produces an endless restart loop the moment the Deployment is applied — the pod never gets a chance to finish loading before being killed and restarted.</li>
+<li><strong>Setting a liveness probe timeout too aggressively for a busy inference server.</strong> A model server under heavy load can be alive and correctly processing requests but momentarily slow to answer a health check; an overly strict liveness probe kills and restarts a perfectly healthy, simply busy pod, making load-induced slowness worse, not better.</li>
+<li><strong>Forgetting that GPUs cannot be overcommitted like CPU.</strong> Setting a GPU request lower than the limit (or omitting the limit) is invalid or misleading for GPU resources — teams used to CPU/memory overcommit patterns bring that instinct here and are surprised when it does not apply.</li>
+<li><strong>Not isolating GPU nodes, letting the scheduler pack arbitrary CPU-only pods onto them.</strong> This silently wastes the most expensive resource in the cluster and can even leave a GPU node without enough CPU/memory headroom left for the GPU pod it was provisioned for.</li>
+<li><strong>Autoscaling a model-serving Deployment on CPU utilization.</strong> A GPU-bound inference server can be fully saturated on the GPU while its CPU sits nearly idle — a CPU-based HPA target will simply never trigger a scale-out when it is needed most.</li>
+<li><strong>Ignoring image pull time in rollout planning.</strong> Multi-gigabyte AI serving images pulled fresh on every new node can make a rolling update or scale-out take many minutes longer than expected; pre-pulling images or using a private, geographically close registry mitigates this.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Three performance dimensions dominate AI-on-Kubernetes decisions, and all three trace back to the "GPUs are indivisible by default" limitation established in Section 4.3.
+</p>
+
+<p>
+<strong>GPU utilization and fractional sharing.</strong> Because a default GPU request consumes an entire device, a lightly-loaded model (one that doesn't need a full A100's throughput) still ties up the whole card, and utilization dashboards across a cluster of "one workload per GPU" often reveal embarrassingly low average utilization. Two mitigations exist, each with real trade-offs: <strong>NVIDIA Multi-Instance GPU (MIG)</strong>, which physically partitions a supported GPU into several fully isolated, independently schedulable smaller GPUs at the hardware level (strong isolation, but a fixed, coarse set of partition sizes decided at boot); and <strong>time-slicing</strong>, which lets multiple pods share one GPU by taking turns on the same physical device (finer-grained sharing, but no memory isolation — one workload can starve another or even crash it by exhausting shared GPU memory). Choosing between them is a direct latency-isolation-versus-utilization trade-off you should make deliberately, not by default.
+</p>
+
+<p>
+<strong>Cold start versus steady-state latency.</strong> The gap between "a GPU pod exists" and "a GPU pod can serve a request" (Section 5, steps 4–7) can be the dominant contributor to tail latency under bursty traffic if your autoscaler is reactive rather than anticipatory. Mitigations used in real systems include keeping a small warm pool of always-ready replicas sized above the autoscaler's minimum, using node-level GPU pre-warming so newly scheduled pods land on nodes that already have drivers and cached images ready, and preferring scale-up signals with lead time (queue depth trending upward) over lagging signals (current p99 latency, which by definition only degrades after the problem has already started).
+</p>
+
+<p>
+<strong>Cost.</strong> GPU nodes are frequently the single largest line item in an AI platform's infrastructure bill, often by an order of magnitude over the CPU tier serving the same traffic. This makes the Section 10 practice of scaling GPU and non-GPU tiers independently a direct cost lever, not just an architectural nicety: an idle or over-provisioned GPU node pool burns money continuously whether or not it is serving traffic, which is why aggressive, well-tuned scale-to-zero or scale-to-minimum policies on the GPU tier — accepting some cold-start latency in exchange — are common in cost-sensitive production deployments, and why request batching at the inference-server level (covered in a later chapter) matters as much for cost as for throughput.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Kubernetes for AI workloads inherits every standard Kubernetes security concern in full — namespace isolation, RBAC scoping, network policies, image provenance, secrets management for API keys used by <code>ChatModel</code> implementations calling external providers — none of that is optional or reduced just because the workload happens to be AI-related, and this chapter will not repeat general Kubernetes hardening guidance covered elsewhere in this series. Two considerations are, however, specific enough to AI workloads to call out directly here. First, <strong>GPU device access is a privileged capability</strong>: a container with device-plugin-granted GPU access typically also gets broader access to that device's driver interfaces than a typical containerized workload would need for an equivalent CPU task, so GPU-enabled pods deserve the same scrutiny you would give any pod requesting elevated host-level access — restrict which namespaces/service accounts may even request GPU resources via admission policy, rather than trusting every workload equally. Second, <strong>model artifacts and weights pulled at container startup are a supply-chain surface</strong> exactly like any other dependency — a model server pulling weights from an untrusted or unpinned source at Pod startup is functionally equivalent to pulling an unpinned third-party library, and the same provenance and pinning discipline you apply to container images should apply to the model weights and tokenizer files a Pod downloads on its way to becoming ready.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What is the difference between a Kubernetes Pod, a Deployment, and a Service?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A Pod is a single running instance of one or more tightly-coupled containers — the smallest deployable unit, and inherently ephemeral. A Deployment is a controller that declares and maintains a desired number of healthy Pod replicas over time, handling replacement and rolling updates automatically. A Service is a stable network endpoint (virtual IP and DNS name) that load-balances traffic across the current, changing set of Pods matching a label selector, so clients never need to track individual Pod IPs directly.</p>
+</div>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why can't you just request "half a GPU" the way you can request half a CPU core in Kubernetes?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>By default, Kubernetes exposes GPUs through vendor device plugins as opaque, indivisible integer resources — the scheduler has no built-in concept of fractional GPU allocation the way it does for CPU, which the kernel can time-slice cleanly. Fractional or shared GPU access requires additional mechanisms layered on top, such as NVIDIA MIG (hardware-level partitioning) or GPU time-slicing (software-level sharing without memory isolation).</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Walk through what happens between running `kubectl apply` on a GPU-backed Deployment and that pod actually being able to serve traffic.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The manifest is validated and persisted to etcd via the API server; the Deployment controller creates the requested number of Pod objects; the scheduler filters nodes by GPU availability and any affinity/taint rules, then binds each Pod to a chosen node; the kubelet on that node pulls the container image, requests a specific GPU device from the device plugin, and starts the container; the process loads model weights into GPU memory; and only once the configured readiness probe starts succeeding does the Service begin routing traffic to that Pod. Before that point the Pod exists and is running but receives zero traffic.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why is a naive, copy-pasted readiness/liveness probe configuration dangerous for a model-serving pod specifically?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Typical default probe timings assume near-instant startup, which is true for a simple web service but false for a model server that must load multi-gigabyte weights into GPU memory before it can respond at all — applying defaults unchanged causes the readiness probe to keep failing during legitimate warm-up, and an aggressive liveness probe can even kill and restart the pod before it finishes loading, producing an endless crash loop that looks like the application is broken when it is actually the probe timing that's wrong.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. Your Horizontal Pod Autoscaler is configured on CPU utilization for a GPU-backed inference Deployment, and it never scales out even during periods when users report high latency. Diagnose this.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>An inference server bottlenecked on GPU compute or GPU memory bandwidth can be fully saturated on the GPU while CPU usage remains low, since the CPU is mostly idle waiting on GPU work — CPU utilization simply does not correlate with the actual bottleneck for this workload shape, so the HPA's scaling condition never triggers even under real load. The fix is to autoscale on a metric that actually reflects saturation for this workload: GPU utilization exposed via a custom metrics pipeline (e.g., DCGM exporter feeding a Prometheus adapter into the HPA), or an application-level leading indicator like request queue depth or in-flight request count, ideally combined so the system reacts before latency has already degraded.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. How would you design node pool and scheduling policy so that expensive GPU nodes are never wasted on non-AI workloads, without manually babysitting pod placement?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Apply a taint to every GPU node (e.g., <code>workload=gpu-inference:NoSchedule</code>) so no pod is scheduled there by default, and add a matching toleration only to Deployments that genuinely require a GPU, combined with a <code>nodeSelector</code> or node affinity rule targeting the correct GPU type label. This makes GPU-node placement an explicit opt-in rather than something the scheduler could do accidentally, and it composes cleanly with cluster-autoscaler node pools so GPU capacity scales independently of the general-purpose pool.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Add that requests and limits for GPU resources must be set equal, since GPUs cannot be overcommitted or throttled the way CPU can — mentioning this shows you understand the resource model at a level beyond copy-pasted YAML, and it directly explains why "just lower the request a bit for better packing," a common CPU/memory optimization instinct, does not apply to GPU scheduling at all.</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. A platform team wants to run mixed workloads — a latency-sensitive chat-serving tier and a cost-sensitive nightly batch embedding job — on the same Kubernetes cluster's GPU capacity. What architecture would you propose, and what failure mode are you specifically protecting against?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Separate the two workloads by <code>PriorityClass</code> and, ideally, by distinct node pools or GPU partitioning (MIG) rather than letting them contend freely for the same devices — the chat-serving Deployment should carry a high priority class so that, under resource pressure, the scheduler preempts lower-priority batch Jobs rather than starving user-facing latency-sensitive traffic. The specific failure mode being protected against is priority inversion: without an explicit priority scheme, a large batch embedding Job submitted at the wrong moment can consume all available GPU capacity and leave a latency-critical chat-serving Deployment unable to scale out exactly when user traffic spikes, since Kubernetes' default scheduler has no inherent notion that one workload matters more than another unless you tell it so via PriorityClass and, if needed, resource quotas per namespace.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. Why do most managed "AI platform" products (SageMaker endpoints, Vertex AI, KServe) look, underneath, like a thin API wrapped around a Kubernetes control plane, and what does that imply for a platform team deciding build-vs-buy?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Kubernetes already solves the hard, general problems these platforms need — declarative desired-state reconciliation, hardware-aware scheduling, rolling updates, autoscaling control loops, service discovery — so building a competing orchestration layer from scratch would mean re-solving problems Kubernetes has already spent a decade hardening. Managed platforms instead standardize the AI-specific vocabulary on top (model versions, traffic splitting between model versions, endpoint autoscaling policies) and let Kubernetes do the underlying scheduling and lifecycle work, typically via CRDs like KServe's <code>InferenceService</code>. For a platform team, this means the real build-vs-buy decision is rarely "Kubernetes or not" — it is whether to adopt an existing AI-native CRD/operator layer (KServe, Seldon) on top of Kubernetes you already operate, versus building a comparable abstraction in-house, versus paying a managed provider to operate both layers; understanding that Kubernetes is the common foundation underneath all three options reframes the decision around operational ownership and vendor lock-in rather than around raw technical capability, which is largely equivalent across all three.</p>
+</div>
+
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why Kubernetes' "declare desired state, reconcile continuously" control-loop model is a better fit for managing GPU node failures than an imperative deployment script would be. Use the specific example of a GPU node dying mid-inference.</li>
+<li>A colleague proposes autoscaling a self-hosted embedding-model Deployment purely on memory utilization. Explain why this is likely to be as misleading a signal as CPU utilization was for the chat-serving example in Section 12, and propose a better signal.</li>
+<li>Compare NVIDIA MIG and GPU time-slicing as two different answers to "GPUs aren't divisible by default." For a platform running many small, bursty inference workloads versus one running a few large, steady ones, argue which approach fits better and why.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Write a complete Kubernetes Deployment and Service manifest for a hypothetical self-hosted embedding-model server that needs 1 GPU, takes roughly 45 seconds to become ready after startup, and should never be scheduled onto general-purpose (non-GPU) nodes. Include correctly tuned readiness/liveness probes and the taint/toleration/nodeSelector combination needed for correct placement.</li>
+<li>Take a Spring Boot service using Spring AI's <code>ChatClient</code> against a self-hosted model reachable at a Kubernetes Service DNS name. Configure <code>server.shutdown=graceful</code> and wire Spring Boot Actuator's readiness/liveness health groups into a Deployment manifest's probe configuration, ensuring the readiness check genuinely verifies the downstream model server is reachable rather than only checking the JVM's own health.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Kubernetes became the default AI infrastructure substrate because it already solved general scheduling, reconciliation, and lifecycle-management problems that AI workloads also need — it was extended for GPUs via device plugins, not redesigned from scratch.</li>
+<li>The core mental model is a continuous control loop: you declare desired state, and controllers perpetually reconcile reality toward it — this explains almost every Kubernetes behavior you will encounter, from Deployments to autoscalers.</li>
+<li>GPUs are fundamentally different from CPU/memory in Kubernetes' resource model — indivisible by default, requests must equal limits, and this single fact explains most of the operational pitfalls unique to AI workloads on this platform.</li>
+<li>Readiness and liveness probes are the single most important, most frequently misconfigured mechanism for AI workloads, because model servers have startup profiles wildly different from typical web services.</li>
+<li>Autoscaling must be keyed on signals that actually correlate with the real bottleneck — GPU utilization or queue depth for model-serving tiers, not CPU — or the autoscaler will confidently fail to react when it matters most.</li>
+<li>Your Spring AI application code stays decoupled from all of this through the <code>ChatModel</code>/<code>ChatClient</code> abstraction talking to a stable Service DNS name; the Kubernetes-specific engineering lives in manifests, probes, taints, and autoscaling policy, not in your business logic.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> Kubernetes gives you the substrate to run and scale individual AI workloads reliably on one cluster, but real production AI systems rarely stay confined to a single cluster or a single point of coordination — model servers, vector stores, caches, and orchestration layers end up spread across nodes, zones, and sometimes regions, each with its own latency, consistency, and partial-failure behavior. Distributed Systems for AI (Chapter 73) picks up exactly there: the theory and patterns you need once "reliable" has to mean reliable across a network, not just reliable on one machine.
+</p>
+
+</div>
+
+</body>
+</html>

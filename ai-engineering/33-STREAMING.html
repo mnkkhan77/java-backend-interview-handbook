@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>57-STREAMING.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 33 — STREAMING</h1>
+
+<p class="roi">Volume 2 — Spring AI · Chapter 8 of 15</p>
+
+<div class="callout">
+The Memory chapter (Chapter 32) solved the problem of a model remembering what was said earlier in a conversation — but it said nothing about how the *current* turn actually reaches the user while the model is still generating it. A model that takes eight seconds to produce a paragraph, delivered as one silent, blocking HTTP call, feels broken even when it is working perfectly. Streaming is the engineering discipline that turns "wait, then receive everything" into "watch it being written," and it touches every layer of your stack — from the HTTP transport, to Reactor's `Flux`, to how an `Advisor` must be rewritten to intercept a response that no longer exists as one object.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Every chapter so far in this volume has treated a model call as a request/response pair: you send a prompt, you wait, you get an answer back, and everything downstream — advisors, memory, output parsing — operates on that one complete answer. That model of the world is not wrong, but it is incomplete in a way that becomes visible the moment you ship a real chat interface to real users. Large language models do not produce their output atomically. They produce it autoregressively, one token at a time (a mechanism covered in depth in the Transformers chapter), and a response of any meaningful length — a paragraph, a code block, a multi-step explanation — can take several seconds to finish generating in full, even though the *first* token might be ready in a few hundred milliseconds.
+</p>
+
+<p>
+If your application waits for the entire response before showing anything, the user stares at a blank screen or a spinner for the full duration of generation, then the whole answer appears at once. If instead your application forwards each token to the user as soon as the model produces it, the same total generation time feels dramatically faster and more alive — the user starts reading while the model is still writing. This is not a cosmetic nicety. It is the single highest-leverage latency optimization available to you in an LLM-backed product, because it does not reduce the model's actual compute time at all — it only changes *when the user is allowed to see the work that is already happening*. Every production chat product you have used — ChatGPT, Claude.ai, GitHub Copilot Chat — streams for exactly this reason.
+</p>
+
+<p>
+For you as a Spring engineer, streaming is also the first topic in this volume that cannot be understood by analogy to a normal REST call returning a JSON body. It forces you to actually use the reactive stack — `Flux`, backpressure, Server-Sent Events — for real, not as a theoretical curiosity from a Spring WebFlux slide deck you skimmed once. Getting this chapter right is what separates a demo that streams token-by-token in a terminal `curl` command from a production system that streams correctly through a load balancer, a reverse proxy, an `Advisor` chain, and finally into a browser's `EventSource`, without buffering, without dropped chunks, and without leaking a connection every time a user closes a tab mid-response.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<h3>2.1 Streaming Data to a Browser, Before LLMs Existed</h3>
+
+<p>
+The problem "how do I push data to a client incrementally, over plain HTTP, before the response is finished" long predates language models. Early web applications solved it with hacks: <strong>long polling</strong> (the client repeatedly asks "anything new yet?" and the server holds the connection open until it has something), and <strong>hidden iframe streaming</strong> (a server writes an endless HTML document into a hidden iframe and the browser executes `&lt;script&gt;` tags as they arrive, chunk by chunk). Both worked, and both were fragile — long polling wastes round trips and adds latency per update; iframe streaming is a browser-parsing trick, not a protocol.
+</p>
+
+<p>
+Two real standards eventually replaced these hacks. <strong>WebSockets</strong> (standardized 2011) gave the web a genuine full-duplex, persistent connection — the browser and server can both push messages at any time over a single TCP connection. <strong>Server-Sent Events / SSE</strong ( standardized as part of HTML5, roughly the same era) gave the web a simpler, one-directional alternative: the server keeps an HTTP response open and writes a stream of `data: ...` lines over time, and the browser's built-in `EventSource` API parses them as they arrive, with automatic reconnection built in. SSE is intentionally the "simple half" of what WebSockets offer — no client-to-server push, but far less machinery, and it rides on plain HTTP, which means it survives ordinary proxies and load balancers far more easily than a WebSocket upgrade does.
+</p>
+
+<h3>2.2 How LLM Providers Adopted Streaming</h3>
+
+<p>
+When OpenAI's completions API and its successors began exposing multi-second generation times for longer completions, they exposed a `stream=true` parameter that changes the wire format of the response from one JSON blob to a sequence of SSE `data:` events, each carrying a small incremental delta of the answer (a few tokens' worth of text), terminated by a special `data: [DONE]` marker. Every major provider since — Anthropic's Messages API, Google's Gemini API, open-source inference servers like vLLM and Ollama — converged on essentially the same shape: SSE-framed, incremental, token-level (or small-chunk-level) deltas over a long-lived HTTP connection. This convergence is precisely why Spring AI can offer one unified streaming abstraction (`Flux<ChatResponse>`) across providers — the underlying wire protocols are different in framing detail but structurally the same idea, and the client library on each provider SDK already normalizes the raw SSE bytes into a stream of typed chunk objects before Spring AI ever sees them.
+</p>
+
+<h3>2.3 Reactive Streams as the Java-Side Answer</h3>
+
+<p>
+On the Java side, the piece of the puzzle that had to exist before Spring AI's streaming API could be built cleanly was <strong>Reactive Streams</strong> — a specification (2015, later folded into `java.util.concurrent.Flow` in JDK 9) for asynchronous stream processing with non-blocking backpressure. Project Reactor, the reactive library underneath Spring WebFlux, implements this specification with two core types: `Mono<T>` (zero or one async value) and `Flux<T>` (zero to many async values, over time). A streaming LLM response is a textbook `Flux<ChatResponse>` — a sequence of response chunks arriving over time, of unknown final length, that the consumer should process incrementally rather than collect and then process. Spring AI's streaming support did not need to invent new streaming primitives; it needed to plug LLM provider SSE streams into `Flux`, which Reactor already did well for HTTP, database, and messaging use cases.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Deliver a model's output to a consumer incrementally, as it is produced, while preserving correctness (nothing lost, nothing duplicated, nothing shown out of order), composability (the same middleware — memory, logging, safety checks — that works on a complete response must also work on a stream of partial ones), and resource safety (a slow or disconnected client must not pin server resources indefinitely).</strong>
+</div>
+
+<p>
+Unpack each clause, because each one is a real, separate engineering problem, and a naive streaming implementation typically gets exactly one of them right at the expense of the others.
+</p>
+
+<ul>
+<li><strong>Correctness under partial delivery.</strong> Tokens must arrive in the order the model generated them, none skipped, none repeated, and the consumer must be able to tell unambiguously when the stream is complete versus merely paused. A dropped chunk in the middle of a JSON tool-call argument, for instance, silently corrupts the entire payload.</li>
+<li><strong>Composability with everything else in the pipeline.</strong> Chapters on Advisors, Memory, and (later) Guardrails all assume some ability to inspect or transform a "response." When the response is not one object but a `Flux` of them, does memory persistence wait for the last chunk, or persist incrementally? Does a content-safety filter block on the full text, or scan chunks as they arrive and risk showing text it later has to retract?</li>
+<li><strong>Resource safety under partial consumption.</strong> A client can disconnect, a browser tab can close, a mobile network can drop, at any point mid-stream. The server-side connection, the reactive subscription, and the upstream provider call must all be torn down cleanly when that happens — otherwise every abandoned chat response leaks a thread, a socket, or a billed provider call that nobody is reading.</li>
+</ul>
+
+<p>
+Framed this way, streaming is not "turn on a flag." It is a cross-cutting architectural decision that touches your transport layer (HTTP chunked/SSE vs WebSocket), your concurrency model (blocking Servlet stack vs reactive WebFlux), and every piece of middleware you have already built around the non-streaming call.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 Two Timelines That Matter: TTFT and TTLT</h3>
+
+<p>
+Non-streaming systems have one latency number worth caring about: total request time. Streaming systems have two, and conflating them is the most common conceptual error engineers make when reasoning about "how fast" a streamed feature is:
+</p>
+
+<table>
+<tr><th>Metric</th><th>Definition</th><th>What It Actually Measures</th></tr>
+<tr><td><strong>TTFT</strong> — Time To First Token</td><td>Time from request sent to the first chunk of output arriving</td><td>Perceived responsiveness — "does this feel instant?"</td></tr>
+<tr><td><strong>TTLT</strong> — Time To Last Token (a.k.a. total generation time)</td><td>Time from request sent to the final chunk / stream completion</td><td>Actual total work done — same whether streamed or not</td></tr>
+</table>
+
+<p>
+Streaming does not change TTLT at all — the model still has to generate every token, and the total compute time is identical whether you stream or not. What streaming changes is the user's *experience* of that same TTLT, by giving them something at TTFT instead of making them wait until TTLT. This is the same principle behind a progress bar or a skeleton loading screen — you are not making the underlying operation faster, you are making the wait legible and productive.
+</p>
+
+<h3>4.2 Hot vs. Cold Streams, and Why It Matters for LLM Calls</h3>
+
+<p>
+In reactive programming, a <strong>cold</strong> publisher does not start producing values until someone subscribes — every subscriber gets its own independent run from the beginning (think: re-reading a file per subscriber). A <strong>hot</strong> publisher produces values regardless of whether anyone is listening, and late subscribers miss whatever already happened (think: a live radio broadcast). An LLM streaming call, as exposed by Spring AI's `ChatModel.stream(...)`, is a <strong>cold</strong> `Flux`: nothing is sent to the provider, and no tokens are generated, until something subscribes to the returned `Flux<ChatResponse>`. This matters practically — building the `Flux` pipeline (attaching advisors, mapping, filtering) costs nothing and starts nothing; only the terminal `subscribe()` (or the framework's own subscription, e.g. when returning the `Flux` from a WebFlux controller method) actually triggers the network call to the model provider and starts burning tokens and money.
+</p>
+
+<h3>4.3 Chunking Granularity: Tokens, Sub-Word Fragments, and Deltas</h3>
+
+<p>
+"Streaming token by token" is a slight simplification worth correcting once, since it affects how you write UI code. Providers stream <strong>deltas</strong> — small increments of text — but the granularity of a delta is not guaranteed to be exactly one token; it can be a sub-word fragment, a single token, or occasionally a small batch of tokens, depending on the provider's internal buffering. What Spring AI guarantees is that concatenating every delta's text, in arrival order, reconstructs the full response exactly — the granularity is an implementation detail you should not build fragile assumptions on top of (for instance, never assume a delta boundary aligns with a word boundary or a JSON token boundary).
+</p>
+
+<h3>4.4 Backpressure: What It Means When the Producer Is a Language Model</h3>
+
+<p>
+Backpressure is the mechanism by which a slow consumer tells a fast producer to slow down, rather than being overwhelmed by a buffer that grows without bound. In most reactive systems (a database returning rows, a message queue), backpressure genuinely throttles the producer. With LLM streaming, this needs an honest caveat: the *provider* is generating tokens at its own pace (bounded by model inference speed, typically tens of tokens per second) regardless of how fast your consumer reads — you cannot signal a hosted model provider to "generate slower." What backpressure protects you from in this specific case is not an overwhelmed model, but an overwhelmed *consumer inside your own application* — a slow WebSocket client, a slow downstream sink writing to a database — being handed data faster than it can process it, which without backpressure would grow an unbounded in-memory buffer and risk an `OutOfMemoryError` under load. Reactor's `Flux` gives you this protection for free as long as you do not break the reactive chain with blocking calls or manual buffering.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Trace one streamed chat request end to end, because each hop is a place where a real system can misbehave if built carelessly.
+</p>
+
+<ol>
+<li><strong>Client opens the request.</strong> A browser opens an `EventSource` (SSE) or `fetch` with a readable stream against your Spring Boot endpoint, or a mobile client opens an HTTP connection expecting a chunked, long-lived response. The HTTP connection is held open — this is fundamentally different from a normal request/response cycle and immediately implies your server, your reverse proxy, and any load balancer in between must all be configured not to time out or buffer this connection prematurely.</li>
+<li><strong>Your controller returns a `Flux`, not a value.</strong> In a Spring WebFlux controller, the handler method returns `Flux<String>` or `Flux<ServerSentEvent<...>>` immediately — no blocking, no `.block()`. Returning the `Flux` itself is the entire contract; the framework subscribes to it on your behalf and writes each emitted element to the response as it arrives.</li>
+<li><strong>Spring AI's `ChatModel` (or `ChatClient`) opens the upstream call.</strong> Calling `.stream()` instead of `.call()` causes Spring AI to invoke the underlying provider client's streaming endpoint (which itself opens an SSE connection to, say, the OpenAI or Anthropic API) and wraps the incoming provider-specific SSE events into a normalized `Flux<ChatResponse>`, where each `ChatResponse` element represents one incremental chunk.</li>
+<li><strong>Advisors intercept the stream, not a single response.</strong> Any `Advisor` in the chain (covered in the Advisors and Memory chapters) that wants to observe or modify streaming output must operate on the `Flux` — typically via a streaming-aware hook that receives the `Flux<ChatResponse>` and returns a (possibly transformed) `Flux<ChatResponse>`, rather than the simple "before/after a single response" hook used for non-streaming calls. This is the detail that breaks the most existing middleware when a team retrofits streaming onto a system originally built only for `.call()` — an advisor written to inspect "the response" as one object has nothing to inspect until the stream completes.</li>
+<li><strong>Chunks propagate downstream, transformed as needed.</strong> Your controller (or a service layer) typically maps each `ChatResponse` chunk to just its text delta (`chunk.getResult().getOutput().getText()`), possibly wraps it as a `ServerSentEvent`, and lets it flow to the HTTP layer. Nothing here should call `.collectList()` or otherwise materialize the whole stream — doing so silently converts your "streaming" endpoint back into a blocking one that merely *looks* like it streams in the code.</li>
+<li><strong>The client renders incrementally.</strong> The browser's `EventSource.onmessage` (or the `fetch` stream reader) fires once per chunk, appending each delta to the visible response as it arrives — this is the payoff of the entire pipeline: the user sees text grow in near real time.</li>
+<li><strong>Completion or cancellation tears everything down.</strong> On normal completion, the provider stream ends, your `Flux` completes, and the HTTP response is closed cleanly. On the client disconnecting early (tab closed, network drop), the reactive `Flux` subscription's cancellation signal must propagate all the way back to the upstream provider call, cancelling it — otherwise you keep paying for and generating tokens nobody will ever read. This propagation is automatic in a properly built, unbroken reactive chain, and silently broken the moment any link in that chain uses blocking I/O or a manually managed thread instead of the reactive operators.</li>
+</ol>
+
+<p>
+Two edge cases deserve explicit attention because they are exactly where interviewers probe and where real incidents happen: <strong>tool calling during streaming</strong> and <strong>errors mid-stream</strong>. When a model decides to call a tool/function (Volume 4 territory, but relevant here), the arguments for that call often arrive as a streamed, partial JSON fragment across multiple chunks — your application must buffer and reassemble the full arguments before attempting to parse or execute the tool call; attempting to parse a half-arrived JSON object will simply fail. And because the HTTP response headers (including the status code) were already sent as `200 OK` the moment streaming began, an error that occurs *after* the first chunk has already gone out cannot be reported via a change of HTTP status — it must be encoded as a special event or error payload inside the stream itself, which the client is responsible for recognizing and handling gracefully.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Streaming is not a heavily mathematical topic, but two lightweight quantitative models genuinely help you reason about capacity and user experience, and both are worth internalizing rather than skipping.
+</p>
+
+<h3>6.1 Perceived Latency as a Function of TTFT, Not TTLT</h3>
+
+<p>
+If a non-streaming response takes total time <code>T</code> to generate, a user perceives a wait of approximately <code>T</code>. If the same response is streamed, the user perceives a wait of approximately <code>TTFT</code> (often 200ms–1s) and then experiences the remaining <code>T − TTFT</code> as "reading," not "waiting" — cognitively, humans tolerate a stream of arriving content far better than an equal-length silent pause, even though the total elapsed time to see the complete answer is unchanged. Product teams sometimes express this informally as "perceived latency ≈ TTFT," which is an approximation, not a law, but it is a useful mental shortcut that explains why shaving TTFT (smaller/faster first-token models, warm connections, skipping unnecessary pre-processing before the first model call) is disproportionately valuable compared to shaving total generation time.
+</p>
+
+<h3>6.2 Concurrency Capacity via Little's Law</h3>
+
+<p>
+Because a streaming response holds a connection (and, in a blocking stack, a thread) open for its *entire* generation duration rather than the brief duration of a normal request, capacity planning changes. Little's Law — <code>L = λ × W</code>, where <code>L</code> is the average number of concurrent items in a system, <code>λ</code> is the arrival rate of new requests, and <code>W</code> is the average time each item spends in the system — applies directly. If your average streamed chat response takes 6 seconds end to end (<code>W = 6s</code>) and you receive 50 new streaming requests per second (<code>λ = 50/s</code>), you should expect roughly <code>L = 300</code> concurrent open streaming connections at steady state. On a traditional one-thread-per-request Servlet stack, that is 300 threads pinned for the full 6 seconds each, which is precisely the capacity wall that makes a reactive, non-blocking stack (WebFlux, backed by a small fixed number of event-loop threads) the structurally correct choice for a system that streams at any real scale — the thread is never blocked waiting on the network, so the same handful of threads can service many times more concurrent streaming connections.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Blocking Call vs. Streaming Call — Timeline Comparison</h3>
+
+<pre>
+BLOCKING (.call()) — user sees nothing until everything is ready
+────────────────────────────────────────────────────────────────
+ t=0        Request sent
+ t=0..6s    [ model generating tokens, silently, on the server ]
+ t=6s       Full response arrives ──► rendered to user all at once
+                                            ▲
+                            user perceives a 6-second wait
+
+STREAMING (.stream()) — user sees output as it is produced
+────────────────────────────────────────────────────────────────
+ t=0        Request sent
+ t=0.4s     First chunk arrives ──► rendered immediately  (TTFT)
+ t=0.6s     chunk ──► rendered
+ t=0.9s     chunk ──► rendered
+ t=1.3s     chunk ──► rendered
+   ...      (chunks keep arriving as the user reads)
+ t=6s       Final chunk arrives, stream closes                (TTLT)
+                                            ▲
+                     user perceives ~0.4s wait, then continuous reading
+                     TOTAL WORK DONE IS IDENTICAL IN BOTH CASES
+</pre>
+
+<h3>7.2 End-to-End Component Sequence for a Streamed Chat Turn</h3>
+
+<pre>
+ Browser              Spring Boot            Spring AI            Provider
+ (EventSource)         Controller           ChatClient/Model      (OpenAI/
+                        (WebFlux)                                  Anthropic/…)
+    │                      │                      │                    │
+    │  GET /chat/stream    │                      │                    │
+    ├─────────────────────►│                      │                    │
+    │                      │  .stream(prompt)     │                    │
+    │                      ├─────────────────────►│                    │
+    │                      │                      │  POST .../stream   │
+    │                      │                      │  (stream=true)     │
+    │                      │                      ├───────────────────►│
+    │                      │                      │                    │
+    │                      │                      │◄─ SSE: delta "The" │
+    │                      │◄── Flux<ChatResponse>│                    │
+    │◄── SSE: "The"        │  (advisors applied   │                    │
+    │                      │   per-chunk)         │◄─ SSE: delta " sky"│
+    │◄── SSE: " sky"       │◄─────────────────────┤                    │
+    │        ...           │         ...          │◄─ SSE: delta " is"│
+    │◄── SSE: " is"        │◄─────────────────────┤                    │
+    │                      │                      │◄─ SSE: [DONE]      │
+    │◄── stream closed     │◄── Flux completes ───┤                    │
+    │                      │                      │                    │
+    │  (user closes tab mid-stream)                                    │
+    ├── connection reset ─►│                      │                    │
+    │                      │  cancel signal propagates upstream ──────►│
+    │                      │                      │  (provider call    │
+    │                      │                      │   aborted, no      │
+    │                      │                      │   further tokens   │
+    │                      │                      │   billed/wasted)   │
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+Streaming is deceptively easy to get working on a laptop with `curl` and devastatingly easy to get subtly wrong once real infrastructure — load balancers, reverse proxies, CDNs — sits between your service and the client. Every one of those hops has historically been optimized for "buffer, then forward" behavior, because that is correct for 99% of ordinary HTTP traffic and actively wrong for SSE.
+</p>
+
+<pre>
+                     ┌───────────────────────────┐
+                     │      Client (Browser /     │
+                     │   Mobile app, EventSource) │
+                     └─────────────┬───────────────┘
+                                   ▼
+                     ┌───────────────────────────┐
+                     │   CDN / Edge (if present)   │  ── MUST bypass caching &
+                     │                             │     buffering for this route
+                     └─────────────┬───────────────┘
+                                   ▼
+                     ┌───────────────────────────┐
+                     │  Load Balancer / Ingress    │  ── needs long idle-timeout,
+                     │  (ALB, NGINX, Envoy)         │     HTTP/1.1 keep-alive or
+                     │                             │     HTTP/2, no response
+                     │                             │     buffering on this path
+                     └─────────────┬───────────────┘
+                                   ▼
+                     ┌───────────────────────────┐
+                     │  Spring Boot (WebFlux)      │  ── reactive stack; a small
+                     │  Streaming Controller       │     fixed thread pool holds
+                     │  Flux<ServerSentEvent<...>> │     thousands of open streams
+                     └─────────────┬───────────────┘
+                                   ▼
+                     ┌───────────────────────────┐
+                     │  Spring AI ChatClient /     │  ── Advisors operate per-chunk;
+                     │  ChatModel.stream()         │     Memory persists once the
+                     │                             │     Flux completes (or
+                     │                             │     incrementally, by design)
+                     └─────────────┬───────────────┘
+                                   ▼
+                     ┌───────────────────────────┐
+                     │  Model Provider (SSE)       │
+                     └───────────────────────────┘
+</pre>
+
+<p>
+The single most common production incident in this stack is a reverse proxy silently buffering the entire response before forwarding it — NGINX, for instance, buffers proxied responses by default, which means your beautifully streaming Spring Boot endpoint arrives at NGINX correctly, chunk by chunk, but NGINX waits for the *whole* response before sending anything onward to the client, and your "streaming" feature demos perfectly in local development (no proxy in the path) and then appears completely broken — all-at-once — the moment it is deployed behind the standard production ingress. The fix on NGINX is the `X-Accel-Buffering: no` response header (or `proxy_buffering off` in the relevant location block); other proxies, load balancers, and CDNs have their own equivalent settings, and every one of them must be explicitly checked before you trust a "works on my machine" streaming demo.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI's streaming surface mirrors its synchronous surface closely on purpose, so the mental model you built in earlier chapters transfers directly — the difference is almost entirely in return types and the reactive discipline required around them.
+</p>
+
+<table>
+<tr><th>Non-Streaming API</th><th>Streaming Equivalent</th><th>Key Difference</th></tr>
+<tr><td><code>ChatModel.call(Prompt)</code> → <code>ChatResponse</code></td><td><code>ChatModel.stream(Prompt)</code> → <code>Flux&lt;ChatResponse&gt;</code></td><td>One complete object vs. a cold, ordered sequence of incremental chunks</td></tr>
+<tr><td><code>ChatClient.call().content()</code> → <code>String</code></td><td><code>ChatClient.stream().content()</code> → <code>Flux&lt;String&gt;</code></td><td>Convenience projection straight to text deltas, no manual chunk mapping needed for the common case</td></tr>
+<tr><td>Advisor's request/response hook operating on a single <code>ChatResponse</code></td><td>Advisor's streaming hook operating on <code>Flux&lt;ChatResponse&gt;</code></td><td>Must transform the whole reactive pipeline, not inspect one finished value — cannot "peek and modify" the way you would a POJO</td></tr>
+<tr><td>Standard <code>@RestController</code> method returning a DTO</td><td>WebFlux controller method returning <code>Flux&lt;ServerSentEvent&lt;String&gt;&gt;</code> or <code>Flux&lt;String&gt;</code></td><td>Framework subscribes and writes incrementally; must run on the reactive (WebFlux) stack, not classic Spring MVC, to avoid blocking a Servlet thread for the whole duration</td></tr>
+</table>
+
+<p>
+A minimal, realistic controller looks like this:
+</p>
+
+<pre>
+@RestController
+@RequestMapping("/api/chat")
+class StreamingChatController {
+
+    private final ChatClient chatClient;
+
+    StreamingChatController(ChatClient.Builder builder) {
+        this.chatClient = builder.build();
+    }
+
+    @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    Flux&lt;String&gt; streamChat(@RequestParam String message) {
+        return chatClient.prompt()
+                .user(message)
+                .stream()
+                .content()               // Flux&lt;String&gt; of incremental text deltas
+                .doOnCancel(() -&gt;
+                    log.info("Client disconnected mid-stream"))
+                .doOnError(e -&gt;
+                    log.error("Upstream model stream failed", e));
+    }
+}
+</pre>
+
+<p>
+Two things in that snippet are load-bearing, not stylistic. First, <code>produces = MediaType.TEXT_EVENT_STREAM_VALUE</code> tells Spring (and any proxy inspecting content-type) that this is an SSE stream, which is part of what prevents downstream buffering. Second, returning the `Flux` directly — never calling `.block()` or `.collectList()` anywhere in the chain — is what keeps the whole request non-blocking end to end; a single accidental `.block()` call anywhere in this pipeline (including inside a custom `Advisor`) reintroduces a blocked thread for the full generation duration and defeats the entire purpose of using WebFlux in the first place. If your service still runs on classic Spring MVC (the Servlet stack) rather than WebFlux, Spring provides `SseEmitter`/`ResponseBodyEmitter` as a bridge for streaming on a blocking stack, at the cost of manually managing a dedicated thread per open connection instead of getting the free scalability of the reactive event loop.
+</p>
+
+<p>
+Also worth noting for the Memory chapter's continuity: an `Advisor` that persists conversation history typically needs to buffer the streamed `Flux&lt;ChatResponse&gt;` into a single aggregated response (via an operator like `collectList()` internally, applied only to a side-channel used for persistence, never to the client-facing stream) so that what gets saved to memory is the complete assistant turn, not a jumble of partial fragments — a subtlety that is easy to miss when adapting a memory advisor originally written only against `.call()`.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Build streaming endpoints on WebFlux, not classic Spring MVC, whenever streaming is a first-class feature.</strong> The reactive stack's non-blocking I/O is what lets a small thread pool support thousands of concurrent open streams; a thread-per-connection Servlet model does not scale the same way once concurrency and average stream duration both grow, as shown by the Little's Law reasoning in Section 6.</li>
+<li><strong>Explicitly disable buffering at every proxy/load balancer hop, and verify it under real network topology, not just localhost.</strong> Section 8's NGINX example is the single most common production surprise with streaming; treat "does streaming actually stream through the full deployed path" as a required pre-launch test, not an assumption.</li>
+<li><strong>Design every advisor and middleware component to operate on the `Flux`, not on an assumed single object.</strong> Retrofit-testing existing advisors against a streaming code path is mandatory before enabling streaming in production — an advisor silently doing nothing (or throwing) on the streaming path is a common regression.</li>
+<li><strong>Always wire up cancellation propagation and log it.</strong> Use `doOnCancel` (or equivalent) to ensure client disconnects actually stop the upstream provider call, and log these events — a spike in mid-stream cancellations is often an early signal of a UI bug, a slow first token driving users to reload, or a client-side timeout misconfigured too aggressively.</li>
+<li><strong>Buffer only where correctness requires it (tool-call argument reassembly, memory persistence), never for convenience.</strong> Any `collectList()`/`block()` in the client-facing path silently converts a streaming feature back into a blocking one while still looking, in the code, like it streams.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Calling `.block()` on the streaming `Flux` "just to test it quickly," and leaving it in.</strong> This compiles, appears to work in a quick manual test, and silently destroys both the latency benefit and the scalability benefit of streaming — the response is fully buffered server-side before anything is sent, which is functionally identical to never streaming at all.</li>
+<li><strong>Assuming a reverse proxy or CDN passes SSE through untouched by default.</strong> As covered in Section 8, most proxies buffer by default; "it worked locally" is not evidence it will work in production.</li>
+<li><strong>Treating each streamed chunk as if it aligns with a token, a word, or a JSON structural boundary.</strong> A delta can split a word, a JSON key, or a multi-byte UTF-8 character mid-sequence; code that naively tries to `JSON.parse()` each chunk independently, or assumes chunks are whitespace-delimited words, will fail intermittently and unpredictably.</li>
+<li><strong>Forgetting that HTTP status and headers are committed the instant the first chunk is sent.</strong> A mid-stream failure (provider error, rate limit hit partway through generation) cannot be reported as an HTTP 500 anymore — the 200 OK already went out. Teams that don't design an in-band error signal (a special SSE event type, a sentinel JSON payload) end up with streams that just silently stop, leaving the client unable to distinguish "finished normally" from "failed."</li>
+<li><strong>Not testing client disconnection.</strong> It is easy to build and test the "happy path" where a stream runs to completion and never test what happens when the browser tab is closed, the phone loses signal, or a load balancer times out the connection mid-response — exactly the scenario where leaked upstream calls and orphaned resources accumulate in production under real user behavior.</li>
+<li><strong>Applying non-streaming-aware guardrails/safety filters to a stream by buffering the whole thing first, then wondering why "streaming" adds no perceived latency benefit.</strong> If a moderation layer must see the complete text before releasing anything to the user, you have architecturally reintroduced the TTLT wait the whole feature was meant to eliminate — this trade-off (safety completeness vs. streaming responsiveness) must be a deliberate design decision, discussed openly with stakeholders, not an accidental side effect of bolting a filter onto a stream naively.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Streaming's performance story is really a redistribution story, not a raw speed-up, and treating it as the latter leads to bad capacity planning.
+</p>
+
+<ul>
+<li><strong>Total tokens generated, and total cost, are unchanged by streaming.</strong> You still pay per output token whether it is delivered in one blob or five hundred small chunks — streaming is a UX and connection-management concern, not a cost-optimization technique (cost optimization is covered properly in Volume 5).</li>
+<li><strong>Open-connection resource cost rises with concurrency and average stream duration, per Little's Law (Section 6.2).</strong> Capacity planning for a streaming feature must budget for concurrently open connections, not just requests-per-second, which is a materially different sizing exercise than a typical low-latency REST endpoint.</li>
+<li><strong>Small chunk sizes mean more, smaller network writes.</strong> On very high-throughput systems this can matter (more syscalls, more per-chunk framing overhead); in practice, for typical chat-assistant traffic volumes, this overhead is negligible compared to model inference time itself, but it is worth knowing the dial exists (some providers/configurations allow batching multiple tokens per delta to reduce chunk count at a small cost to perceived smoothness).</li>
+<li><strong>Reactive stacks trade lower per-connection memory/thread cost for higher implementation complexity.</strong> WebFlux lets you serve far more concurrent streams per server instance than a thread-per-connection model, but every blocking call anywhere in the chain (a synchronous JDBC call inside an advisor, a `.block()` used out of habit) can stall an event-loop thread and degrade *every other concurrent stream* sharing that thread — a failure mode that does not exist in a traditional thread-per-request model, where one slow request only ever blocks itself.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Streaming's security surface is narrower than topics like Prompt Injection or Retrieval, but it is not empty, and it interacts with earlier chapters in a way worth naming explicitly.
+</p>
+
+<ul>
+<li><strong>Partial-content exposure before safety checks complete.</strong> If your architecture streams raw model output directly to the user while a moderation/guardrail check runs in parallel or afterward, a user can see (and screenshot) content that a completeness check would have blocked, before the block ever takes effect. Systems with strict compliance requirements often deliberately buffer a small look-ahead window, or run lightweight streaming-safe classifiers per chunk, rather than naively "stream everything, moderate after."</li>
+<li><strong>Unsanitized rendering of streamed content in the client.</strong> If a frontend appends each raw text delta directly into the DOM (e.g., via `innerHTML`) without sanitization, and the model's output contains attacker-influenced content (from a prompt-injected document, per the Security Considerations discussion in earlier chapters), this becomes a genuine client-side injection/XSS vector — the incremental nature of streaming does not create this risk, but it does make it easier to overlook, since streaming UI code is often written for "cool factor" first and hardened later.</li>
+<li><strong>Long-lived connections as a resource-exhaustion / denial-of-service vector.</strong> Because streaming connections are held open far longer than typical request/response calls, an attacker (or just a buggy client that never closes idle connections) can exhaust server-side connection or thread capacity faster than with equivalent short-lived traffic; rate limiting and per-client concurrent-stream caps are more important here than for ordinary endpoints.</li>
+<li><strong>Auth/session expiry mid-stream.</strong> A token or session that expires partway through a long-running stream needs an explicit policy — do you let the in-flight stream finish, or terminate it immediately? — because standard per-request auth checks run once, at connection start, and are not naturally re-evaluated as a stream continues.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What problem does streaming an LLM response actually solve — does it make the model faster?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>No — streaming does not reduce the model's total generation time (TTLT is unchanged). It changes when the user is allowed to see output: instead of waiting silently for the complete response, the user sees the first token (TTFT) almost immediately and then watches the rest arrive incrementally, which dramatically improves perceived responsiveness for the same total amount of work.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. What is the difference between Server-Sent Events (SSE) and WebSockets, and which does typical LLM streaming use?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>SSE is a one-directional, server-to-client stream over plain HTTP, with automatic browser reconnection built into `EventSource`. WebSockets provide a full-duplex, persistent connection where both sides can push at any time, at the cost of more infrastructure complexity (protocol upgrade, different proxy handling). Most LLM provider APIs, and most Spring AI-based chat features, use SSE, because the interaction is fundamentally one-directional (server pushes generated tokens) and SSE survives ordinary HTTP infrastructure more easily.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. In Spring AI, what changes structurally when you call `.stream()` instead of `.call()`, and what is the returned type?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>`.call()` returns a single, complete `ChatResponse` (or a projected type like `String`) after blocking until generation finishes. `.stream()` returns a `Flux&lt;ChatResponse&gt;` (or `Flux&lt;String&gt;` via `.content()`) — a cold, reactive sequence of incremental response chunks that only begins producing values once subscribed to. Every downstream component — controllers, advisors, memory persistence — must be written to operate on this reactive sequence rather than assuming one finished object.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why does a `.block()` call anywhere inside a streaming pipeline defeat the purpose of streaming?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>`.block()` forces the reactive chain to wait for the entire `Flux` to complete before returning a value, which reintroduces full buffering — the client receives nothing until generation is completely finished, identical in effect to never streaming. Worse, on a WebFlux event-loop thread, blocking also stalls that thread, degrading every other concurrent request sharing it, which does not happen on a traditional thread-per-request model.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. A team deployed a working streaming chat feature behind NGINX and users report the UI appears frozen, then the full answer appears all at once. Diagnose the likely cause and the fix.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>This is the classic reverse-proxy buffering failure: NGINX buffers proxied HTTP responses by default, so even though Spring Boot is correctly emitting SSE chunks as they are generated, NGINX accumulates the entire response before forwarding it downstream, which makes a genuinely streaming backend appear non-streaming to the client. The fix is to disable buffering for that route/location, e.g. `proxy_buffering off;` and/or setting the `X-Accel-Buffering: no` response header from the Spring Boot app, and then verifying behavior through the actual deployed path (load balancer included), not just localhost, since local testing has no proxy in between to hide the bug.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Mention that this class of bug is invisible in local development and only appears once real infrastructure — proxies, CDNs, API gateways — sits in the path, and that a pre-launch checklist for any streaming feature should explicitly include "verify SSE passes through every hop of the real deployment topology unbuffered." This shows you've internalized that streaming correctness is a full-stack, not just an application-code, concern.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. How should an `Advisor` that persists conversation memory (as covered in the Memory chapter) be adapted to work correctly with streaming responses?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A memory-persisting advisor written only against `.call()` typically expects one complete `ChatResponse` to save. Against a streaming `Flux&lt;ChatResponse&gt;`, it must aggregate the chunks — reconstructing the full assistant message text from all deltas in order — before writing it to the memory store, without buffering the client-facing stream itself in the process. Practically, this means tapping the `Flux` (e.g., via an operator that collects the full text as a side effect once the stream completes) while still forwarding each chunk to the caller unbuffered and in real time, so the user experience stays fully streaming while memory still ends up with one coherent, complete turn.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q7. Your platform needs to run content-safety moderation on model output before showing it to users, but product wants low-latency streaming for the chat UI. How do you reconcile these, architecturally?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>These two requirements are in genuine, structural tension: full-completeness moderation requires seeing the whole response, which reintroduces the TTLT wait streaming exists to avoid. A staff-level answer names the trade-off explicitly rather than pretending it does not exist, then proposes concrete mitigations: (1) run a lightweight, streaming-capable classifier per chunk or per small rolling window of chunks, accepting slightly reduced detection accuracy for unbroken responsiveness; (2) stream with a short, bounded look-ahead buffer (e.g., a few hundred milliseconds or a few chunks of delay) so a fast moderation pass can run just ahead of what's shown, catching most violations with minimal perceived latency cost; (3) for high-risk categories/use cases, deliberately choose to buffer fully and forgo streaming, treating streaming as a UX optimization that is subordinate to a hard safety requirement rather than a universal default. The decision should be made per use case based on risk tolerance, and documented as a conscious architectural choice — not left as an accidental default from whichever engineer wired up the first version.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. How does supporting streaming at scale change your capacity planning and infrastructure choices compared to a purely request/response AI service?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Streaming connections are held open for the full generation duration (seconds, not milliseconds), so capacity must be planned around concurrently open connections (via Little's Law: concurrent connections ≈ arrival rate × average stream duration), not just requests-per-second. This pushes toward a non-blocking, reactive stack (Spring WebFlux) so a small, fixed thread pool can support a large number of simultaneously open streams, rather than a thread-per-connection Servlet model that would need a thread pinned per open stream. It also requires re-auditing every piece of infrastructure between client and server — load balancer idle timeouts, reverse proxy buffering, CDN caching rules — since all of these are typically tuned by default for short-lived request/response traffic and will silently misbehave (buffer, timeout early, or cache incorrectly) against long-lived streaming connections unless explicitly reconfigured.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, in your own words, why streaming reduces perceived latency without reducing actual total generation time. Use the TTFT/TTLT distinction explicitly in your answer.</li>
+<li>A colleague argues "streaming is strictly better, we should enable it everywhere." Identify at least two scenarios from this chapter (safety/moderation, tool-call argument handling) where naive streaming introduces a real correctness or safety trade-off, and explain the trade-off in each case.</li>
+<li>Explain why an `Advisor` written correctly for `.call()` can silently fail or do nothing useful when the same call path is switched to `.stream()`, and what change is required to make it work for both.</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Build a minimal Spring Boot WebFlux endpoint that streams a Spring AI `ChatClient` response as SSE to a browser using a plain HTML page with `EventSource`. Then deliberately introduce a `.block()` call somewhere in the chain, observe how the behavior changes (the response now arrives all at once), and write two sentences explaining why.</li>
+<li>Using a local reverse proxy (NGINX or similar) in front of your streaming endpoint from the previous exercise, reproduce the "response arrives all at once despite streaming backend" bug described in Section 8 by leaving default buffering enabled, then fix it by disabling buffering for that route and confirm the fix by observing incremental delivery in the browser network tab.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Streaming does not make a model generate faster — it changes the delivery of an unchanged amount of work, converting a silent wait of length TTLT into a short wait of length TTFT followed by continuous incremental delivery.</li>
+<li>LLM provider streaming rides on SSE-framed, incremental text deltas over a long-lived HTTP connection, an approach whose roots (SSE, WebSockets, Reactive Streams) predate language models and were adapted, not invented, for this use case.</li>
+<li>In Spring AI, `.stream()` returns a cold `Flux&lt;ChatResponse&gt;` rather than a single `ChatResponse`, and every downstream component — controllers, advisors, memory persistence — must be rewritten with reactive, non-blocking discipline to actually preserve the benefit; a single stray `.block()` silently defeats the entire feature.</li>
+<li>Production correctness depends as much on infrastructure (proxy buffering, load balancer timeouts, connection concurrency capacity) as on application code — the most common real-world streaming bug is a reverse proxy buffering the response despite a perfectly correct streaming backend.</li>
+<li>Streaming introduces genuine, honest trade-offs against completeness-dependent safety checks and tool-call argument parsing, which must be resolved as deliberate architectural decisions, not accidental defaults.</li>
+<li>Capacity planning for streaming systems must account for concurrently open, long-lived connections (via Little's Law), which is precisely why a reactive stack like WebFlux is the structurally correct foundation for streaming at scale.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> once a model's output can arrive incrementally, a new problem appears immediately — how do you get that output to reliably conform to a schema your downstream code can parse, when you can no longer wait for and validate one complete JSON blob before acting on it? Structured Output (Chapter 34) covers how Spring AI constrains and parses model responses into typed Java objects, and how that discipline interacts with everything streaming just introduced.
+</p>
+
+</div>
+
+</body>
+</html>

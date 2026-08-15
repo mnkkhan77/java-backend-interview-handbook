@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>76-ENTERPRISE-RAG.html</title>
+<style>
+body{
+    font-family: Arial, sans-serif;
+    line-height:1.7;
+    margin:40px;
+    background:#f4f6f8;
+    color:#222;
+}
+h1,h2,h3,h4{
+    color:#1f4e79;
+}
+.section{
+    background:white;
+    padding:20px;
+    margin-bottom:20px;
+    border-radius:8px;
+    box-shadow:0 2px 4px rgba(0,0,0,0.1);
+}
+.question{
+    color:#c0392b;
+    font-weight:bold;
+    font-size:20px;
+}
+.answer{
+    margin-top:10px;
+}
+.roi{
+    color:green;
+    font-weight:bold;
+}
+.level{
+    display:inline-block;
+    background:#1f4e79;
+    color:white;
+    font-size:12px;
+    font-weight:bold;
+    padding:2px 8px;
+    border-radius:10px;
+    margin-right:8px;
+}
+.followup{
+    background:#fff8dc;
+    padding:10px;
+    border-left:4px solid orange;
+    margin-top:10px;
+}
+.callout{
+    background:#eef6ff;
+    padding:12px 16px;
+    border-left:4px solid #1f4e79;
+    margin:14px 0;
+}
+pre{
+    background:#f4f4f4;
+    padding:10px;
+    border-radius:4px;
+    overflow:auto;
+    font-size:13.5px;
+}
+table{
+    border-collapse:collapse;
+    margin:10px 0;
+    width:100%;
+}
+th,td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    vertical-align:top;
+}
+th{
+    background:#1f4e79;
+    color:white;
+}
+</style>
+</head>
+<body>
+
+<h1 id="h1">CHAPTER 52 — ENTERPRISE RAG</h1>
+
+<p class="roi">Volume 3 — Embeddings & RAG · Chapter 12 of 13</p>
+
+<div class="callout">
+Retrieval Strategies (Chapter 51) taught you how to make retrieval <em>accurate</em> — hybrid search, query rewriting, reranking, all measured against a single, clean, static corpus. Real enterprises hand you none of that cleanliness: your knowledge lives across a dozen systems owned by different teams, updates every hour, and — critically — not every employee is allowed to see every document. This chapter is about the gap between "a RAG pipeline that answers well" and "a RAG system you can actually deploy inside a company without a security incident, a compliance violation, or a support queue full of stale answers." Getting retrieval right was necessary; getting it right <em>while respecting who is allowed to know what, and how current that knowledge is</em> is the actual production problem.
+</div>
+
+<hr>
+
+<h1 id="h2">1. MOTIVATION</h1>
+
+<div class="section">
+
+<p>
+Almost every RAG tutorial you will find online follows the same shape: load one PDF, chunk it, embed it, store it in an in-memory vector store, ask it three questions, and declare victory. That demo is genuinely useful for learning the mechanics — Chapters 25 through 51 of this volume were built on exactly that clean foundation on purpose. But if you take that demo, swap the one PDF for "everything the company knows," and ship it, you will have built something dangerous rather than something useful, and you will find that out the hard way: an intern asks the internal assistant a question and it answers using a document from the executive compensation committee that the intern was never authorized to open. Nobody wrote a prompt injection to cause that — the retrieval layer simply had no concept of "who is asking."
+</p>
+
+<p>
+This is the pivot this chapter asks you to make: enterprise RAG is not "RAG, but with more documents." It is RAG combined with three disciplines that have nothing to do with embeddings at all — <strong>identity and access management</strong> (who is allowed to see what), <strong>data engineering</strong> (how content gets pulled from a dozen source-of-truth systems and kept fresh), and <strong>governance</strong> (what must be logged, redacted, retained, or deleted, and why). A staff engineer asked to "add RAG to our internal assistant" who only thinks about chunk size and embedding models will ship something that works in the demo and gets pulled from production within a month of a real audit. This chapter exists so that does not happen to you.
+</p>
+
+<p>
+It also matters because this is precisely the kind of system a Java/Spring engineer is uniquely well positioned to own. Everything enterprise RAG needs — connectors to line-of-business systems, scheduled batch jobs, event-driven change propagation, request-scoped security context, multi-tenant data isolation — is exactly the territory Spring Boot, Spring Security, Spring Batch, and Spring Integration were built for over the last two decades. The vector database and the LLM are the newest, smallest pieces of this system; the plumbing around them is where your existing expertise pays off the most.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h3">2. HISTORICAL BACKGROUND</h1>
+
+<div class="section">
+
+<p>
+Enterprise RAG did not appear out of nowhere — it is the third attempt at the same underlying goal: "let an employee ask a natural-language question and get an answer grounded in the company's own documents," and each earlier attempt left behind lessons (and infrastructure) that enterprise RAG quietly inherits.
+</p>
+
+<h3>2.1 Enterprise Search (1990s–2010s)</h3>
+
+<p>
+The first attempt was enterprise search: products like Autonomy IDOL, FAST Search, the Google Search Appliance, and later SharePoint Search and Elasticsearch-based intranet search crawled internal file shares, wikis, and document management systems, built inverted indexes, and returned ranked lists of documents for keyword queries. This generation solved a problem enterprise RAG still has to solve today and cannot skip: <strong>connectors</strong> (how do you actually authenticate to Confluence, SharePoint, a file share, and a ticketing system, and pull content out reliably) and — the part most RAG tutorials ignore entirely — <strong>security-trimmed search</strong>, where the search index itself respects the source system's access control lists so a user only ever sees results they were already authorized to see in the original system. That security-trimming discipline is the direct ancestor of the ACL-aware retrieval this chapter spends most of its time on.
+</p>
+
+<h3>2.2 Enterprise Content Management and Data Warehousing</h3>
+
+<p>
+In parallel, enterprises built content management systems (Documentum, SharePoint, Confluence) with document lifecycle metadata — owner, classification, retention policy, version history — and data warehouses with formal ETL (extract, transform, load) pipelines and change data capture (CDC) to keep downstream copies of data synchronized with source systems without hammering them on every read. Enterprise RAG's ingestion pipeline is, structurally, an ETL pipeline whose "load" target happens to be a vector index instead of a relational warehouse table. If you have ever built or maintained a data pipeline that keeps a search index or a reporting database in sync with an OLTP system, you already understand the shape of an enterprise RAG ingestion pipeline before you have written a line of it.
+</p>
+
+<h3>2.3 The RAG Turn (2023–present)</h3>
+
+<p>
+What changed with the arrival of capable LLMs was not the need for connectors or ACLs — both already existed — but the interface: instead of returning a ranked list of ten documents and making the human read and synthesize them, the system now retrieves relevant chunks and has a model synthesize a direct, cited answer. This is a strictly harder security and correctness problem than classic enterprise search, for a subtle reason worth sitting with: a ranked list of ten links is inherently self-limiting (a user who is shown an unauthorized document's title in a results list is already a smaller leak than a system that reads that document's contents and confidently answers a question using it). Generative synthesis compresses many chunks into one fluent answer, which means a single leaked chunk can silently shape the final answer even if the user never sees the source. Enterprise RAG, as a discipline, exists specifically to close that gap — not by removing generation, but by making sure nothing unauthorized, unlabeled, or stale ever reaches the retrieval step in the first place.
+</p>
+
+<table>
+<tr><th>Era</th><th>What It Solved</th><th>What Enterprise RAG Inherits</th></tr>
+<tr><td>Enterprise Search (IDOL, FAST, SharePoint)</td><td>Crawling siloed systems, keyword ranking, security-trimmed results</td><td>Connectors, ACL-aware indexing</td></tr>
+<tr><td>ECM / Data Warehousing</td><td>Document lifecycle metadata, ETL, change data capture</td><td>Ingestion pipeline shape, freshness/versioning discipline</td></tr>
+<tr><td>RAG (2023+)</td><td>Semantic retrieval + generative synthesis of answers</td><td>Everything above, now with the added risk of silent synthesis across sources</td></tr>
+</table>
+
+</div>
+
+<hr>
+
+<h1 id="h4">3. PROBLEM STATEMENT</h1>
+
+<div class="section">
+
+<div class="callout">
+<strong>Build a retrieval-augmented generation system that answers questions grounded in content pulled from many heterogeneous, independently-owned enterprise systems, where every answer respects the requesting user's actual authorization, reflects data that is acceptably current, and is auditable and attributable back to its sources — at a cost and latency the business can sustain at real headcount scale.</strong>
+</div>
+
+<p>
+Unpack the qualifiers, because each one is a separate engineering requirement that a naive RAG pipeline (Chapters 25–51 of this volume) does not address:
+</p>
+
+<ul>
+<li><strong>Heterogeneous, independently-owned systems</strong> — Confluence, SharePoint, Jira, Salesforce, internal wikis, Slack archives, ticketing systems, and relational databases each have their own APIs, rate limits, authentication schemes, and content formats (HTML, PDF, Markdown, scanned images, structured rows). There is no single "documents table" to chunk.</li>
+<li><strong>Respects the requesting user's actual authorization</strong> — the same corpus must return different retrievable chunks for different users, dynamically, based on group membership, department, and document-level or even field-level permissions that can change independently of the document's content.</li>
+<li><strong>Acceptably current</strong> — a document edited five minutes ago in Confluence must eventually (and for some use cases, near-immediately) be reflected in the index, and a deleted or access-revoked document must stop being retrievable, ideally faster than "eventually."</li>
+<li><strong>Auditable and attributable</strong> — every answer needs a trace back to which chunks, from which source documents, at which version, informed it — both for user trust (citations) and for compliance (someone must be able to answer "why did the assistant say that" six months later).</li>
+<li><strong>Sustainable cost and latency at real scale</strong> — a company-wide assistant used by thousands of employees is a very different cost and infrastructure problem than a demo queried a dozen times a day.</li>
+</ul>
+
+<p>
+None of this is solved by picking a better embedding model or a smarter reranker — those are Chapter 51's problem, already assumed solved here. Enterprise RAG is the layer of engineering that sits <em>around</em> a good retrieval pipeline to make it safe, current, and operable inside a real organization.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h5">4. THEORY</h1>
+
+<div class="section">
+
+<h3>4.1 The Central Mental Model: RAG as a Materialized, Permissioned View</h3>
+
+<p>
+The single most useful mental model for enterprise RAG, if you come from a database or data-engineering background, is this: <strong>your vector index is a materialized view over many source systems, and it must inherit both the freshness obligations and the access-control obligations of every system it draws from.</strong> A materialized view in a relational database is a precomputed, queryable copy of data derived from base tables — it is fast to query precisely because it is not recomputed live, but that speed comes with an obligation to refresh it, and if the base tables have row-level security, a correctly designed view must not silently bypass that security just because it is a separate physical copy of the data. Every architectural decision in this chapter — CDC-based ingestion, ACL metadata on chunks, deletion propagation, staleness monitoring — is simply that one sentence applied consistently.
+</p>
+
+<h3>4.2 Core Concepts You Need Before the Mechanism</h3>
+
+<table>
+<tr><th>Concept</th><th>Definition</th><th>Why It Exists</th></tr>
+<tr><td>Connector</td><td>A component that authenticates to a source system and extracts content plus its native metadata (owner, ACL, timestamps)</td><td>Enterprise content is never in one place or one format</td></tr>
+<tr><td>Document ACL / permission metadata</td><td>The set of users, groups, or roles authorized to view a given document, carried through ingestion onto every chunk derived from it</td><td>Without this, retrieval cannot be filtered per requester</td></tr>
+<tr><td>Chunk-level provenance</td><td>Metadata tying an indexed chunk back to its exact source document, version, and location within it</td><td>Enables citations and auditability</td></tr>
+<tr><td>Change data capture (CDC) / incremental sync</td><td>A mechanism to detect and propagate only what changed in a source system since the last sync, rather than re-crawling everything</td><td>Full re-crawls of enterprise-scale corpora are too slow and expensive to run frequently</td></tr>
+<tr><td>Tenant isolation</td><td>Guaranteeing that one customer's or business unit's data can never be retrieved in another's context, even under bugs</td><td>Multi-tenant SaaS and multi-business-unit enterprises cannot tolerate cross-contamination</td></tr>
+<tr><td>Data classification</td><td>A label (public, internal, confidential, restricted) attached to content that governs how it can be indexed, cached, or logged</td><td>Not all content is safe to embed, cache, or send to a third-party model provider identically</td></tr>
+</table>
+
+<h3>4.3 The Analogy: A Corporate Librarian, Not a Search Box</h3>
+
+<p>
+Picture enterprise RAG not as "a smarter search box" but as a corporate research librarian who has read everything in the building, knows which filing cabinets are locked for which staff badge levels, refuses to hand you a document that was shredded last week even if she remembers its contents, and always tells you exactly which shelf and page she pulled her answer from. A plain RAG demo is a librarian with an excellent memory but no concept of locked cabinets, no idea a document was shredded, and no habit of citing sources. Every section that follows is about building the badge-checking, shelf-tracking, shredding-aware version of that librarian.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h6">5. INTERNAL WORKING</h1>
+
+<div class="section">
+
+<p>
+Enterprise RAG has two operationally distinct lifecycles that must be understood separately: the <strong>ingestion pipeline</strong> (runs continuously, out of band from user requests) and the <strong>query pipeline</strong> (runs synchronously, in the request path). Confusing the two — for example, trying to check permissions "live" against the source system on every single retrieval call — is a common design mistake covered in Section 11.
+</p>
+
+<h3>5.1 Ingestion Pipeline, Step by Step</h3>
+
+<ol>
+<li><strong>Discovery and extraction</strong> — a connector for each source system (Confluence, SharePoint, a database table, a ticketing system) lists content, either via a full crawl (initial load) or an incremental delta query (ongoing sync), and extracts raw content plus native metadata: author, last-modified timestamp, folder/space, and — critically — the source system's own access control list for that item.</li>
+<li><strong>Parsing and normalization</strong> — PDFs, HTML, Markdown, spreadsheets, and scanned images are each parsed differently (PDF text extraction, HTML-to-text with structure preservation, OCR for scans, row-to-text serialization for structured tables) into a normalized document representation.</li>
+<li><strong>Chunking</strong> — content is split using strategies appropriate to its structure (this reuses everything from earlier chapters on chunking, but now per-source-type: a Confluence page chunks differently than a support ticket thread or a database row).</li>
+<li><strong>Metadata enrichment</strong> — every chunk is tagged with provenance (source system, document ID, version, URL), the inherited ACL/permission set, a data classification label, and a timestamp. This metadata is what makes the rest of the system possible — it is not optional decoration.</li>
+<li><strong>PII/sensitive-data handling</strong> — content is scanned and, per policy, redacted, tokenized, or flagged before embedding, especially for content headed to a third-party-hosted embedding or generation model.</li>
+<li><strong>Embedding</strong> — chunks are embedded using the chosen embedding model (Chapter 16's territory), batched for throughput.</li>
+<li><strong>Indexing / upsert</strong> — vectors plus metadata are written into the vector store, keyed so that a later update to the same source document can find and replace its old chunks rather than accumulating duplicates.</li>
+<li><strong>Deletion and revocation propagation</strong> — when a source document is deleted, or a user/group's access to it is revoked, the pipeline must remove or re-tag the corresponding chunks, ideally faster than the normal refresh cadence, since a stale permission is a live security exposure, not just a stale fact.</li>
+</ol>
+
+<h3>5.2 Query Pipeline, Step by Step</h3>
+
+<ol>
+<li><strong>Authenticate and resolve identity</strong> — the incoming request carries (or is resolved to) the requesting user's identity and group/role memberships, typically via the existing corporate identity provider (SSO/OIDC/SAML) — the same identity your Spring Security filter chain already resolves for every other endpoint.</li>
+<li><strong>Build a permission filter</strong> — the user's group memberships are translated into a metadata filter expression (for example: "ACL contains any of [group:engineering, group:all-staff, user:jane.doe]").</li>
+<li><strong>Query understanding and rewriting</strong> — as covered in the Retrieval Strategies chapter: query expansion, decomposition, or rewriting as appropriate.</li>
+<li><strong>Filtered hybrid retrieval</strong> — the vector store executes semantic (and, typically, lexical/BM25) retrieval <em>with the permission filter applied as a hard pre-filter, not a post-filter</em> — this distinction matters enormously and is discussed in Section 5.3.</li>
+<li><strong>Reranking</strong> — the filtered candidate set is reranked for relevance, exactly as in Chapter 51, operating only on chunks the user was already authorized to see.</li>
+<li><strong>Context assembly with provenance</strong> — the top chunks are assembled into the prompt along with their citation metadata, so the model can be instructed to cite sources rather than free-floating claims.</li>
+<li><strong>Generation</strong> — the model produces an answer grounded in the assembled, authorized context.</li>
+<li><strong>Citation and groundedness check</strong> — before the answer is returned, an automated check (or a dedicated evaluation step, previewed here and formalized in Chapter 53) can verify that citations actually correspond to retrieved chunks, catching cases where the model cites something not actually retrieved.</li>
+<li><strong>Audit log write</strong> — the query, the resolved identity, the retrieved chunk IDs, and the final answer are logged for later audit, exactly as you would log an authorization decision on any other sensitive endpoint.</li>
+</ol>
+
+<h3>5.3 Why Permission Filtering Must Happen Before Retrieval, Not After</h3>
+
+<p>
+A tempting but wrong shortcut is to retrieve the top-K chunks by similarity first, and only afterward drop the ones the user is not authorized to see. This is wrong for two independent reasons. First, it silently degrades answer quality: if 6 of your top 8 semantically-relevant chunks belong to a document the user cannot see, post-filtering leaves you with 2 weak chunks and a poor answer, when a pre-filtered search over only authorized content might have surfaced 8 good ones. Second, and far more seriously, it is a security anti-pattern: if the LLM call, the logging, or any intermediate caching layer happens to touch the unauthorized chunks before the post-filter runs, you have already leaked the content into a system boundary you cannot fully control. The permission filter must be pushed down into the vector store's query itself — a metadata pre-filter, evaluated as part of the nearest-neighbor search, exactly the way a row-level-security policy in a relational database is enforced by the query planner before rows are ever returned to the application layer.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h7">6. MATHEMATICS</h1>
+
+<div class="section">
+
+<p>
+Enterprise RAG is overwhelmingly a systems and governance problem rather than a mathematical one — the embedding math was covered in the Vector Mathematics and Introduction to RAG chapters, and the ranking math in Retrieval Strategies. The one piece of quantitative intuition worth adding here is how <strong>permission filtering interacts with approximate nearest-neighbor (ANN) recall</strong>, because it explains a production symptom you will otherwise find mysterious.
+</p>
+
+<p>
+Most vector databases at enterprise scale use ANN indexes (e.g., HNSW) that trade a small amount of recall for large speedups over exact search. ANN indexes are typically tuned assuming the candidate pool returned by the index roughly matches the true top-K by similarity. When you apply a restrictive metadata filter (say, a user who can only see 2% of the corpus) as a <em>post</em>-filter on top of an ANN search that already only approximately explores the space, you can end up with far fewer than K usable results, or worse, degraded relevance, because the ANN index was never asked to specifically search within that narrow authorized subset. This is exactly why modern vector databases increasingly support <strong>filtered ANN search</strong> (sometimes called pre-filtering or attribute-aware indexing) — the index incorporates the metadata predicate during graph traversal rather than after it, so recall quality is preserved even for narrow, highly-restricted user permission sets. When evaluating a vector store for an enterprise deployment, "does it support efficient filtered search at your expected filter selectivity" is a more consequential question than raw benchmark recall numbers on an unfiltered dataset.
+</p>
+
+<p>
+A second, purely operational piece of arithmetic worth internalizing: ingestion throughput requirements scale with corpus churn, not corpus size. A ten-million-document corpus that is mostly static needs a very different pipeline (and budget) than a two-million-document corpus where 5% of documents change every day — the latter requires sustained re-embedding and re-indexing throughput of roughly 100,000 documents per day just to stay current, which is a capacity-planning number, not a one-time migration number.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h8">7. VISUAL DIAGRAMS</h1>
+
+<div class="section">
+
+<h3>7.1 Ingestion Pipeline — Multi-Source, ACL-Propagating</h3>
+
+<pre>
+  SOURCE SYSTEMS                    INGESTION PIPELINE                      INDEX
+ ┌───────────────┐
+ │  Confluence     │──┐
+ └───────────────┘  │
+ ┌───────────────┐  │      ┌────────────┐   ┌────────────┐   ┌────────────┐
+ │  SharePoint     │──┼───►│ Connector /  │──►│  Parse +    │──►│  Chunk +    │
+ └───────────────┘  │      │ CDC listener │   │  normalize  │   │  enrich     │
+ ┌───────────────┐  │      └────────────┘   └────────────┘   │  metadata:  │
+ │  Jira / tickets │──┤            │  each item carries:            │  ACL, source,│
+ └───────────────┘  │            │  content + native ACL          │  version,   │
+ ┌───────────────┐  │            │  + last-modified timestamp     │  classifi-  │
+ │  DB tables      │──┘                                            │  cation     │
+ └───────────────┘                                                 └─────┬──────┘
+                                                                          ▼
+                                                                  ┌────────────┐
+                                                                  │  Embed       │
+                                                                  │  (batched)   │
+                                                                  └─────┬──────┘
+                                                                          ▼
+                                                                  ┌────────────┐
+                                                                  │  Upsert /    │
+                                                                  │  delete-     │
+                                                                  │  propagate   │──► Vector
+                                                                  └────────────┘     Store
+                                                                                     (chunk +
+                                                                                      ACL +
+                                                                                      provenance
+                                                                                      metadata)
+  Deletion / access-revocation events flow the same path, marked
+  as tombstones so retrieval stops serving them immediately —
+  even before the next full re-embed cycle runs.
+</pre>
+
+<h3>7.2 Query-Time Flow — Permission-Filtered, Cited Answer</h3>
+
+<pre>
+ User + identity token
+        │
+        ▼
+ ┌───────────────────────┐
+ │ Resolve identity via     │   (existing corporate IdP / SSO —
+ │ Spring Security context  │    same mechanism as every other endpoint)
+ └───────────┬───────────┘
+             ▼
+ ┌───────────────────────┐
+ │ Build ACL filter          │   e.g. ACL ∩ {user's groups} ≠ ∅
+ │ expression                │
+ └───────────┬───────────┘
+             ▼
+ ┌───────────────────────┐
+ │ Filtered hybrid search     │◄── vector store applies filter
+ │ (vector + BM25, pre-       │    DURING search, not after
+ │  filtered by ACL)          │
+ └───────────┬───────────┘
+             ▼
+ ┌───────────────────────┐
+ │ Rerank (authorized           │
+ │ candidates only)              │
+ └───────────┬───────────┘
+             ▼
+ ┌───────────────────────┐
+ │ Assemble prompt +               │
+ │ citation metadata                │
+ └───────────┬───────────┘
+             ▼
+ ┌───────────────────────┐
+ │ LLM generation                    │
+ └───────────┬───────────┘
+             ▼
+ ┌───────────────────────┐
+ │ Groundedness / citation           │──► Audit log:
+ │ check                              │    query, identity,
+ └───────────┬───────────┘            chunk IDs, answer
+             ▼
+      Answer + citations to user
+</pre>
+
+</div>
+
+<hr>
+
+<h1 id="h9">8. PRODUCTION ARCHITECTURE</h1>
+
+<div class="section">
+
+<p>
+A real enterprise RAG deployment separates the always-on ingestion side from the request-serving side, connected only through the index and an event bus — this separation is what lets each side scale, fail, and be operated independently.
+</p>
+
+<pre>
+ ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐
+ │ Confluence   │   │ SharePoint   │   │ Jira/DB      │   │ ... more     │
+ │ connector    │   │ connector    │   │ connectors   │   │ sources      │
+ └──────┬─────┘   └──────┬─────┘   └──────┬─────┘   └──────┬─────┘
+        │                  │                  │                  │
+        └──────────────────┴───────┬──────────┴──────────────────┘
+                                       ▼
+                         ┌───────────────────────┐
+                         │   Event bus / CDC        │   (Kafka / Spring Cloud
+                         │   change stream          │    Stream — "document
+                         └────────────┬──────────┘    changed / deleted / ACL
+                                       ▼                changed" events)
+                         ┌───────────────────────┐
+                         │  Ingestion workers        │   (Spring Batch jobs,
+                         │  parse → chunk → enrich   │    horizontally scaled,
+                         │  → embed → upsert          │    idempotent per doc)
+                         └────────────┬──────────┘
+                                       ▼
+                         ┌───────────────────────┐
+                         │  Vector store              │  (namespaced / sharded
+                         │  + metadata index           │   per tenant or business
+                         └────────────┬──────────┘   unit, ACL + provenance
+                                       │              on every chunk)
+                                       │
+   ─────────────── request path ──────┼────────────────────────────────
+                                       ▼
+ ┌────────────┐          ┌───────────────────────┐          ┌────────────┐
+ │ Client / UI  │────────►│ Spring Boot app:            │─────────►│ LLM /        │
+ │              │          │ auth (Spring Security),     │          │ ChatModel    │
+ │              │◄────────│ ACL-filtered retrieval,      │◄─────────│              │
+ └────────────┘          │ Advisors, citation check     │          └────────────┘
+                            └────────────┬──────────┘
+                                            ▼
+                                  ┌───────────────────┐
+                                  │ Audit log / observ-  │
+                                  │ ability (Chapter 38)  │
+                                  └───────────────────┘
+</pre>
+
+<p>
+Notice what is <em>not</em> in this diagram: a live, synchronous call from the request path back to Confluence or SharePoint to check permissions on every query. That would add unacceptable latency and load to source systems that were never designed to be queried per-token-generation. Instead, permission state is captured and denormalized into the index at ingestion time and kept current through the same CDC stream that keeps content current — access revocation is treated as exactly the same kind of event as a content edit.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h10">9. JAVA / SPRING PERSPECTIVE</h1>
+
+<div class="section">
+
+<p>
+Spring AI's document ETL abstractions map almost one-to-one onto the ingestion pipeline in Section 5.1, which is not a coincidence — they were modeled on exactly this kind of pipeline. A <code>DocumentReader</code> implementation is your connector boundary (Spring AI ships readers for common formats, and you implement custom ones for internal systems like Confluence or a ticketing API); a chain of <code>DocumentTransformer</code>s handles splitting (<code>TokenTextSplitter</code> or a custom splitter per content type) and metadata enrichment; and a <code>DocumentWriter</code> implementation performs the upsert into your chosen <code>VectorStore</code> implementation. The key enterprise-specific addition is that your custom <code>DocumentTransformer</code> is where ACL and classification metadata gets attached to each <code>Document</code>'s metadata map — this is plain, ordinary Spring code, not anything RAG-specific.
+</p>
+
+<p>
+On the query side, the permission filter from Section 5.2 is expressed through the <code>VectorStore</code> API's filter expression support — Spring AI's <code>SearchRequest</code> accepts a metadata filter expression (a small, typed filter DSL) alongside the query text and top-K, which is exactly the mechanism you use to push the ACL predicate down into the underlying store's filtered search, rather than filtering the returned list in application code after the fact:
+</p>
+
+<pre>
+SearchRequest request = SearchRequest.builder()
+    .query(userQuery)
+    .topK(8)
+    .filterExpression(
+        "acl_groups in ['engineering','all-staff'] " +
+        "AND classification != 'restricted'"
+    )
+    .build();
+
+List&lt;Document&gt; authorizedChunks = vectorStore.similaritySearch(request);
+</pre>
+
+<p>
+The <code>acl_groups</code> value here is not hard-coded — it is built per request from the authenticated principal resolved by Spring Security, typically inside a custom <code>Advisor</code> (the same Advisor mechanism covered in Chapter 31) that intercepts the request before it reaches the retrieval step, resolves the current <code>Authentication</code>'s granted authorities, and injects the corresponding filter expression. This keeps the permission-resolution logic in exactly one, testable, reusable place rather than duplicated across every endpoint that touches the vector store — the same discipline you would apply to any other cross-cutting authorization concern in a Spring application.
+</p>
+
+<p>
+For the ingestion side's operational concerns — scheduled full syncs, retry and backoff on flaky upstream APIs (SharePoint and Confluence rate-limit aggressively), and idempotent, restartable batch runs over millions of documents — Spring Batch's chunk-oriented processing model (readers, processors, writers, with built-in restart-from-failure semantics) is a natural fit and predates RAG by well over a decade; you are not inventing new infrastructure, you are pointing a mature Spring capability at a new kind of "load" target.
+</p>
+
+</div>
+
+<hr>
+
+<h1 id="h11">10. BEST PRACTICES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Push permission filtering into the retrieval query itself</strong>, using the vector store's native filter support, never as an application-layer post-filter on already-retrieved content.</li>
+<li><strong>Treat access revocation and deletion as high-priority events</strong>, propagated faster than routine content-freshness updates — a stale fact is an inconvenience, a stale permission is a security incident.</li>
+<li><strong>Attach provenance metadata (source, document ID, version, URL) to every chunk at ingestion time</strong>, not as an afterthought bolted on at generation time — citations you cannot reconstruct are citations you cannot trust.</li>
+<li><strong>Version chunks by source document version</strong> so an update to a document replaces its prior chunks rather than accumulating duplicate, contradictory entries in the index over time.</li>
+<li><strong>Classify content before it is embedded</strong>, and route restricted-classification content to policies appropriate for it (self-hosted embedding models, no third-party logging) rather than a single blanket pipeline for all content.</li>
+<li><strong>Isolate tenants or business units at the index/namespace level</strong> in addition to metadata filtering — defense in depth means a filter bug should not be the only thing standing between two customers' data.</li>
+<li><strong>Instrument staleness explicitly</strong> — track and alert on "time since last successful sync" per source system, the same way you would monitor replication lag on a database.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h12">11. COMMON MISTAKES</h1>
+
+<div class="section">
+
+<ul>
+<li><strong>Trying to enforce access control via the prompt</strong> ("only answer using documents the user is authorized to see") instead of at retrieval. The model has no reliable, tamper-proof notion of authorization — this is a direct consequence of the prompt-injection risk discussed in the Hallucinations and prior security chapters, and it is not a substitute for a hard filter at the data layer.</li>
+<li><strong>Post-filtering retrieved results by permission</strong> instead of pre-filtering the search itself, silently degrading both security posture and answer quality, as explained in Section 5.3.</li>
+<li><strong>Treating ingestion as a one-time migration</strong> rather than a continuously-running pipeline, leading to answers grounded in months-stale documents with no one noticing until a user complains.</li>
+<li><strong>Forgetting deletion and revocation propagation entirely</strong> — a document deleted from Confluence for legal reasons that remains fully retrievable from the vector index for weeks is a real, recurring incident pattern in early enterprise RAG deployments.</li>
+<li><strong>Using one chunking strategy for every content type</strong> — a support ticket thread, a 200-page policy PDF, and a database table need fundamentally different chunk boundaries; forcing them through identical fixed-size chunking degrades retrieval quality unevenly across your corpus.</li>
+<li><strong>Skipping citations because "the demo looked fine without them,"</strong> then discovering at audit time that no one can explain why the assistant said something six months ago.</li>
+<li><strong>Underestimating parsing complexity</strong> — scanned PDFs, embedded tables, and images-of-text are common in real enterprise content and each requires dedicated extraction (OCR, table-structure recognition) that a naive text-extraction-only pipeline silently drops or mangles.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h13">12. PERFORMANCE CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Enterprise RAG performance has two nearly independent profiles that must be reasoned about separately: <strong>ingestion throughput</strong> (batch, off the request path, measured in documents/hour and driven by corpus churn as discussed in Section 6) and <strong>query latency</strong> (synchronous, in the request path, and the one users actually feel).
+</p>
+
+<ul>
+<li><strong>Latency budget</strong> — a typical enterprise query path breaks down roughly as: identity/filter resolution (single-digit milliseconds), filtered hybrid retrieval (tens of milliseconds if the index supports efficient filtered ANN search, far more if it falls back to a broad scan under restrictive filters), reranking (tens to low-hundreds of milliseconds depending on model choice), and generation (typically the dominant cost, hundreds of milliseconds to a few seconds depending on model and output length). A filter that forces the vector store into an unfiltered-then-post-filter fallback path is often the single largest, most invisible latency regression in these systems.</li>
+<li><strong>Caching</strong> — query-result and embedding caches (Chapter 27/56 territory) help disproportionately in enterprise settings because employee query patterns cluster heavily around common questions ("what is our PTO policy," "how do I request VPN access") — but any cache must be keyed with the permission context, never shared blindly across users with different authorization.</li>
+<li><strong>Reranker cost at scale</strong> — cross-encoder rerankers are accurate but expensive per candidate; at enterprise query volume, reranking a smaller, well-filtered candidate set (thanks to effective pre-filtering) is both cheaper and faster than reranking a large, loosely-filtered one.</li>
+<li><strong>Storage and sharding trade-offs</strong> — a single shared index with metadata filters is operationally simpler but risks noisy-neighbor effects and makes strict tenant isolation harder to guarantee; per-tenant namespaces/collections cost more operationally but bound the blast radius of any bug to one tenant.</li>
+<li><strong>Embedding cost at ingestion scale</strong> — for corpora in the tens of millions of chunks with meaningful daily churn, embedding API costs (or self-hosted embedding infrastructure costs) become a real budget line item, not a rounding error, and should be modeled explicitly during capacity planning.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h14">13. SECURITY CONSIDERATIONS</h1>
+
+<div class="section">
+
+<p>
+Security is not a side concern for enterprise RAG — it is arguably the majority of what distinguishes it from the RAG covered in earlier chapters of this volume, and it deserves to be treated with the same rigor as authentication and authorization anywhere else in your stack.
+</p>
+
+<ul>
+<li><strong>Access control at the data layer, not the prompt layer</strong> — as emphasized repeatedly in this chapter, permission enforcement belongs in the retrieval query, never in instructions hoping the model "chooses" not to use unauthorized content.</li>
+<li><strong>Prompt injection via retrieved content</strong> — because retrieved chunks originate from documents authored by many different employees (some of whom may be malicious, compromised, or simply careless), a chunk can itself contain text crafted to hijack the model's behavior once it lands in the prompt, exactly the risk introduced in the Hallucinations and What Is Intelligence chapters and covered fully in Volume 5's guardrails material — enterprise RAG's larger, less-curated corpus makes this attack surface larger, not smaller.</li>
+<li><strong>Cross-tenant data leakage</strong> — the failure mode unique to multi-tenant enterprise RAG: a filter bug, an indexing error, or a cache key collision that lets one tenant's or one department's content leak into another's answer. This is why namespace-level isolation as defense-in-depth (Section 10) matters even when metadata filtering is believed to be correct.</li>
+<li><strong>Data residency and third-party model exposure</strong> — sending confidential or regulated content to a third-party-hosted embedding or generation model may itself violate data residency or contractual obligations; classification-aware routing (Section 10) exists specifically to keep restricted content on infrastructure that meets those obligations.</li>
+<li><strong>Auditability and the right to erasure</strong> — regulations like GDPR create a "right to be forgotten" obligation that a vector index must honor just as faithfully as the source system — deletion propagation (Section 5.1) is not only a freshness feature, it is a compliance requirement.</li>
+<li><strong>Least-privilege connector credentials</strong> — each source-system connector should hold the minimum scope needed to read content and its ACLs, stored and rotated through the same secrets-management discipline as any other service credential, since a compromised ingestion pipeline with over-broad credentials is a company-wide data breach, not a localized bug.</li>
+</ul>
+
+</div>
+
+<hr>
+
+<h1 id="h15">14. INTERVIEW QUESTIONS</h1>
+
+<div class="section">
+
+<div class="question"><span class="level">JUNIOR</span>Q1. What makes "enterprise RAG" different from the basic RAG pipeline of embedding a document and querying it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Enterprise RAG adds requirements a single-document demo never faces: content pulled from many heterogeneous, independently-owned source systems; per-user access control so different users see different retrievable content from the same corpus; freshness/sync so edits and deletions propagate into the index; and auditability/citations so answers can be traced back to their sources. The retrieval and generation mechanics are the same — the surrounding engineering (connectors, ACLs, CDC, governance) is what's new.</p>
+</div>
+
+<div class="question"><span class="level">JUNIOR</span>Q2. Why can't you just tell the model in the prompt "only use documents the user is allowed to see"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The model has no tamper-proof way to distinguish authorized from unauthorized content inside the prompt, and if unauthorized content was already retrieved and placed in the context, it has already crossed a security boundary regardless of what the model does with it next. Authorization must be enforced before retrieval, as a filter on what content can ever be returned, not as an instruction hoping the model self-polices.</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q3. Walk through what happens, end to end, when a document is deleted in the source system. What could go wrong if you don't handle this explicitly?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High</p>
+<div class="answer">
+<p>A delete (or access-revocation) event should be captured by the same CDC/connector mechanism as content edits, and propagated with high priority to remove or tombstone the corresponding chunks in the vector index, ideally faster than routine content-refresh cadence. If this isn't handled explicitly, the deleted document's content remains fully retrievable and can be surfaced in future answers indefinitely — a correctness problem if it was deleted for being wrong, and a security/compliance problem if it was deleted for legal or access reasons (e.g., a "right to be forgotten" request).</p>
+</div>
+
+<div class="question"><span class="level">MID</span>Q4. Why should permission filtering happen as a pre-filter inside the vector search rather than a post-filter on the results?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High</p>
+<div class="answer">
+<p>Post-filtering degrades answer quality: if most of the top-K semantically similar chunks belong to unauthorized documents, filtering them out afterward can leave too few (or weak) results even though better authorized matches existed further down. It's also a security risk: unauthorized content may already have touched logging, caching, or downstream systems before the post-filter ever runs. Pushing the filter into the search itself (pre-filtering, ideally via filtered ANN support in the vector store) keeps both quality and security intact.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q5. How would you design chunk-level metadata for an enterprise RAG system, and what fields are non-negotiable?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Every chunk needs, at minimum: source system and document ID (provenance), a document version or last-modified timestamp (freshness and citation accuracy), the inherited access control list or role/group set (authorization filtering), and a data classification label (governs indexing, caching, and model-routing policy). Without provenance you cannot produce trustworthy citations or support audits; without ACL metadata you cannot filter retrieval; without version/timestamp you cannot detect staleness or safely replace outdated chunks on re-ingestion; without classification you cannot apply differentiated handling to sensitive content.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Add that metadata schema should be designed for filtered ANN search efficiency too — some vector stores perform far better with a small number of low-cardinality filter fields than with many high-cardinality ones, so ACL representation (e.g., a bounded set of group IDs rather than an unbounded list of individual user IDs per chunk) is itself a performance decision, not just a data-modeling one.</div>
+
+<div class="question"><span class="level">SENIOR</span>Q6. A business unit complains that the internal assistant's answers are frequently based on outdated documentation. How do you diagnose and fix this systemically, not just for the one complaint?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at senior level</p>
+<div class="answer">
+<p>First, instrument staleness explicitly — track time-since-last-successful-sync per source system and per document, the way you'd monitor replication lag. Check whether the connector for that business unit's source system is actually running incrementally (CDC) or falling back to slow, infrequent full crawls; check whether updates are being upserted (replacing old chunks) rather than appended as duplicates that then compete with stale versions during retrieval and reranking; and check whether classification or rate-limit throttling on that source is silently delaying its sync cadence relative to others. The systemic fix is usually a combination of tightening the sync interval for that source, ensuring proper chunk versioning/replacement on update, and adding staleness alerting so this is caught before a user complaint rather than after.</p>
+</div>
+
+<div class="question"><span class="level">SENIOR</span>Q7. Compare single shared vector index with metadata filtering versus per-tenant namespaces/collections for a multi-tenant enterprise RAG deployment. What would push you toward each?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A shared index with metadata filtering is operationally simpler (one index to scale, tune, and monitor) and works well when tenant boundaries are relatively low-risk and the vector store has strong, efficient filtered-search support. Per-tenant namespaces or collections cost more operationally (more indexes to manage, potential resource fragmentation) but bound the blast radius of a filter bug, a noisy-neighbor performance problem, or an audit requirement to a single tenant, and make hard compliance guarantees ("this tenant's data physically cannot be queried by that tenant's code path") much easier to demonstrate. Regulated industries or contractually-mandated data isolation usually push toward namespace-level separation as defense-in-depth even when filtering alone would technically work.</p>
+</div>
+
+<div class="question"><span class="level">STAFF</span>Q8. You're asked to design the ingestion architecture for a company-wide assistant spanning 15 internal systems, each with different rate limits, auth mechanisms, and update frequencies. What are the key architectural decisions, and how do you keep this maintainable as more sources get added over time?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Decouple ingestion from serving through an event bus (a "document changed/deleted/ACL changed" stream) so each connector can run independently on its own schedule and failure domain without blocking others. Standardize on a common internal document representation (normalized content plus a fixed metadata schema: provenance, ACL, classification, version) so downstream chunking, embedding, and indexing logic is written once against that abstraction rather than once per source system — this is the same "adapter to a common interface" discipline used for any heterogeneous integration problem. Build connectors as independently deployable, horizontally scalable workers (a natural fit for a Spring Batch or Spring Integration job per source) with their own retry/backoff tuned to each system's actual rate limits, and make ingestion idempotent per document so a retried or replayed sync never produces duplicate or conflicting chunks. For maintainability as sources grow, invest early in a connector "template" or SDK internally so a new source integration is mostly configuration (auth, endpoint, ACL-mapping rules) rather than a bespoke pipeline each time, and enforce the metadata schema (especially ACL and classification) as a hard contract that any new connector must satisfy before it's allowed to write into the shared index.</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">15. EXERCISES</h1>
+
+<div class="section">
+
+<h3>Conceptual</h3>
+<ol>
+<li>Explain, using the "materialized view" analogy from Section 4.1, why a vector index built from enterprise content has the same two obligations (freshness, access control) as a database materialized view built from base tables with row-level security — and where the analogy breaks down.</li>
+<li>A colleague proposes checking permissions by calling the source system's API live, on every retrieval query, instead of denormalizing ACLs into the index. List the operational and latency problems with this approach, and explain when (if ever) it might still be the right trade-off.</li>
+<li>Compare the security risk of a classic enterprise search system (returning a ranked list of document links) with a RAG system (returning a synthesized, generated answer) with respect to a single unauthorized document accidentally being retrieved. Why does synthesis make the leak harder to detect?</li>
+</ol>
+
+<h3>Practical</h3>
+<ol>
+<li>Design a chunk metadata schema (as a table of field name, type, and purpose) for a hypothetical enterprise RAG system ingesting from Confluence, a ticketing system, and a product database. Include at minimum provenance, ACL, classification, and versioning fields, and justify each one.</li>
+<li>Sketch, in the ASCII style of Section 7, an ingestion pipeline for a single source system of your choice (your company's wiki, ticketing system, or file share) that you have direct knowledge of. Annotate where ACL metadata would come from at each stage, and where a deletion/revocation event would need to short-circuit the normal refresh cadence.</li>
+</ol>
+
+</div>
+
+<hr>
+
+<h1 id="h17">16. SUMMARY</h1>
+
+<div class="section">
+
+<ul>
+<li>Enterprise RAG is RAG plus three disciplines a clean single-document demo never needs: identity/access control, multi-source data engineering, and governance/auditability.</li>
+<li>The correct mental model is a vector index as a <strong>permissioned, materialized view</strong> over many source systems — it inherits both the freshness and the access-control obligations of every system it draws from.</li>
+<li>Permission filtering must be pushed down into the retrieval query itself, as a pre-filter evaluated during search, never enforced through prompt instructions or applied as a post-filter after retrieval.</li>
+<li>Ingestion and query are operationally distinct lifecycles: ingestion runs continuously and out-of-band via connectors and change data capture; queries run synchronously and must never depend on live calls back to source systems for permission checks.</li>
+<li>Deletion and access-revocation propagation are security-critical, not just freshness features, and deserve faster propagation than routine content updates.</li>
+<li>Spring AI's <code>DocumentReader</code>/<code>DocumentTransformer</code>/<code>DocumentWriter</code> ETL abstractions, <code>VectorStore</code> filter expressions, Spring Security's authentication context, and Spring Batch's mature batch-processing model together cover almost the entire enterprise RAG surface — this is largely an assembly problem for a Java/Spring engineer, not a from-scratch build.</li>
+</ul>
+
+<p class="followup">
+<strong>Next chapter:</strong> everything in this chapter assumed you could tell a good enterprise RAG system from a bad one — accurate, current, properly authorized, well-cited. Evaluation (Chapter 53) is where that assumption gets formalized: how to build labeled evaluation sets, measure retrieval quality and groundedness quantitatively, and catch regressions before your users do, closing the loop this volume has been building toward since Chapter 25.
+</p>
+
+</div>
+
+</body>
+</html>
