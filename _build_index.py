@@ -264,8 +264,9 @@ def is_noise(text):
     return False
 
 def clean_text(raw):
-    # strip any inner tags, collapse whitespace
-    t = re.sub(r"<[^>]+>", "", raw)
+    # strip any inner tags (replacing with a space so e.g. "<span>JUNIOR</span>Q1." doesn't
+    # collapse into "JUNIORQ1."), collapse whitespace
+    t = re.sub(r"<[^>]+>", " ", raw)
     t = html.unescape(t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
@@ -280,6 +281,7 @@ def read_minutes(raw_html):
     return max(1, round(len(words) / WORDS_PER_MIN))
 
 chapters = []
+search_index = []
 
 for group_idx, (group_name, nums) in enumerate(GROUPS):
     track_name = TRACK_OF_GROUP[group_idx]
@@ -305,6 +307,24 @@ for group_idx, (group_name, nums) in enumerate(GROUPS):
         # sequential id -> fully idempotent: same output on every run.
         new_content = re.sub(r"<h1[^>]*>(.*?)</h1>", repl, content, flags=re.DOTALL)
 
+        qcounter = {"n": 0}
+        questions = []
+
+        def qrepl(m):
+            qcounter["n"] += 1
+            qid = "q%d" % qcounter["n"]
+            inner = m.group(1)
+            questions.append({"id": qid, "text": clean_text(inner)})
+            return '<div class="question" id="%s">%s</div>' % (qid, inner)
+
+        # every chapter's "question" divs (the interview-handbook Q&A blocks, and the
+        # embedded mini Q&A in the 16-section AI textbook chapters alike) get the same
+        # sequential-id treatment, so the global search index can deep-link to one.
+        # Match with or without an existing id (same idempotency trick as the <h1> pass
+        # above) -- otherwise a second run, finding ids already stamped, matches nothing
+        # and silently regenerates an empty search index.
+        new_content = re.sub(r'<div class="question"[^>]*>(.*?)</div>', qrepl, new_content, flags=re.DOTALL)
+
         if new_content != content:
             with open(path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(new_content)
@@ -319,6 +339,7 @@ for group_idx, (group_name, nums) in enumerate(GROUPS):
                 continue
             subs.append(s)
 
+        chapter_idx = len(chapters)
         chapters.append({
             "num": num,
             "trackSlug": slug,
@@ -330,7 +351,17 @@ for group_idx, (group_name, nums) in enumerate(GROUPS):
             "readMins": read_minutes(content),
         })
 
+        # global search index: one [chapterIdx, questionId, text] triple per question,
+        # across every chapter/track -- compact arrays (not objects) keep the embedded
+        # payload smaller than repeating key names ~3-4k times.
+        for q in questions:
+            text = q["text"]
+            if len(text) > 240:
+                text = text[:240].rstrip() + "…"
+            search_index.append([chapter_idx, q["id"], text])
+
 DATA = json.dumps(chapters, ensure_ascii=False)
+SEARCH_DATA = json.dumps(search_index, ensure_ascii=False)
 
 # ---- render handbook.html (shell only -- chapter content is fetched on demand) ----
 # handbook.html used to inline every chapter's <body> at build time. Now it ships
@@ -342,12 +373,13 @@ with open(os.path.join(ROOT, "_handbook_template.html"), "r", encoding="utf-8") 
     hb_template = fh.read()
 
 hb = hb_template.replace("var CHAPTERS = [];", "var CHAPTERS = " + DATA + ";", 1)
+hb = hb.replace("var SEARCH_INDEX = [];", "var SEARCH_INDEX = " + SEARCH_DATA + ";", 1)
 hb = hb.replace("{{CHAPTER_COUNT}}", str(len(chapters)), 1)
 with open(os.path.join(ROOT, "handbook.html"), "w", encoding="utf-8", newline="\n") as fh:
     fh.write(hb)
 
 total_subs = sum(len(c["sections"]) for c in chapters)
-print("Chapters: %d, total sub-sections: %d" % (len(chapters), total_subs))
+print("Chapters: %d, total sub-sections: %d, indexed questions: %d" % (len(chapters), total_subs, len(search_index)))
 print("Generated: handbook.html (single-file, mobile-friendly)")
 for c in chapters:
     print("  %s/%-2s  %-32s  %2d sections  [%s]" % (c["trackSlug"], c["num"], c["title"], len(c["sections"]), c["file"]))
