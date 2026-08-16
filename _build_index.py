@@ -64,6 +64,7 @@ TRACKS = [
         ("Enterprise AI Engineering", ["64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75"]),
         ("AI Production Projects", ["76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87"]),
         ("Advanced & Specialized Topics", ["88", "89", "90", "91", "92", "93"]),
+        ("AI Engineer Interview Question Bank", ["94", "95", "96", "97", "98", "99"]),
     ]),
 ]
 
@@ -171,6 +172,12 @@ TITLES = {
         "91": "LLMOps & Model Lifecycle Management",
         "92": "Responsible AI, Safety & Ethics",
         "93": "AI Engineer Behavioural & Career Interview",
+        "94": "AI & Machine Learning Fundamentals Interview Questions",
+        "95": "Deep Learning, Transformers & Attention Interview Questions",
+        "96": "Prompt Engineering, RAG & Embeddings Interview Questions",
+        "97": "AI Agents, Tool Calling & MCP Interview Questions",
+        "98": "Spring AI & Production AI Engineering Interview Questions",
+        "99": "LLMOps, Fine-Tuning & Safety Interview Questions",
     },
     "java": {
         "01": "Introduction & HR",
