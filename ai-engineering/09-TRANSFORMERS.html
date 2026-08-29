@@ -586,6 +586,556 @@ The Transformer architecture itself has a genuinely narrow direct security surfa
 <p>Self-attention has no architectural concept of "trusted instruction" versus "untrusted data" — every token in the context window, whether it came from a system prompt, a retrieved document, or raw user input, is mechanically eligible to influence every other token's representation and thus the model's eventual output. This means any untrusted text reaching the model is a potential vector for hijacking its behavior, and no amount of prompting alone can create a hard boundary the architecture does not have. For a platform team, the implication is that trust boundaries must be enforced structurally outside the model: privilege separation for tool-calling permissions, strict validation of anything the model is allowed to act on, sandboxing of consequential actions, and treating model output as untrusted input to downstream systems rather than as a trusted instruction in its own right — architecture-level guardrails, not prompt-level ones.</p>
 </div>
 
+<div class="question" id="q10"><span class="level">MID</span>Q10. Walk through the scaled dot-product attention formula step by step, stating what each matrix's dimensions represent.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>For a sequence of length n, Q is an (n × d_k) matrix of Query vectors, K is an (n × d_k) matrix of Key vectors, and V is an (n × d_v) matrix of Value vectors — one row per token. Computing Q·Kᵗ produces an (n × n) matrix of raw match scores, one score per pair of tokens. Dividing by √d_k rescales those scores. Applying softmax row-wise turns each row into a probability distribution over which other tokens to attend to. Multiplying that (n × n) weight matrix by V produces the final (n × d_v) output — one new, context-blended vector per token, matching the original per-token layout so it can flow into the next sublayer.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">SENIOR</span>Q11. Derive why attention scores are scaled specifically by 1/√d_k rather than left unscaled or scaled by some other factor.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High</p>
+<div class="answer">
+<p>Assume each component of Q and K is drawn independently with mean 0 and variance 1 (a reasonable approximation after initialization and normalization). The dot product of two d_k-dimensional vectors is a sum of d_k independent products, so its variance is approximately d_k · Var(q_i·k_i) ≈ d_k. That means the standard deviation of raw dot-product scores grows as √d_k as the head dimension increases. Left unscaled, scores for a larger d_k would routinely be large in magnitude, and feeding large-magnitude values into softmax pushes it into a saturated regime where one score dominates and the rest receive gradients close to zero — softmax becomes nearly a hard argmax, and the surrounding weight matrices stop receiving a useful training signal. Dividing every score by √d_k renormalizes the variance back to roughly 1 regardless of head dimension, keeping softmax in a well-behaved, gradient-friendly regime.</p>
+<pre><code>Var(Q·K) = Var(Σ q_i·k_i) ≈ d_k · Var(q_i·k_i) ≈ d_k
+StdDev(Q·K) ≈ √d_k
+scaled score = (Q·K) / √d_k  →  variance renormalized to ≈ 1</code></pre>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly name the failure mode — "softmax saturation causing vanishing gradients" — rather than just saying "for numerical stability." Interviewers at senior level are listening for whether you understand the mechanism, not just the vocabulary.</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. What do d_model, d_k, and h (number of heads) represent, and how are they typically related?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>d_model is the width of the vector representing each token as it flows through the model — the model's overall working dimension. h is the number of attention heads run in parallel inside a multi-head attention sublayer. d_k (and typically d_v) is the dimension of the Query/Key (and Value) vectors inside a single head. Most architectures choose d_k = d_model / h, so that the concatenated output of all h heads is exactly d_model wide again, letting attention sublayers be stacked without changing the model's working width at any point.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">SENIOR</span>Q13. At a conceptual level, how does backpropagation flow through the softmax and matrix multiplications inside self-attention?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Gradients flow backward through exactly the same chain the forward pass built: from the loss, back through the final weighted-sum matmul (attention weights × V) to get gradients with respect to both the attention-weight matrix and V; then back through softmax, whose local Jacobian has the classic form diag(p) − p·pᵗ for a probability vector p, which is what lets a change in any one raw score influence every output weight in that row (since softmax couples all entries in a row together); then back through the scaling and the Q·Kᵗ matmul to get gradients with respect to Q and K; and finally back through the linear projections (W_Q, W_K, W_V) to update those learned weights. Nothing here is architecturally special — it is the same chain-rule machinery from the Neural Networks chapter — but the softmax coupling is worth being able to state explicitly, since it's the step most candidates wave their hands past.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">MID</span>Q14. What is the time and memory complexity of a single self-attention layer in terms of sequence length n and model dimension d?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High</p>
+<div class="answer">
+<p>Computing Q·Kᵗ and the subsequent weighted sum with V costs O(n²·d) time, and materializing the attention score matrix costs O(n²) memory (per head, before summing/concatenating across heads). The linear projections that produce Q, K, and V, and the output projection, each cost O(n·d²) time and O(n·d) memory. For short-to-moderate sequences where n is smaller than d, the O(n·d²) projection cost can dominate; once n grows large enough, the O(n²·d) attention term dominates — this crossover point is exactly what Q15 explores.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">STAFF</span>Q15. Compare the per-token computational cost of the attention sublayer versus the feed-forward sublayer as sequence length grows — at what point does attention dominate total cost?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The feed-forward sublayer's cost scales as O(n·d²) — linear in sequence length, quadratic in model width — because it applies the same per-token transformation independently to every position. The attention sublayer's cost scales as O(n²·d) — quadratic in sequence length, linear in model width. Setting these roughly equal (n·d² ≈ n²·d) shows the crossover happens around n ≈ d: when sequence length is much shorter than model width (a common regime for chat-sized prompts against models with d in the thousands), the feed-forward sublayers actually dominate total compute, and attention is a comparatively minor cost. Once sequence length grows past model width — tens of thousands of tokens against a d_model in the few-thousands — attention's quadratic term takes over and becomes the dominant cost. This is the concrete, numeric justification for why attention-efficiency work (FlashAttention, sparse/windowed attention) matters disproportionately for long-context serving specifically, and is a comparatively low priority for short-prompt workloads.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">MID</span>Q16. How exactly is causal masking implemented mathematically inside scaled dot-product attention?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High</p>
+<div class="answer">
+<p>Before softmax is applied, an additive mask is added to the raw (scaled) score matrix: positions that should be disallowed — every position j that comes after the current position i — get a very large negative number (conceptually −∞) added to their score, while allowed positions get 0 added. Once softmax is applied, e^(−∞) collapses to essentially 0, so disallowed future positions receive effectively zero attention weight without ever needing a separate conditional branch in the computation — the masking is folded directly into the same matrix arithmetic as the rest of attention, which is exactly why it can be computed as efficiently as unmasked attention on parallel hardware.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">JUNIOR</span>Q17. What is the difference between self-attention and cross-attention?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>In self-attention, the Query, Key, and Value vectors are all derived from the same sequence — tokens attend to other tokens within the same set. In cross-attention, the Query comes from one sequence (typically a decoder's current hidden states) while the Key and Value come from a different sequence entirely (typically an encoder's output), letting one sequence pull relevant information from another rather than from itself.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">SENIOR</span>Q18. Walk through how cross-attention works mechanically in an encoder-decoder Transformer such as the original translation architecture or T5.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The encoder processes the full source sequence once, bidirectionally, producing a final set of encoder output vectors. Every decoder layer contains a dedicated cross-attention sublayer, distinct from its causal self-attention sublayer, in which the decoder's current hidden states are projected into Queries while the encoder's output vectors are projected into Keys and Values. This lets each decoder position, at every layer, directly pull in whichever parts of the source sequence are most relevant to what it is generating right now, and because the encoder's Keys and Values are computed once and reused at every decoding step, they do not need to be recomputed as generation proceeds — only the decoder's own causal self-attention and cross-attention Queries change per step.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">MID</span>Q19. Attention is often described as a "differentiable soft lookup." What does that mean, and how does it contrast with a hard, discrete key-value lookup like a hash map?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A hash map lookup retrieves exactly one value for an exact key match, with no notion of partial relevance and no gradient — a lookup either hits or misses. Attention instead retrieves a weighted blend of every Value in the sequence, where the weights are a smooth function (softmax over scaled dot products) of how well each Key matched the Query. Because that weighting function is differentiable everywhere, gradients can flow back through the whole retrieval process, letting the model learn — via ordinary gradient descent — which kinds of Query/Key alignment should be treated as more or less relevant, which is precisely why attention can be trained end-to-end as part of a single loss function rather than needing a separately engineered retrieval step.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">MID</span>Q20. Give the exact matrix mechanics of splitting d_model into h attention heads inside multi-head attention.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The input (n × d_model) matrix is projected through three learned weight matrices W_Q, W_K, W_V (each d_model × d_model) to produce full-width Q, K, V matrices. Each of those is then reshaped from (n × d_model) into (n × h × d_k), where d_k = d_model / h, and transposed so that h behaves like an extra batch dimension — effectively giving h independent (n × d_k) Q, K, V triples. Scaled dot-product attention (Section 6) is computed independently and in parallel for each of the h heads. The h resulting (n × d_v) outputs are concatenated back into a single (n × d_model) matrix and passed through one more learned output projection W_O (d_model × d_model) to produce the sublayer's final output.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">SENIOR</span>Q21. Why do several smaller-dimension attention heads tend to outperform one large single-head attention computation?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>A single attention computation produces exactly one probability distribution per token over "who to attend to," which forces every kind of relevant relationship — syntactic, coreferential, positional, topical — to be superimposed into one shared weighting. With multiple heads, each has its own independently learned Q/K/V projections operating in its own lower-dimensional subspace, so gradient descent is free to push different heads toward specializing in different relational patterns without any one head having to represent all of them at once. This is not manually assigned — no engineer tells head 3 to track subject-verb agreement — it emerges because splitting the representational capacity into independent subspaces gives optimization more places to differentiate specialized, non-redundant behavior, similar in spirit to why splitting capacity across multiple filters in a convolutional layer captures more diverse features than one wide filter.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">JUNIOR</span>Q22. Can you literally inspect what an attention head is "looking at," and how reliable is that as an explanation of model behavior?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes — attention weights are just numbers, so you can visualize, for a given input, how much weight one token's Query places on every other token's Key, for any specific head and layer. In shallow layers this sometimes lines up neatly with human-interpretable patterns (a head that mostly attends to the previous token, or to a matching pronoun). But this should be treated as a useful diagnostic signal, not a guaranteed causal explanation: many heads' behavior does not decompose into one clean human-nameable function, heads can jointly encode a pattern that no single head reveals alone, and high attention weight on a token does not always mean that token was the actual causal driver of the output — a caution worth stating explicitly rather than overclaiming interpretability.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">SENIOR</span>Q23. What does research on attention head pruning suggest about redundancy in multi-head attention, and why does it matter for efficient inference?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Empirical pruning studies (e.g., Michel et al.) have shown that a substantial fraction of attention heads in a trained Transformer can be removed at inference time with only a small drop in task quality, and in some cases removing a head even helps slightly — evidence that trained models learn meaningfully redundant heads rather than every head carrying equally unique, load-bearing information. Practically, this motivates structured pruning as a model-compression technique for efficient serving: rather than uniformly shrinking every layer, an engineering team can measure each head's actual contribution on representative traffic and remove the lowest-value ones, recovering inference speed and memory with a controlled, measured quality trade-off instead of guessing.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">STAFF</span>Q24. When designing a new Transformer-based architecture, what factors drive the choice of number of heads (h) and per-head dimension (d_k)?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Several forces pull on this decision simultaneously. Empirically, per-head dimensions in the range of roughly 64–128 have repeatedly worked well across many model families, suggesting a practical floor below which a head has too little capacity to be useful and a ceiling above which extra per-head width stops paying for itself. Hardware efficiency also matters directly: GPU tensor cores execute matrix multiplications most efficiently at certain dimension multiples (e.g., 8, 16, 64), so d_k is often chosen to align with those shapes rather than an arbitrary number. Finally, this choice is not just a quality knob — since KV cache memory (Section 8, and Q70) scales directly with the number of KV heads, a team designing for large-batch, long-context inference has a strong incentive to consider fewer, shared KV heads (grouped-query or multi-query attention, Q25–27) even if a "more heads, more specialization" argument would otherwise favor a larger h — the decision is jointly a modeling-quality decision and a serving-cost decision, and treating it as purely the former is a common design mistake.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. What is Multi-Query Attention (MQA), and how does it differ from standard multi-head attention?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>In standard multi-head attention, every head has its own independent Query, Key, and Value projections. In Multi-Query Attention, the Query projections remain separate per head (so the model still gets multiple independent "views" for matching), but all heads share a single Key and single Value projection. This means the KV cache only needs to store one Key/Value pair per token per layer instead of h pairs, dramatically shrinking KV cache memory — at some cost to model quality, since the heads lose the ability to look at content through independently specialized Key/Value lenses, only through independently specialized Query lenses.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">SENIOR</span>Q26. What is Grouped-Query Attention (GQA), and why did models like Llama 2 and Llama 3 adopt it over plain MQA?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>GQA sits between standard multi-head attention and MQA: query heads are split into g groups, and each group shares one Key/Value head, rather than every query head having its own K/V head (full MHA, g = h) or all query heads sharing a single K/V head (MQA, g = 1). This gives an explicit knob to trade quality against KV cache memory: a larger g preserves more of MHA's representational richness at the cost of more cache memory, while a smaller g approaches MQA's memory savings at the cost of more shared, less specialized K/V representations. Llama 2/3 adopted GQA specifically because, at the scale and context lengths they target, full MHA's KV cache cost was too high for efficient large-batch, long-context serving, but plain MQA's quality cost was judged too steep — GQA recovers most of MHA's quality while still delivering most of MQA's memory savings, which is why it became the default choice for large open-weight decoder-only models rather than either extreme.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Frame GQA as a serving-cost decision made visible in the architecture itself — it is one of the clearest examples of an inference-serving concern (KV cache memory) directly shaping a pretraining-time architectural choice, which is exactly the kind of cross-layer reasoning staff-level interviewers are probing for.</div>
+
+<div class="question" id="q27"><span class="level">SENIOR</span>Q27. Quantify, with a formula, how much KV cache memory GQA and MQA save relative to standard multi-head attention.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>KV cache size per token per layer is proportional to the number of distinct Key/Value heads actually stored. For standard MHA with h heads, that is proportional to h · d_k. For GQA with g groups, it is proportional to g · d_k. For MQA, it is proportional to 1 · d_k. So GQA's memory savings relative to full MHA is simply a factor of h/g, and MQA's savings is a factor of h. For a concrete example, a model with h = 32 query heads using GQA with g = 8 groups stores only 8 K/V heads instead of 32 — a 4× reduction in KV cache memory — while a query head count of 32 collapsed all the way to MQA's single shared K/V head would give a 32× reduction, at a correspondingly larger quality risk.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">JUNIOR</span>Q28. Recap: what problem does positional encoding solve, and what are the three broad families of solutions?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Raw self-attention is permutation-invariant — it has no built-in notion of which token came first — so positional information has to be injected deliberately. The three broad families are: absolute positional encodings (a vector determined only by a token's position, either fixed by a formula like sinusoidal encoding, or learned as an embedding table indexed by position); relative positional encodings (which represent the offset between two positions rather than their absolute location); and rotation/bias-based schemes like RoPE and ALiBi, which inject position information directly into the attention computation itself rather than into the token's input embedding.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. Derive, at a working level, the sinusoidal positional encoding formula and explain why it uses varying frequencies.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The original Transformer defines, for position <code>pos</code> and dimension index <code>i</code> within the embedding: even dimensions use sine and odd dimensions use cosine, each at a frequency that decreases as the dimension index grows. Concretely:</p>
+<pre><code>PE(pos, 2i)   = sin( pos / 10000^(2i/d_model) )
+PE(pos, 2i+1) = cos( pos / 10000^(2i/d_model) )</code></pre>
+<p>Each dimension pair oscillates at a different frequency — low dimension indices oscillate quickly (changing a lot between adjacent positions, useful for distinguishing nearby positions), while high dimension indices oscillate very slowly (changing little across many positions, useful for distinguishing coarse, far-apart regions of the sequence). Using both sine and cosine at each frequency also means that the encoding for position (pos + k) can be expressed as a fixed linear transformation of the encoding for position pos — a trigonometric identity property the original authors argued would make relative-position relationships easier for the model to learn, even though the encoding is nominally absolute.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">SENIOR</span>Q30. Why should sinusoidal positional encodings, in theory, generalize to sequence lengths longer than any seen in training, and why does that fail in practice?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The sinusoidal formula is defined for any real-valued position, not just positions the model happened to see during training, so mathematically you can always compute a well-defined encoding for position 50,000 even if training only ever used sequences up to 2,000 tokens. In practice, extrapolation degrades anyway, because generalization requires more than "the input vector is well-defined" — it requires the rest of the network (the attention and feed-forward weights) to behave sensibly when they encounter position-encoding patterns and content interactions unlike anything reinforced during training. The model's learned Q/K projections become tuned to the range of positional patterns actually observed, so novel combinations at much longer lengths fall outside the distribution the weights were optimized for, producing degraded attention behavior even though the input encoding itself remains numerically valid. This gap between "mathematically defined" and "actually well-generalizing" is exactly what motivates the length-extension techniques covered later in this section (Q33–37).</p>
+</div>
+
+<div class="question" id="q31"><span class="level">MID</span>Q31. What are learned absolute positional embeddings, as used in models like BERT and GPT-2, and what is their key limitation compared to sinusoidal encodings?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Instead of computing position encodings from a fixed formula, the model has a learned embedding table with one row per position, up to some fixed maximum sequence length, trained end-to-end just like token embeddings. The key limitation is a hard cutoff: there is simply no row in the table for any position beyond the trained maximum, so there is no well-defined way to represent — let alone generalize to — a longer sequence at all, whereas a sinusoidal formula is at least mathematically defined (if not reliably useful) for arbitrary positions beyond the trained range.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">SENIOR</span>Q32. What is relative positional encoding, and why might modeling the offset between two positions be preferable to modeling absolute position?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Relative positional encoding (as used in Transformer-XL and as the relative position bias in T5) represents, for a pair of tokens at positions i and j, a learned or computed value that depends only on the offset (i − j), rather than on i and j's absolute values. Linguistically, what usually matters is how far apart two tokens are, not which absolute slot in the sequence they happen to occupy — "the noun two words to my left" means the same grammatical thing whether it occurs at position 5 or position 5,005. Encoding the offset directly means the same learned relative pattern is reused correctly no matter where in the sequence it occurs, which both reduces the number of distinct patterns the model has to learn and naturally supports sequences longer than any specific absolute position seen in training, since offsets between nearby tokens recur constantly regardless of overall sequence length.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">STAFF</span>Q33. Derive, at a mechanism level, how Rotary Positional Embeddings (RoPE) encode position by rotating Query and Key vectors.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High at senior/staff level</p>
+<div class="answer">
+<p>RoPE treats each pair of dimensions in a Query or Key vector as a 2D coordinate and rotates that coordinate by an angle proportional to the token's position: position m's vector is rotated by angle m·θ (for some fixed base frequency θ per dimension pair, analogous to the varying frequencies in sinusoidal encoding). Crucially, rotation matrices compose: rotating vector A by angle a and vector B by angle b, then taking their dot product, is mathematically equivalent to taking the dot product of the original (unrotated) A and B after rotating one of them by the difference (b − a). Applied to attention, this means the dot product between a rotated Query at position m and a rotated Key at position n depends only on the relative offset (m − n), not on the absolute values of m and n individually — position information is injected directly into the attention score computation itself, through pure geometry, rather than being added to the token's input embedding beforehand as sinusoidal and learned encodings do.</p>
+</div>
+
+<div class="question" id="q34"><span class="level">SENIOR</span>Q34. Write out RoPE's 2D rotation math explicitly and show why the resulting Query-Key dot product depends only on relative position.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<pre><code>Rotation matrix for angle φ:
+R(φ) = [ cos φ   −sin φ ]
+       [ sin φ    cos φ ]
+
+Rotated query at position m:  q'_m = R(mθ) · q
+Rotated key at position n:    k'_n = R(nθ) · k
+
+Dot product: q'_m · k'_n = qᵗ · R(mθ)ᵗ · R(nθ) · k
+                          = qᵗ · R(nθ − mθ) · k      (rotation composition property)
+                          = qᵗ · R((n − m)θ) · k</code></pre>
+<p>The last line is the key result: after expanding the matrix multiplications, the rotated dot product depends on m and n only through their difference (n − m), never through their absolute values. This is exactly the "relative position injected geometrically" property claimed in Q33 — every pair of tokens with the same relative offset produces the same rotational relationship between their Query and Key, regardless of where that pair sits in the overall sequence.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. What is ALiBi (Attention with Linear Biases), and how does it differ mechanically from RoPE?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>ALiBi does not rotate or modify Query and Key vectors at all. Instead, it adds a static, position-dependent penalty directly to the raw attention scores after Q·Kᵗ but before softmax: for a pair of positions i and j, the penalty is proportional to the distance |i − j|, scaled by a slope that differs per attention head (some heads penalize distance heavily, favoring very local attention; others penalize it lightly, allowing more long-range attention). There is no learned or rotated position representation at all — just a fixed, monotonically increasing bias against attending to farther-away tokens, baked directly into the score matrix.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">SENIOR</span>Q36. Compare RoPE and ALiBi specifically on long-context extrapolation — which handles sequence lengths beyond training better, and why?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>ALiBi was explicitly designed and evaluated for "train short, test long" extrapolation, and its simple, monotonic distance penalty tends to degrade gracefully at lengths well beyond training, since the underlying mechanism (penalize far-away tokens more) remains sensible regardless of how far "far away" actually gets. RoPE alone, without any additional adjustment, tends to extrapolate poorly past its trained length — the rotational patterns at very large position differences fall into angle ranges the model's weights never learned to handle well, producing degraded attention behavior. In practice, however, RoPE has become the dominant choice in modern large-scale LLMs because it tends to produce better quality at the lengths a model is actually trained and evaluated on, and the extrapolation gap is addressed separately through explicit RoPE-scaling techniques (Q37) rather than by abandoning RoPE for ALiBi.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">STAFF</span>Q37. A model trained with a 4K-token context needs to reliably serve 32K-token contexts. Walk through the RoPE-scaling techniques available and their trade-offs.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Position Interpolation compresses the position indices of the longer sequence down into the range the model was originally trained on — effectively pretending position 32,000 is "position 4,000 scaled down" — which keeps the rotational angles RoPE produces within a familiar range, but typically requires some amount of continued fine-tuning at the target length to let the model adapt to the compressed spacing, and can blur fine-grained distinctions between nearby tokens. NTK-aware scaling instead adjusts RoPE's base frequency non-uniformly across dimensions, preserving high-frequency (fine-grained, local) rotational behavior for nearby tokens while compressing only the low-frequency (coarse, long-range) components, often giving better zero-shot extrapolation without fine-tuning than naive interpolation. YaRN combines interpolation-style scaling with NTK-aware frequency adjustments and an additional attention-temperature correction, generally achieving the best quality-per-context-length trade-off of the three but at the highest implementation complexity. In all cases, the trade-off is the same shape: more context length gained per unit of quality lost, purchased either with some fine-tuning cost, some quality degradation at the extended length, or both — none of these techniques is free, and a team should benchmark actual downstream task quality at the target length rather than assuming any one method "solves" long context.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Note that none of these techniques increase the amount of information the model can genuinely reason over reliably — they let the architecture accept more tokens without crashing or producing garbage, but the "lost in the middle" reliability concern from Section 11's common mistakes still applies on top of whichever scaling method is chosen.</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. Why can't you simply add more rows to a learned absolute positional embedding table at inference time to extend context length?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A learned embedding table's rows only acquire meaningful values through gradient descent during training — a row for a position the model never saw during training is either uninitialized or arbitrarily initialized, and the rest of the network's weights have never learned how to interact with whatever pattern that row happens to contain. Simply appending new rows produces vectors with no learned relationship to the model's attention or feed-forward weights, unlike RoPE or ALiBi, which are defined by a formula for any position and therefore at least produce something structurally consistent with what the model has already learned to interpret, even if quality still degrades at unfamiliar lengths (Q30, Q36).</p>
+</div>
+
+<div class="question" id="q39"><span class="level">JUNIOR</span>Q39. Name the three Transformer architecture families and one canonical model for each.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Encoder-only (bidirectional attention, built for understanding tasks) — canonical example: BERT. Decoder-only (causal, masked attention, built for autoregressive generation) — canonical example: GPT. Encoder-decoder (an encoder for the input plus a decoder that cross-attends into it) — canonical examples: T5 and BART, and the original 2017 translation architecture itself.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. What is BERT's masked language modeling (MLM) pretraining objective, and why does bidirectional attention make sense for it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>During pretraining, roughly 15% of input tokens are replaced with a special mask token (or occasionally a random or unchanged token, per the original recipe), and the model must predict the original token at each masked position using the surrounding context on both sides. Because the task is explicitly "use context from before and after the blank to fill it in," bidirectional self-attention is exactly the right tool — there is no reason to hide future tokens from the model, since the model is not being asked to generate the sequence in order, only to understand it well enough to reconstruct removed pieces.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">MID</span>Q41. What is GPT's pretraining objective, and why must it use causal masking?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>GPT is pretrained on next-token prediction: given all tokens so far, predict the next one, repeated across every position in a training sequence. Causal masking is required because the training objective must exactly match the constraint the model will face at actual generation time — at inference, later tokens genuinely do not exist yet when an earlier token is being generated. If training allowed the model to peek at future tokens while predicting the current one, it would learn to rely on information that will not be available at inference time, making the trained behavior inconsistent with the deployed behavior.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">SENIOR</span>Q42. Explain T5's span-corruption and BART's denoising pretraining objectives, and how they use the encoder-decoder structure differently from a plain translation seq2seq setup.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Rather than pairing a source sentence with an independently written target sentence (as in translation), T5 corrupts spans of a single piece of text — replacing contiguous runs of tokens with sentinel placeholders — and trains the encoder-decoder pair so the encoder processes the corrupted text bidirectionally while the decoder autoregressively reconstructs just the missing spans, cross-attending into the encoder's output at every layer. BART similarly corrupts the input (token masking, deletion, sentence permutation, and other noise types) but trains the decoder to reconstruct the entire original, uncorrupted text rather than only the missing spans. In both cases the "source" and "target" are two views of the same underlying text rather than two genuinely different texts, which lets a single large corpus of ordinary text generate its own supervised training pairs without needing parallel translation data, while still exercising the full encoder-decoder cross-attention mechanism.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">SENIOR</span>Q43. Why has the field converged so heavily on decoder-only architectures for general-purpose LLMs, even for tasks that seem to want bidirectional understanding?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>A single decoder-only architecture with one training objective (next-token prediction) can, at sufficient scale, be prompted to perform understanding-flavored tasks (classification, extraction, summarization) reasonably well through in-context instructions, rather than requiring a separate architecture and objective per task family. This dramatically simplifies training and serving infrastructure — one model, one attention pattern, one set of serving optimizations (KV cache, causal-attention kernels) rather than maintaining parallel infrastructure for encoder-style and decoder-style models. Empirically, next-token prediction at massive scale over massive data has also turned out to produce representations rich enough to substitute for a lot of what bidirectional pretraining was thought to uniquely provide, closing much of the practical gap encoder-only architectures once held for pure understanding tasks. The trade-off is that for latency- and cost-sensitive, narrowly scoped classification-style tasks, a small fine-tuned encoder-only model can still be meaningfully cheaper and faster (Q44) — decoder-only convergence is a "best general-purpose default," not evidence that encoder-only architectures no longer have a place.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">STAFF</span>Q44. A team must choose between fine-tuning a BERT-style encoder or using a decoder-only LLM for document classification under strict latency requirements. Walk through the trade-offs.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>A fine-tuned encoder-only model is typically much smaller, requires only a single forward pass (no autoregressive generation loop) to produce a classification, and can be optimized aggressively for the one task it was fine-tuned on — this combination usually gives the lowest latency and lowest cost per request, which matters directly under a strict SLA. A decoder-only LLM used via prompting avoids needing a labeled fine-tuning dataset at all and offers more flexibility if the classification taxonomy changes frequently or reasoning beyond simple pattern matching is required, but pays for that flexibility with higher per-request latency and cost, both because the underlying model is usually much larger and because even a short generated label still incurs autoregressive decoding overhead. The recommendation for a well-defined, stable classification task with available labeled data and strict latency requirements is the fine-tuned encoder-only model; the LLM-via-prompting approach is better reserved for cases with little or no labeled data, frequently changing categories, or where the classification genuinely benefits from broader world knowledge or multi-step reasoning that a small fine-tuned encoder could not capture.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">MID</span>Q45. Why can't a bidirectional encoder representation, on its own, be used directly for open-ended text generation the way a decoder-only model can?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Open-ended generation requires producing tokens one at a time, each conditioned only on what has been generated so far — exactly the constraint causal masking enforces. A bidirectional encoder's attention pattern lets every position see every other position, including ones that, in a generation setting, would not exist yet — there is no natural "generate the next token" operation defined on a representation built under the assumption that the entire input is already fully present. This is precisely why BERT-family models are used for embeddings and classification (where the full input genuinely is available upfront) while GPT-family decoder-only models are used for generation, and why encoder-decoder models keep a separate causal decoder specifically to handle the generation half of the job.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">SENIOR</span>Q46. What are Prefix-LM / UL2-style hybrid pretraining objectives, and how do they get partial bidirectionality within a decoder-style architecture?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Rather than committing entirely to full bidirectional attention (encoder-only) or full causal attention (decoder-only) across the whole sequence, a Prefix-LM allows bidirectional attention within a designated "prefix" portion of the input (so every prefix token can see every other prefix token, both before and after it) while remaining strictly causal over the "continuation" portion that must actually be generated. UL2 goes further and mixes several different corruption/objective styles (span corruption, prefix language modeling, standard next-token prediction) during pretraining within a single architecture, exposing the model to a blend of bidirectional-style and autoregressive-style training signals without maintaining two separate encoder and decoder stacks — an attempt to capture some of BERT's understanding-oriented benefits and GPT's generation-oriented benefits inside one unified model.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">MID</span>Q47. What is layer normalization, and why do Transformers use it instead of batch normalization?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Layer normalization normalizes each individual token's feature vector (subtracting its own mean and dividing by its own standard deviation across its features, then applying a learned scale and shift), independent of any other token or example in the batch. Batch normalization instead normalizes across the batch dimension for each feature, which requires stable batch statistics and running averages, and behaves inconsistently for variable-length sequences and small or single-example batches. Since Transformers routinely operate on sequences of varying length and are frequently run with batch size 1 at inference (one user's request), layer normalization's per-example independence is a much better structural fit than batch normalization's cross-example dependence.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">SENIOR</span>Q48. Explain the difference between Post-LN and Pre-LN placement in a Transformer block, and why Pre-LN became the standard for large-scale training.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>In the original 2017 Post-LN design, each sublayer's output is added to its input (the residual connection) first, and layer normalization is applied after that addition. In Pre-LN, layer normalization is applied to the sublayer's input before the sublayer transforms it, and the residual connection adds the sublayer's output to the untouched, un-normalized input. Pre-LN keeps the residual (identity) path completely free of any normalization operation along its entire length through the network, which means the raw signal being carried forward and the gradient flowing backward through that path stays much more predictably scaled across many stacked layers. Post-LN's repeated post-hoc renormalization tends to produce much larger gradient magnitudes deep in the network early in training, making training unstable unless the learning rate is warmed up very slowly and carefully. Because large-scale LLM training needs to reliably train very deep stacks without extensive per-model warmup tuning, Pre-LN became the default choice, at a mild cost — Post-LN models, when they do train successfully, sometimes reach a marginally better final quality ceiling for a given depth.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">STAFF</span>Q49. What is the precise mechanism behind why very deep Post-LN Transformers are hard to train, while Pre-LN models are comparatively robust?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>In a Post-LN block, normalization is applied after the residual addition, meaning the scale of the residual stream is repeatedly reset at every layer based on that layer's freshly computed, not-yet-well-trained output — early in training, before weights have settled into sensible ranges, this repeated rescaling can compound in ways that produce very large gradient magnitudes by the time backpropagation reaches deep layers, which is exactly the kind of gradient explosion/instability that requires a slow, carefully tuned learning-rate warmup to survive. In a Pre-LN block, normalization happens on the sublayer's input before any transformation, so the residual (identity) path itself is never touched by normalization at all — the raw sum of all sublayer outputs accumulates additively and predictably, giving backpropagation a clean, well-scaled path straight back to early layers regardless of depth, which is architecturally the same benefit residual connections give against vanishing gradients in general, just extended to also protect against normalization-induced instability specifically.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">MID</span>Q50. What is RMSNorm, and why do many modern LLMs (such as the Llama family) use it instead of standard LayerNorm?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>RMSNorm normalizes a vector by its root-mean-square magnitude alone, without first subtracting the mean, and typically without a learned additive bias term — a simplification of standard LayerNorm's mean-centering-plus-rescaling-plus-bias computation. It is adopted in many modern LLMs primarily because it is computationally cheaper (fewer operations per normalization call, which adds up across dozens of layers and billions of forward passes) while empirically performing comparably to full LayerNorm on large-scale language modeling — a case where a simpler, faster operation was found not to cost meaningful quality at the scale these models are actually trained and deployed.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. How does the choice of learning-rate warmup schedule interact with the choice between Post-LN and Pre-LN?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Post-LN models are known to be sensitive to the learning rate used very early in training, because the residual stream's scale is reset at every layer by normalization applied after immature, not-yet-well-trained sublayer outputs are added in — an aggressive learning rate applied too early can push this compounding effect into outright divergence, which is why Post-LN training recipes typically prescribe a longer, more carefully tuned warmup phase before reaching peak learning rate. Pre-LN models, because their residual path bypasses normalization entirely, tend to tolerate more aggressive learning rates and shorter warmup schedules without diverging, since the identity path's scale is not being perturbed by immature sublayer outputs in the same way. This is a concrete example of how a normalization-placement decision made at architecture-design time directly constrains what training-time hyperparameter choices are even viable.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">JUNIOR</span>Q52. What is the purpose of the residual (skip) connections wrapped around each sublayer in a Transformer block?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A residual connection adds a sublayer's input directly to its output, giving gradients a direct additive path backward through the network that does not have to pass through every intervening nonlinear transformation. This makes it practical to stack many Transformer blocks — sometimes over a hundred — without the training signal degrading as it travels back through so many layers, addressing the same class of vanishing-gradient concern raised in the LSTMs chapter, but solved here through architecture (an always-available shortcut path) rather than through learned gating.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">MID</span>Q53. What problem does FlashAttention solve — does it change the mathematical result of attention, or just how it's computed?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High</p>
+<div class="answer">
+<p>FlashAttention computes exactly the same mathematical result as standard scaled dot-product attention — the same softmax-weighted blend of Values — it does not approximate anything or change the output. What it changes is the computation strategy: standard implementations materialize the full n×n attention score matrix in GPU memory, which is slow because writing and reading that large matrix from GPU high-bandwidth memory (HBM) is the actual bottleneck on modern hardware, not the arithmetic itself. FlashAttention restructures the computation so that large matrix is never fully written out, making attention meaningfully faster and far more memory-efficient with zero accuracy trade-off — a pure engineering win rather than a quality-for-speed trade.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">SENIOR</span>Q54. Explain FlashAttention's IO-aware tiling approach — why is standard attention memory-bandwidth bound, and how does tiling avoid materializing the full score matrix?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>On modern GPUs, arithmetic throughput has grown much faster than memory bandwidth, so an operation that has to move a lot of data between slow HBM and fast on-chip SRAM, relative to how much arithmetic it does with that data, ends up bottlenecked on data movement rather than on compute — standard attention, which writes an entire n×n matrix to HBM for softmax and then reads it back for the second matmul, falls squarely into this memory-bandwidth-bound regime. FlashAttention processes Q, K, and V in small blocks that fit inside fast SRAM, computing partial attention outputs and maintaining running softmax normalization statistics incrementally (an "online softmax" that updates a running max and running sum as new blocks are processed, rather than needing the full row of scores upfront) — this lets the entire attention computation for a block be fused into one pass without ever writing the full n×n matrix out to HBM, trading a modest amount of extra recomputation for a large reduction in the actual memory traffic that was the true bottleneck.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Say explicitly that the bottleneck is memory bandwidth, not FLOPs — this is the detail that separates candidates who have internalized the roofline model of GPU performance from those reciting "FlashAttention is faster" without knowing why.</div>
+
+<div class="question" id="q55"><span class="level">STAFF</span>Q55. You must choose an attention implementation for a latency-constrained real-time service with long contexts on limited GPU memory. Walk through your decision process.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Start from the baseline that costs nothing in quality: if the serving hardware and software stack support it, FlashAttention (or an equivalent fused, IO-aware exact-attention kernel) should simply always be enabled — there is no accuracy trade-off, only an engineering integration cost, so it is the default rather than a decision point. From there, the real trade-off begins: if context lengths are long enough that even an optimized exact-attention kernel's compute and KV-cache memory become the binding constraint under the latency SLA, consider sliding-window attention (bounding per-token cost at the price of losing single-layer long-range recall, mitigated by stacking layers as in Q57) or a hybrid pattern with a few full-attention layers mixed among mostly windowed layers to retain some genuine long-range capability. Only reach for sparse or linear attention approximations if profiling shows the windowed/hybrid approach still cannot meet the latency target, and only after validating quality on your actual task's evaluation set, since these are genuine approximations to the softmax computation itself, not free engineering wins like FlashAttention — the decision should be driven by measured p95 latency and measured task-quality regression on your workload, not by reaching for the most sophisticated-sounding technique first.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">MID</span>Q56. What is sliding-window attention (as used in models like Mistral and Longformer), and what trade-off does it make?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Instead of attending to every prior token, each token attends only to a fixed-size window of nearby tokens (for example, the previous 4,096 tokens), reducing attention cost from O(n²) to O(n·w) where w is the fixed window size — linear in sequence length rather than quadratic. The trade-off is that, within a single layer, a token has no direct way to attend to something far outside its window; any influence from farther away has to propagate indirectly through multiple layers instead (Q57), which is a real, if partially mitigated, loss of the "any two positions interact in one step" property that motivated full self-attention in the first place (Section 3).</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. How can a model built from local sliding-window attention layers still model long-range dependencies across the full sequence?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Stacking multiple sliding-window layers lets information propagate transitively across layers even though no single layer can attend arbitrarily far: in layer 1, token A's information reaches token B because B is within A's window; in layer 2, token B (whose representation now carries a trace of A) reaches token C because C is within B's window; after enough stacked layers, information originating at A can reach a token far outside A's original window, indirectly, through this multi-hop relay. This mirrors, almost exactly, how stacking convolutional layers with small local kernels builds a large effective receptive field in a CNN — the per-layer operation stays local and cheap, but depth recovers a global effective reach, at the cost of that information now taking multiple layers (and therefore being processed and potentially diluted through nonlinearities) to arrive, rather than one direct attention step.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">SENIOR</span>Q58. What is BigBird's block-sparse attention pattern, and what theoretical property does it try to preserve relative to full attention?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>BigBird combines three types of attention links for each token: a local window (attending to nearby neighbors), a small set of global tokens that attend to and are attended to by every other token (acting as information hubs), and a handful of random links to otherwise-distant tokens. The paper's theoretical contribution is showing that this specific combination of sparse links is still rich enough, in a formal sense, to approximate the expressiveness guarantees of full attention (in particular, retaining Transformer's known universal-approximation and Turing-completeness-style theoretical properties) while reducing the attention computation from quadratic to linear in sequence length — the goal is a sparse pattern that is provably not merely "smaller," but structurally sufficient to still route information globally within a bounded number of hops.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. What is the core idea behind linear-attention approximations such as Linformer and Performer, and how do they reduce attention below O(n²)?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Performer approximates the softmax similarity kernel itself using random feature maps (a kernel-approximation technique from classical machine learning), which allows the attention computation to be reorganized algebraically so that it never needs to form the explicit n×n score matrix — instead computing a mathematically equivalent (approximate) result via a sequence of smaller matrix products, achieving roughly linear cost in sequence length. Linformer takes a different route, projecting the sequence-length dimension of the Key and Value matrices down to a fixed, smaller size using a learned low-rank projection, under the empirical assumption that the true attention matrix for real data is often approximately low-rank, so most of its information can be preserved in a much smaller representation. Both approaches trade an exact softmax computation for an approximate one in exchange for sub-quadratic cost, which distinguishes them fundamentally from FlashAttention (an exact reformulation) and from sparse attention (an exact computation over a restricted, structured set of pairs).</p>
+</div>
+
+<div class="question" id="q60"><span class="level">STAFF</span>Q60. What quality trade-off have engineering teams generally observed when substituting linear-attention approximations for full softmax attention, and why hasn't linear attention replaced quadratic attention in top-tier LLMs?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>In practice, linear-attention approximations have generally underperformed exact softmax attention on language-modeling quality at comparable parameter scale, with the gap often most visible on tasks that require sharp, precise retrieval of a specific fact or token from far back in context — exactly the kind of "needle in a haystack" behavior that softmax's ability to concentrate almost all of its weight on one or two highly relevant tokens seems to support well, and that a lower-rank or kernel-approximated attention pattern tends to smear out. This is the main reason top-tier production LLMs have largely stuck with exact (but hardware-optimized) quadratic attention plus complementary mitigations — FlashAttention for speed, GQA/MQA for KV-cache memory, sliding-window or hybrid layers for very long contexts — rather than switching wholesale to a linear-attention approximation: the exactness of softmax attention appears to matter disproportionately for the specific quality properties users and evaluations reward in language models, even though the asymptotic cost argument for linear attention is, on paper, very attractive.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">MID</span>Q61. What is the core idea behind Reformer's LSH (locality-sensitive hashing) attention?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>Locality-sensitive hashing is used to bucket Query and Key vectors so that vectors likely to be similar (and therefore likely to produce a large attention score) end up hashed into the same bucket with high probability. Attention is then only computed within each bucket rather than against every token in the sequence, approximating full attention while reducing the number of pairwise comparisons needed. The trade-off is that the hashing is probabilistic — a genuinely relevant token can occasionally hash into a different bucket and simply be missed by that attention computation, an approximation risk that full or exact-sparse attention patterns do not carry in the same way.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">JUNIOR</span>Q62. In one sentence, why isn't a bigger context window ever truly "free," even with efficient attention variants?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Efficient attention variants reduce the compute and memory cost of the attention computation itself, but the KV cache still has to store information proportional to context length, and every other part of the pipeline (more tokens to embed, more tokens for the feed-forward sublayers to process, more tokens billed by the provider) still scales with context length regardless of which attention algorithm is used underneath.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. Along the axis of "approximate versus exact," compare hardware-optimized exact attention (FlashAttention), structured sparse attention, and kernel-approximated linear attention — when is each the right engineering choice?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>FlashAttention is exact in both senses — it computes the identical output as standard attention and makes no assumption about which token pairs matter — so it should essentially always be enabled when hardware/software support exists, since there is no downside to weigh. Structured sparse attention (windowed, block-sparse) is exact within a deliberately restricted set of allowed token pairs — it does not approximate the softmax computation itself, but it does assume, as a modeling choice, that most useful information flow can happen through a specific structured pattern (locality plus a few global hubs), which is the right choice when you have domain reason to believe long-range, all-pairs attention is rarely needed at every layer. Kernel-approximated linear attention approximates the softmax function itself for every pair of tokens, making the fewest structural assumptions about which pairs matter but the most assumptions about how closely an approximate kernel can track true softmax behavior — it is the riskiest and most general-purpose of the three, appropriate only after empirical validation shows the approximation does not hurt your specific task's quality.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">STAFF</span>Q64. What is Ring Attention (sequence parallelism), and how does it let extremely long contexts be processed across multiple GPUs?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>When a sequence (and its associated Key/Value tensors) is too large to fit in a single GPU's memory, Ring Attention partitions the sequence into contiguous blocks, assigns each block (and its local Query/Key/Value) to a different GPU, and arranges the GPUs in a logical ring. Each device computes attention between its local Query block and whichever Key/Value block it currently holds, then passes that Key/Value block to the next device in the ring while receiving the previous device's block — after enough rotations around the ring, every Query block has been compared against every Key/Value block, reproducing full (or windowed) attention over a sequence far larger than any single device's memory could hold. The cost that replaces the original memory constraint is inter-GPU communication bandwidth and latency, which becomes the new bottleneck to engineer around, rather than any single device's HBM capacity.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">JUNIOR</span>Q65. In one sentence each: why is self-attention O(n²), and name one mitigation technique.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Self-attention is O(n²) because every token's Query must be compared against every other token's Key, producing a number of pairwise comparisons that grows with the square of sequence length; one common mitigation is sliding-window attention, which bounds the comparisons per token to a fixed-size local neighborhood instead of the whole sequence.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">MID</span>Q66. List at least four distinct classes of mitigation for the quadratic attention cost problem.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>(1) Hardware-efficient exact computation, such as FlashAttention, which reduces memory traffic without changing the math. (2) Structured sparsity, such as sliding-window or block-sparse attention, which restricts which token pairs are computed at all. (3) Kernel/low-rank approximation, such as Performer or Linformer, which approximates the softmax computation itself at sub-quadratic cost. (4) Architectural reduction of KV-head count, such as grouped-query or multi-query attention, which does not reduce attention's compute complexity but substantially reduces the memory cost of caching Keys and Values. A fifth, often more impactful class worth naming is simply reducing effective sequence length in the first place — through retrieval, summarization, or chunking — rather than making the attention mechanism itself cheaper.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. Why doesn't optimizing the attention computation alone fully solve long-context serving cost — what other component also scales with context length?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The KV cache is a separate, independent cost axis from the attention computation itself: even a hypothetically free attention algorithm would still need to store a Key and Value vector for every past token, in every layer, for every active conversation, and that storage grows linearly with context length regardless of how cheaply the attention scores are computed from it. This is exactly why grouped-query/multi-query attention (which shrinks how much must be cached) and KV-cache quantization (which shrinks how many bytes each cached value takes) are treated as a complementary, orthogonal optimization axis alongside attention-algorithm improvements like FlashAttention — solving compute cost and solving memory cost are two separate engineering problems that happen to both stem from the same underlying quadratic-attention/growing-context reality.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">STAFF</span>Q68. Design a cost-efficient long-context RAG serving stack for a support chatbot with a multi-million-document index and a p95 latency target under two seconds, on a constrained budget.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Chunk the document corpus at a moderate granularity that balances retrieval precision against prefill cost — chunks too small lose context, chunks too large waste tokens on irrelevant material within a retrieved chunk. Index chunk embeddings in an approximate-nearest-neighbor structure (such as an HNSW-based vector index) for fast retrieval at scale, and add a lightweight reranking step over the top candidates before final selection, since a cheap reranker meaningfully improves precision without the cost of running the full generation model over excess candidates. Cap the assembled context fed to the model well below its maximum window — favoring a small number of highly relevant chunks over maximizing how much fits — both to control prefill cost directly (Section 6.3's quadratic scaling) and to avoid the "lost in the middle" reliability degradation from Section 11. Choose a serving model and stack that supports GQA (to shrink KV cache) and FlashAttention (to shrink prefill compute and memory traffic), served through an inference platform that does continuous batching and PagedAttention-style KV-cache management (Q76, Q74) to keep GPU utilization high across concurrent users. Cache frequent or repeated query/document combinations where the product's usage pattern allows it. The single biggest cost and latency lever in this whole system is almost always retrieval quality — spending engineering budget on better chunking, embeddings, and reranking to shrink the number of tokens that need to reach the model at all typically beats spending the same budget on supporting a wider context window.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">JUNIOR</span>Q69. What exactly does the KV cache store — is there one cache for the whole model, or one per layer?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The KV cache stores the Key and Value vectors produced for every token processed so far, separately for every attention head in every layer — not one global cache, but effectively one cache per layer (and, within a layer, organized per KV head). This is necessary because each layer has its own independently learned Key/Value projection weights, so the Key and Value vectors a token produces at layer 3 are entirely different numbers from the Key and Value vectors that same token produces at layer 12, and both must be retained for every future decoding step that needs to attend back to that token at that specific layer.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">MID</span>Q70. Derive the formula for total KV cache memory in terms of number of layers, heads, head dimension, sequence length, precision, and batch size.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<pre><code>KV cache memory =
+    2  (K and V)
+  × L  (number of layers)
+  × h  (number of KV heads — h for MHA, g for GQA, 1 for MQA)
+  × d_k (dimension per head)
+  × n  (current sequence length)
+  × b  (bytes per value — 2 for FP16/BF16, 1 for INT8)
+  × B  (batch size / number of concurrent sequences)</code></pre>
+<p>Every factor in this formula is a direct multiplier on memory, which is why reducing any one of them — fewer KV heads via GQA/MQA, lower precision via KV-cache quantization, or simply capping n via context management — produces a proportional, predictable reduction in serving memory, and why doubling either the number of concurrent users (B) or the average conversation length (n) has an equally direct, linear impact on total memory required.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. Using the KV cache memory formula, estimate the cache size for a 70B-class model (80 layers, 64 heads, head dimension 128) at an 8K-token context, FP16, batch size 1 — and explain why this can rival or exceed model-weight memory.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<pre><code>2 × 80 × 64 × 128 × 8192 × 2 bytes × 1
+= 2 × 80 = 160
+160 × 64 = 10,240
+10,240 × 128 = 1,310,720
+1,310,720 × 8,192 ≈ 10,737,418,240
+10,737,418,240 × 2 bytes ≈ 21.5 GB</code></pre>
+<p>Roughly 21.5 GB just for the KV cache of a single 8K-context conversation at batch size 1 — before accounting for the model's own weights (which, for a 70B-parameter model at FP16, is itself around 140 GB, but crucially that weight memory is fixed and shared across every concurrent request, while KV cache memory scales per request). The practical implication is that at long context lengths and meaningful batch sizes, KV cache memory — not model weight memory — is frequently the actual constraint that determines how many concurrent users a given amount of GPU memory can serve, which is exactly why GQA, KV-cache quantization, and careful admission control (Q72, Q94) matter as much as, or more than, model compression for long-context serving economics.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">STAFF</span>Q72. A production chat service hits CUDA out-of-memory errors specifically when users have long conversation histories, even though short conversations work fine. Walk through your debugging process and likely root cause.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>First confirm the correlation is real: instrument GPU memory usage per request against that request's current context length, and check whether memory usage grows in a pattern matching the linear-in-context-length KV cache formula (Q70) rather than staying flat, which would instead point to a leak or a fixed-size buffer issue unrelated to context length. If memory does track context length linearly, the root cause is almost certainly KV cache growth: either individual long-context requests are consuming more memory than budgeted per request, or — more commonly — several long-context requests are being admitted into the same concurrent batch simultaneously, and their combined KV cache exceeds available memory even though each one individually would have been fine. The fix set includes: enforcing a maximum context length or truncating/summarizing very long conversations (Q77) before they reach the model; adopting GQA and/or KV-cache quantization to shrink the per-token memory cost so more long-context requests fit; and, most directly, adding admission control that estimates a request's expected KV-cache footprint from its current prompt length before admitting it into a batch, rather than admitting requests purely based on request count, which implicitly assumes every request has the same, small memory footprint.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. What is KV-cache quantization, and what quality trade-off does it introduce compared to full FP16 precision?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>KV-cache quantization stores the cached Key and Value tensors at a lower numeric precision — commonly INT8, sometimes lower — instead of FP16 or BF16, directly shrinking cache memory by roughly the same ratio as the precision reduction (INT8 halves memory versus FP16), which allows either longer contexts or larger batch sizes within the same GPU memory budget. The trade-off is a small loss of numeric precision in the values that feed into the attention weighted sum; in practice this tends to be more tolerable than quantizing model weights, because K and V values are consumed through a softmax-normalized weighted average that is somewhat robust to small perturbations in individual values, but aggressive quantization can still measurably degrade quality on tasks that depend on precise recall of specific details from far back in context, so the acceptable quantization level should be validated against the actual task rather than assumed safe by default.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">SENIOR</span>Q74. What is PagedAttention (as implemented in vLLM), and what problem in naive KV-cache memory management does it solve?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Naive KV-cache allocation reserves one large, contiguous block of GPU memory per request, sized for the maximum sequence length that request could possibly reach, up front — this causes severe internal fragmentation and wasted memory whenever a request's actual generated length ends up shorter than its reserved maximum, which is the common case, and it also prevents memory from being reused flexibly across requests with very different lengths. PagedAttention borrows the operating-system idea of virtual memory paging: the KV cache is stored in small, fixed-size, non-contiguous physical memory pages, with a per-request logical-to-physical page table mapping sequence positions to wherever their corresponding K/V data actually lives, allocated incrementally as generation proceeds rather than reserved in one large block upfront. This eliminates the pre-allocation waste, allows memory to be packed far more tightly across many concurrent requests of varying length, and directly enables much higher effective batch sizes and throughput on the same hardware.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">STAFF</span>Q75. Explain how PagedAttention's paging scheme enables efficient memory sharing for techniques like beam search or parallel sampling from the same prompt.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Because PagedAttention's KV cache is addressed through a logical page table rather than requiring one contiguous physical block per sequence, multiple beams or multiple parallel samples that share an identical prompt prefix can have their logical page-table entries for that shared prefix simply point to the very same physical memory pages, rather than each beam or sample needing its own full copy of that prefix's Key/Value data. Only once generation actually diverges between beams or samples does the system need to allocate new, separate physical pages for the newly generated, non-shared tokens — a copy-on-write-style scheme directly analogous to how operating systems share memory pages between processes until one of them writes to a shared page. For a long prompt with many parallel samples or beams, this avoids duplicating that prompt's often-substantial KV cache many times over, which is a major, direct memory saving that a naive per-sequence-contiguous-allocation scheme cannot achieve at all.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">MID</span>Q76. What is continuous batching in an inference server, and why does it matter given that different users' KV caches grow at different rates?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Static batching groups a fixed set of requests together and waits for every request in that batch to finish generating before starting the next batch, which wastes GPU capacity whenever some requests in the batch finish (or were always going to be) shorter than others, leaving the GPU partially idle while it waits on the longest-running sequence. Continuous batching instead treats the decode loop as an ongoing, dynamically managed pool: as soon as any sequence in the current batch finishes and frees up capacity (compute and KV-cache memory), a new incoming request is immediately admitted into the batch to fill that freed capacity, rather than waiting for the whole batch to complete. Since KV caches genuinely do grow at different rates across concurrent requests with different context lengths, this dynamic admission keeps GPU utilization consistently high across a live server's actual, uneven mix of request lengths, rather than being bottlenecked by whichever request in a static batch happens to run longest.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">SENIOR</span>Q77. What KV-cache eviction strategies exist for bounding memory when context grows effectively unbounded (e.g., a long-running or streaming conversation), and what quality risk do they introduce?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Sliding-window truncation simply drops the KV entries for tokens older than a fixed window, keeping memory bounded at the cost of making those older tokens completely inaccessible to any future attention computation. Attention-score-based eviction (sometimes described informally as "heavy-hitter" retention, as in approaches like H2O) instead tracks which tokens have historically received high attention weight and preferentially keeps those, evicting tokens that have consistently received low attention weight, on the theory that low-attention tokens are less likely to be needed later — a more targeted but still heuristic bet. Periodic summarization takes a different approach entirely: rather than evicting raw KV data, it periodically compresses older conversation turns into a shorter textual or vector summary (processed through the model as ordinary new tokens) and then drops the original turns' raw KV cache, trading a small amount of generation cost (producing the summary) for a large, controlled memory reduction. All three approaches share the same fundamental risk: the model can no longer literally attend to specific details in whatever was evicted or summarized away, so a user question that depends on a fine-grained fact from early in a long conversation may be answered incorrectly or evasively, and the acceptable strategy depends heavily on how much the product's actual use case depends on exact recall of distant conversation history.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">MID</span>Q78. Why do GQA and MQA reduce KV cache memory directly, independent of any attention-algorithm optimization such as FlashAttention or PagedAttention?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>KV cache size is fundamentally proportional to how many distinct Key/Value heads are stored per token per layer (Q70's formula), which is an architectural property fixed at model design and training time — it has nothing to do with how the attention computation is executed at inference. FlashAttention changes how attention scores are computed from whatever K/V data exists; PagedAttention changes how that K/V data is physically laid out and allocated in memory. Neither one changes how many K/V heads the model has. GQA and MQA are the one lever in this whole picture that changes the underlying quantity being cached in the first place — by design, they reduce the number of distinct K/V heads a token needs stored at all, making them an orthogonal optimization axis that stacks additively with FlashAttention and PagedAttention rather than substituting for them.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">SENIOR</span>Q79. Explain precisely why Transformer training can fully parallelize across the sequence dimension, but naive autoregressive inference cannot.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>During training, the entire target sequence is already known upfront — every ground-truth token that the model is being trained to predict at every position is available before the forward pass even begins, because it comes from a fixed, pre-existing training example rather than from the model's own not-yet-computed output. This means the causal-masked attention and loss computation for every position in the sequence can be executed in one single parallel pass, since none of the required inputs (the actual previous tokens, supplied via teacher forcing, Q80) depend on anything the model itself has to produce first. During inference, there is no ground-truth next token to supply — generating token t+1 requires the model to have already produced token t, because token t is the actual input the model needs to condition on, and it simply does not exist until the model computes it. This creates a strict, sequential data dependency between consecutive decode steps that cannot be removed by adding more parallel hardware, because the dependency is on the value of a not-yet-computed output, not on a computation that could in principle be reordered or parallelized.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">MID</span>Q80. What is teacher forcing during training, and how does it relate to the parallel-training-versus-sequential-inference distinction?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Teacher forcing means that, at training time, the decoder is fed the actual ground-truth previous tokens as input at every position, rather than being fed whatever it would have predicted itself at the previous position. Because every position's input is therefore already known and fixed before the forward pass runs, the entire sequence's outputs and loss can be computed in one parallel pass across all positions at once — this is exactly the mechanism that makes the parallel training described in Q79 possible. At inference, there is no ground truth to force-feed, so the model necessarily has to condition on its own actual previous output, reintroducing the strict sequential dependency that teacher forcing let training sidestep — a training/inference mismatch (sometimes called exposure bias) that is a separate, secondary concern worth knowing but distinct from the parallelism point itself.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">STAFF</span>Q81. What is speculative decoding, and how does it partially recover parallelism during autoregressive generation without changing the model's output distribution?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Speculative decoding uses a small, fast draft model to autoregressively propose several candidate next tokens ahead of time, then runs the full target model once, in a single parallel forward pass, over the original context plus all of the draft's proposed tokens — this parallel verification pass is possible precisely because the proposed tokens are already fixed inputs, exactly the same "inputs are already known upfront" condition that makes training parallelizable (Q79). The target model's own probabilities for each proposed token are then compared against the draft model's probabilities using a specific rejection-sampling rule (detailed in Q82 and Q87) that accepts a run of correct-enough draft tokens and resamples from the correct distribution at the first point of disagreement. When the draft model's guesses are frequently good, several tokens get accepted per single full-model forward pass instead of requiring one full sequential pass per token, meaningfully improving throughput — and the specific acceptance/rejection math guarantees the final accepted tokens are distributed exactly as if they had been sampled one at a time directly from the target model alone, so speed is gained with no change to output quality or distribution.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">SENIOR</span>Q82. Walk through the mechanics of speculative decoding step by step.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>First, a small, fast draft model autoregressively generates k candidate next tokens, one at a time, starting from the current context — this part is still sequential, but cheap, because the draft model is small. Second, the full target model runs a single forward pass over the original context plus all k drafted tokens at once, exactly as it would during parallel training, since all k positions' inputs are already fixed by the draft's output. Third, for each of the k positions, the target model's own probability for the token the draft model actually proposed is compared against the draft model's probability for that same token, using an acceptance rule (Q87) that accepts the token with probability min(1, p_target / p_draft). Fourth, tokens are accepted one by one from the start of the draft sequence until the first rejection; at that point, a corrected token is resampled from the residual distribution (what the target model would have produced, adjusted for what the draft over- or under-proposed), and any remaining, not-yet-checked draft tokens after that point are discarded. The net effect: when the draft's guesses were good, several tokens get committed to the output per single expensive full-model forward pass, rather than needing k separate sequential full-model passes.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">MID</span>Q83. What properties make a good draft model choice in speculative decoding?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A good draft model needs to be substantially smaller and faster than the target model — otherwise proposing candidate tokens costs nearly as much as just running the target model directly, eliminating the whole point of the technique. At the same time, it needs to be similar enough in behavior and distribution to the target model that a meaningful fraction of its proposed tokens actually get accepted; if the draft and target disagree on almost every token, most proposals get rejected and speculative decoding gains little or nothing over plain sequential decoding, since the wasted draft-generation cost and the rejection-handling overhead eat into the benefit. In practice this usually means choosing a smaller model from the same family or training lineage as the target model, or an explicitly distilled version of the target model, so that its predictions are correlated with the target's as often as possible.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">SENIOR</span>Q84. What is Medusa-style self-speculative decoding, and how does it avoid needing a separate draft model?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Instead of running a whole separate, smaller model to propose candidate tokens, Medusa adds several extra lightweight prediction heads directly on top of the target model's own final hidden states, where each additional head is trained to predict a token some fixed number of steps ahead (head 1 predicts the very next token as usual, head 2 predicts the token after that, and so on), all from the same single forward pass. This produces several candidate continuation tokens in one pass without deploying, maintaining, or keeping in sync a second, separate model — the verification and acceptance logic that follows is conceptually similar to standard speculative decoding, but the infrastructure is simpler, since only one model needs to be served, versioned, and kept aligned with the target model's updates.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">JUNIOR</span>Q85. What is the difference between greedy decoding, beam search, and sampling-based decoding (temperature, top-k, top-p)?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Greedy decoding always picks the single highest-probability next token at every step — deterministic and fast, but prone to repetitive or locally-optimal-but-globally-mediocre output, since it never reconsiders an earlier choice. Beam search keeps several candidate partial sequences ("beams") alive at each step and expands only the most promising ones, aiming to find a higher total-probability full sequence than greedy decoding would, at the cost of more compute and some well-known quirks (like a tendency toward generic, safe completions). Sampling-based decoding draws the next token randomly according to the model's probability distribution, optionally reshaped by temperature (Q86), top-k (restrict sampling to only the k highest-probability tokens), or top-p/nucleus sampling (restrict sampling to the smallest set of tokens whose cumulative probability exceeds p) — this trades determinism for more natural, varied output, and is the default decoding style behind most chat-oriented LLM products.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">MID</span>Q86. How does sampling temperature affect output diversity, in terms of the softmax formula itself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Sampling temperature divides the model's output logits by a value T before applying softmax — softmax(z / T) — rather than applying softmax directly to the raw logits. As T increases above 1, dividing by a larger number shrinks the differences between logits before they hit softmax, flattening the resulting probability distribution and making lower-probability tokens relatively more likely to be sampled, which increases output diversity and randomness. As T decreases toward 0, dividing by a smaller number amplifies the differences between logits, sharpening the distribution toward the single highest-probability token and making sampling approach deterministic greedy decoding. This is the exact same softmax operation used everywhere else in the architecture (attention weighting, Section 6; final vocabulary prediction, Section 5.7) — temperature is simply a deliberate, user-controlled distortion applied to that formula's input at the very last step, for the purpose of controlling randomness rather than for weighting relevance.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">SENIOR</span>Q87. Why does speculative decoding preserve the target model's exact output distribution rather than just approximating it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The acceptance step is not a simple heuristic comparison — it is a specific rejection-sampling construction. A drafted token is accepted with probability min(1, p_target(token) / p_draft(token)), comparing the target model's actual probability for that token against the draft model's probability for proposing it. If a token is rejected, the next token is not just regenerated from the draft — it is resampled from a corrected residual distribution, specifically constructed as the positive part of (p_target − p_draft), renormalized. This particular combination of accept-with-probability-ratio and resample-from-the-residual is mathematically constructed so that, marginalized over all the randomness in the draft proposals and the accept/reject decisions, the overall distribution of tokens that end up in the final output is provably identical to the distribution that would result from sampling one token at a time directly from the target model alone. The draft model's quality only affects how often tokens get accepted (and therefore how much speed is gained) — it has no influence on the correctness of the final output distribution, which is exactly why speculative decoding is described as a pure speed optimization rather than an approximation.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">MID</span>Q88. What is weight quantization for Transformer inference, and why does reducing numeric precision often preserve most of the model's quality?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Weight quantization represents a model's learned weights (and sometimes its activations) using lower-precision integer formats — commonly INT8 or INT4 — instead of the FP16, BF16, or FP32 formats typically used during training, which shrinks the model's memory footprint substantially and often increases throughput, since moving less data through memory-bandwidth-bound GPU operations is faster. This tends to preserve most quality because trained weight distributions are usually fairly concentrated and somewhat redundant — the network was not relying on the full dynamic range and precision of 16 or 32 bits for every single weight to produce its trained behavior — and because practical quantization schemes typically use per-channel or per-group scaling factors rather than one crude global scale, which lets different parts of the weight matrix be represented at whatever precision they individually need rather than forcing a one-size-fits-all compromise.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">SENIOR</span>Q89. Compare GPTQ and AWQ conceptually — what do they each optimize for differently than naive uniform quantization?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>GPTQ quantizes a layer's weights sequentially, using a second-order (Hessian-based) approximation of how quantizing one weight affects the layer's output error, and then adjusts the remaining not-yet-quantized weights in that same layer to compensate for the error just introduced — effectively spreading and correcting for quantization error across the layer rather than letting it accumulate independently at each weight. AWQ (Activation-aware Weight Quantization) takes a different angle: it identifies which weight channels interact with unusually large-magnitude activations (making them disproportionately important to the layer's output) and protects those specific channels with a higher-precision-equivalent scaling treatment, while quantizing the remaining, less salient channels more aggressively. Both methods share the same underlying insight that naive, uniform quantization treats every weight as equally important when they clearly are not — they differ in how they identify importance (GPTQ: second-order output-error sensitivity; AWQ: activation-magnitude salience) and in how they compensate (GPTQ: sequential error correction within a layer; AWQ: per-channel scaling before quantization).</p>
+</div>
+
+<div class="question" id="q90"><span class="level">JUNIOR</span>Q90. In plain terms, what is a Mixture-of-Experts (MoE) Transformer, and why can it be cheaper to run than a same-quality dense model?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>In a standard ("dense") Transformer, every token passes through the exact same, single feed-forward network in every block. In a Mixture-of-Experts Transformer, that single feed-forward network is replaced with several separate "expert" feed-forward networks plus a small router that decides, per token, which one or two experts should process it. The model's total parameter count can be very large — the sum of all the experts — but the actual compute spent on any given token stays small, since only the chosen expert(s) actually run for that token. This means an MoE model can hold far more total learned capacity than a dense model that costs the same amount of compute per token, often reaching comparable or better quality for a similar per-token inference cost, at the price of needing much more total memory to hold every expert, even though only a few are active per token.</p>
+</div>
+
+<div class="question" id="q91"><span class="level">SENIOR</span>Q91. Explain MoE routing mechanics — how does a router decide which expert(s) handle a given token, and what does a load-balancing auxiliary loss do?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A lightweight router — typically just a small linear layer followed by a softmax or top-k selection — looks at each token's current hidden representation and produces a score for every available expert; the token is then routed to whichever expert (or, commonly, top-2 experts) scored highest, and if more than one expert is selected, their outputs are combined, often weighted by the router's own scores. Left unconstrained, a router trained purely to minimize task loss can collapse onto routing most tokens to a small subset of "favorite" experts, leaving other experts under-trained and under-utilized while creating a compute hot-spot on the favored experts. A load-balancing auxiliary loss is added specifically to counteract this: it penalizes the router (typically based on how unevenly tokens are distributed across experts within a batch) for concentrating too heavily on a few experts, encouraging a more even distribution of tokens across the full set of experts so that all of the model's expert capacity actually gets used and trained.</p>
+</div>
+
+<div class="question" id="q92"><span class="level">STAFF</span>Q92. What unique serving and infrastructure challenges does an MoE Transformer introduce compared to a dense model of similar quality?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Because every expert must remain resident in memory even though only a small subset actually runs for any given token, an MoE model's total memory footprint is far larger than its active per-token compute would suggest — a dense model matched to the same active compute would have a much smaller memory footprint, so MoE trades memory for quality-per-compute, and that memory has to be provisioned across the serving fleet regardless of how lightly any individual expert is actually used. Token routing under real, uneven production traffic can also become imbalanced despite training-time load-balancing losses, creating hot-spot experts that receive disproportionately more tokens than others in a given batch, which introduces straggler effects that hurt overall batch latency even when total compute capacity is technically sufficient. Serving at scale typically requires expert parallelism — sharding different experts across different devices — plus an all-to-all communication step that physically routes each token's hidden state to whichever device holds its assigned expert and routes the result back, introducing an inter-device networking bottleneck that a dense model's more conventional tensor- or pipeline-parallel serving setup does not have to contend with in the same way.</p>
+</div>
+
+<div class="question" id="q93"><span class="level">JUNIOR</span>Q93. A non-technical product stakeholder asks why a longer conversation with the AI feature "costs more" and "gets slower." How would you explain this without diving into the math?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A useful analogy: every time the assistant responds, it has to re-read the entire conversation so far from the beginning, the same way you'd have to reread an entire document from page one if you wanted to write one more sentence that stayed consistent with everything said before. A three-page memo is quick to reread; a three-hundred-page report takes real time and effort to reread every single time, even if you're only adding one new sentence to it. As a conversation grows, the assistant is effectively rereading a longer and longer document before every reply, so both the cost (more reading work per reply) and the response time (more reading before it can start replying) increase the longer the conversation runs — which is exactly why starting a fresh conversation, or letting the system summarize and compress older parts of a long one, keeps things fast and affordable.</p>
+</div>
+
+<div class="question" id="q94"><span class="level">STAFF</span>Q94. Walk through how you would capacity-plan GPU memory for a chat service where per-user context lengths vary widely — from a few hundred to tens of thousands of tokens.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Start by decomposing GPU memory demand into two categories with very different behavior: model weight memory, which is fixed once the model is loaded and shared across every concurrent request, and per-request KV cache memory, which scales with each individual request's current context length according to the formula from Q70. Rather than sizing capacity around a worst-case assumption that every concurrent slot holds a maximum-length context (which would badly under-utilize hardware most of the time), build a realistic distribution of expected context lengths from actual production usage data, and size total capacity around the expected aggregate KV cache demand at your target concurrency level, with an explicit safety margin for tail behavior rather than for the absolute worst case. Reduce the per-token cost of that aggregate demand directly by adopting GQA (or MQA where quality allows) and KV-cache quantization, both of which shrink the formula's constants without touching model quality much. On the serving-infrastructure side, use PagedAttention-style dynamic, on-demand KV-cache allocation (Q74) combined with continuous batching (Q76) so memory is never wastefully pre-reserved for a request's theoretical maximum length, and add admission control that estimates a new request's likely memory footprint from its actual prompt length (with headroom for expected generation length) before adding it to a running batch, rejecting or queuing requests that would push aggregate KV-cache memory past a safe threshold rather than discovering the overrun as a CUDA OOM crash. Finally, monitor and alert on aggregate KV-cache memory utilization as its own first-class metric, separate from raw GPU compute utilization, since in this exact scenario KV-cache memory — not compute — is what actually triggers failures first.</p>
+</div>
+
+<div class="question" id="q95"><span class="level">STAFF</span>Q95. With a fixed budget, how would you reason about investing in wider context-window support versus investing in better retrieval for a RAG product?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Supporting wider context windows means absorbing larger KV caches, needing long-context-capable models and attention implementations (FlashAttention, GQA, possibly RoPE-scaling techniques from Q37), and paying higher per-request serving cost regardless of whether all that extra context actually gets used productively — and, per Section 11's common mistakes, wider context does not guarantee uniformly reliable use of everything inside it. Investing in better retrieval — improved chunking, better embeddings, a stronger reranking step — instead reduces the number of tokens that need to reach the model at all, which improves cost and latency directly (fewer tokens to process) and tends to improve answer reliability as a side effect, by keeping only the genuinely relevant material in front of the model rather than diluting it with a "lost in the middle" long context. For most RAG-style question-answering products, better retrieval typically dominates wider context windows on a cost-per-correct-answer basis, and should usually be the first investment. Wider context-window support earns its cost specifically for tasks where the necessary information genuinely cannot be cleanly chunked or retrieved piecewise — whole-codebase reasoning, long-document synthesis that depends on structure spanning the entire document — where retrieval would fragment context that actually needs to be read continuously; treating context-window expansion as a default substitute for retrieval investment, rather than a targeted complement for these specific cases, is the trade-off mistake to avoid.</p>
+</div>
+
 </div>
 
 <hr>

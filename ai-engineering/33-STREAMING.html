@@ -561,6 +561,535 @@ Streaming's security surface is narrower than topics like Prompt Injection or Re
 <p>Streaming connections are held open for the full generation duration (seconds, not milliseconds), so capacity must be planned around concurrently open connections (via Little's Law: concurrent connections ≈ arrival rate × average stream duration), not just requests-per-second. This pushes toward a non-blocking, reactive stack (Spring WebFlux) so a small, fixed thread pool can support a large number of simultaneously open streams, rather than a thread-per-connection Servlet model that would need a thread pinned per open stream. It also requires re-auditing every piece of infrastructure between client and server — load balancer idle timeouts, reverse proxy buffering, CDN caching rules — since all of these are typically tuned by default for short-lived request/response traffic and will silently misbehave (buffer, timeout early, or cache incorrectly) against long-lived streaming connections unless explicitly reconfigured.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. What is <code>Flux&lt;ChatResponse&gt;</code> conceptually, and how does it differ from a hypothetical <code>Flux&lt;String&gt;</code> of raw text?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p><code>Flux&lt;ChatResponse&gt;</code> is a Reactive Streams publisher that emits a sequence of <code>ChatResponse</code> objects over time, each one wrapping a small incremental delta of the model's output plus metadata (finish reason, usage once available, etc.). A <code>Flux&lt;String&gt;</code>, typically obtained via <code>.content()</code> on the stream, throws away that metadata and gives you just the raw text deltas — convenient for a simple "append to the UI" use case, but insufficient if you need to detect completion, read token usage, or branch on tool-call events.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. What does it mean that the <code>Flux</code> returned by <code>.stream()</code> is "cold," and why does that matter for how many times you can subscribe to it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A cold publisher does not start producing values until something subscribes to it, and each new subscription triggers its own independent execution from the beginning. For a streaming chat call this means simply building the <code>Flux</code> does not call the model at all — no request is sent until a subscriber (the WebFlux HTTP layer, a test, etc.) subscribes — and if you subscribe twice, you trigger two separate, independently-billed generations, not a shared replay of one.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">JUNIOR</span>Q11. What is the role of the browser's <code>EventSource</code> API in consuming an SSE stream?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><code>EventSource</code> is a built-in browser API that opens a long-lived HTTP connection to an SSE endpoint, parses the <code>text/event-stream</code> wire format into discrete events, fires an <code>onmessage</code> (or named <code>addEventListener</code>) callback per event, and automatically attempts to reconnect if the connection drops — all without the developer writing any manual chunked-parsing or reconnection logic.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. Why is streaming far more valuable for an interactive chat UI than for a background batch summarization job?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Streaming's benefit is entirely about perceived responsiveness for a human watching the output in real time — a chat user directly experiences the difference between seeing the first words in 400ms versus staring at a blank screen for 8 seconds. A batch job has no human watching it live; nothing consumes partial output, so the added architectural complexity of streaming (reactive pipelines, SSE/WebSocket infrastructure, partial-failure handling) buys nothing and a simple blocking call is the right choice.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. What HTTP content type does an SSE endpoint use, and what do the lines of a single SSE event typically contain?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>SSE responses use <code>Content-Type: text/event-stream</code>. Each event is a small block of plain-text lines: an optional <code>event:</code> line naming the event type, a <code>data:</code> line (or several, concatenated) carrying the payload, an optional <code>id:</code> line used for resuming after reconnection, and a blank line marking the end of that event.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">JUNIOR</span>Q14. What does TTFT stand for, and why is it the key latency metric that streaming specifically optimizes?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>TTFT is time-to-first-token — the delay between sending a request and the first piece of generated output reaching the client. Streaming does not shrink total generation time (TTLT), but it collapses TTFT down to roughly the time for the model to produce its very first token, which is the number that actually determines how "fast" an AI feature feels to a user, since humans perceive responsiveness from the first visible reaction, not from total completion time.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">JUNIOR</span>Q15. In Spring WebFlux, what does it mean at the HTTP level for a controller method to return <code>Flux&lt;String&gt;</code> with <code>produces = MediaType.TEXT_EVENT_STREAM_VALUE</code>?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>WebFlux keeps the HTTP response open and writes each emitted element of the <code>Flux</code> to the response body as it arrives, formatted as an SSE frame, using chunked transfer encoding rather than a single <code>Content-Length</code>-bounded body. The connection stays open until the <code>Flux</code> completes (or errors), at which point the response is finalized — nothing is buffered in application code waiting for the full sequence.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">JUNIOR</span>Q16. From a UI/UX perspective, what's the practical difference between streaming at the token level versus streaming at the sentence/chunk level?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Token-level streaming produces the smoothest, most "typewriter-like" perceived responsiveness since new text appears almost continuously, but it means the UI must handle many small, rapid updates efficiently. Sentence- or chunk-level streaming (buffering a few tokens before emitting) reduces update frequency and re-render overhead on the client at the cost of slightly coarser-grained, less continuous-feeling output — a reasonable trade-off on lower-powered clients or when the rendering step itself is expensive (e.g., re-parsing markdown on every update).</p>
+</div>
+
+<div class="question" id="q17"><span class="level">JUNIOR</span>Q17. Why can't a traditional blocking Spring MVC controller stream a response the same way a WebFlux controller can, without extra help?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A standard Spring MVC handler method is expected to return a completed value that gets serialized once into the response body, and the request-handling thread is tied up for the duration of the call. Spring MVC can still stream — via <code>SseEmitter</code> or <code>ResponseBodyEmitter</code>, or by adopting reactive return types with the Servlet 3.1+ async support — but it requires deliberately opting into an async/emitter-based model rather than getting it for free the way a reactive <code>Flux</code> return type does in WebFlux.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">JUNIOR</span>Q18. If a streaming SSE connection is silently dropped by the network, does the browser automatically try to recover it?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes, for connections opened with <code>EventSource</code> — the browser detects the dropped connection and automatically attempts to reconnect after a short delay, optionally sending the last received event's <code>id</code> via the <code>Last-Event-ID</code> header so the server can, if it supports it, resume from that point. Connections consumed manually (e.g., via <code>fetch</code> with a <code>ReadableStream</code>) get no such automatic behavior — reconnection logic has to be written by hand.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">JUNIOR</span>Q19. Why might a team deliberately keep certain endpoints non-streaming (blocking) even in an application that streams elsewhere?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Not every AI-backed endpoint has a human watching output arrive live: a background classification job, a batch enrichment pipeline, or an endpoint whose result must be validated or moderated as a whole before any of it is safe to release, all gain nothing from streaming and only inherit its added complexity. Streaming is a UX optimization for interactive, human-observed responses, not a universal default for every LLM call in a system.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">JUNIOR</span>Q20. What is backpressure, in plain terms, and does it typically become a real practical problem in ordinary LLM chat streaming?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Backpressure is the mechanism by which a slow consumer can signal to a fast producer "don't send me more until I've processed what I already have," preventing the consumer from being overwhelmed. In ordinary LLM chat streaming it's rarely a dominant problem in practice, because token generation is itself relatively slow (tens of milliseconds per token) compared to how fast a browser or reactive client can consume small text chunks — but it becomes very real once you fan a single generation out to multiple slow downstream consumers, or stream to clients on constrained networks or devices.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">MID</span>Q21. How do you convert a <code>Flux&lt;ChatResponse&gt;</code> into a <code>Flux&lt;String&gt;</code> of just the incremental text deltas in Spring AI?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Calling <code>.content()</code> on the <code>ChatClient</code>'s streaming response spec does this directly, mapping each <code>ChatResponse</code> to its text delta and filtering out empty/metadata-only emissions. Done manually against <code>ChatModel.stream()</code>, it's equivalent to <code>.map(response -&gt; response.getResult().getOutput().getContent())</code>, extracting just the generated text from each chunk and discarding the rest of the response envelope.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">MID</span>Q22. What operator would you use to run a side effect — such as incrementing a metrics counter — each time a chunk arrives, without altering the chunk itself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><code>doOnNext()</code> is designed exactly for this: it lets you observe each emitted element and perform a side effect (logging, metrics, tracing) while passing the element through unchanged to downstream subscribers. It should never be used to mutate or replace the element — that's what <code>map()</code> is for — and the side effect itself should be non-blocking, since it runs on the same reactive execution path as the rest of the chain.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">MID</span>Q23. Explain how backpressure is actually signaled and handled between a slow SSE client and a fast-producing <code>Flux</code> in Reactor.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Reactive Streams backpressure works via the subscriber requesting a bounded number of elements from the publisher (<code>request(n)</code>) rather than the publisher pushing unboundedly; Reactor's operators and the underlying Netty/WebFlux HTTP layer respect this, so if a client's TCP receive buffer fills up (because it's slow to read), the write to that connection blocks at the I/O layer, which propagates back as reduced <code>request(n)</code> calls up the chain, ultimately slowing how fast the upstream producer is asked for the next element. In practice, for LLM streaming this rarely causes explicit backpressure errors — the far more common issue is memory building up if a badly-written operator buffers unboundedly instead of respecting the request signal.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. What's the difference between a hot and a cold publisher, and which is <code>ChatModel.stream()</code>'s <code>Flux</code>, practically speaking?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A cold publisher replays its full sequence independently for every subscriber (each subscription triggers a fresh execution); a hot publisher emits the same live sequence to whoever happens to be subscribed at the time, with earlier elements lost to late subscribers. <code>ChatModel.stream()</code> returns a cold <code>Flux</code> — each subscription independently triggers a new call to the model — so if you need to fan the same generation out to multiple consumers (e.g., the client and a logging pipeline) without triggering multiple separate LLM calls, you need to explicitly convert it to hot semantics, typically via <code>.share()</code> or a <code>Sinks.Many</code>-based multicast.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. How would you implement a timeout for a streaming call so that a stalled generation doesn't hang the connection forever?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Reactor's <code>.timeout(Duration)</code> operator can be applied to the <code>Flux</code>, either as an overall timeout for the whole stream or, more usefully for streaming, as a per-element timeout that fires if too much time elapses <em>between</em> emitted chunks — catching a stalled-mid-generation scenario rather than only a stream that never starts. On timeout, the operator terminates the stream with a <code>TimeoutException</code>, which the error-handling path (see the mid-stream-error question) then needs to translate into a clean, client-visible termination rather than an ungraceful connection drop.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. Walk through what happens end-to-end when a browser's <code>EventSource</code> reconnects after a dropped SSE connection — does the server know anything happened?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>By default, the server has no idea anything happened: the dropped TCP connection simply cancels the original <code>Flux</code> subscription (freeing server resources), and <code>EventSource</code> opens what is, from the server's perspective, a brand new, unrelated HTTP request. If the server wants to support genuine resumption rather than just "reconnect and start over," it must read the client-sent <code>Last-Event-ID</code> header on the new request and use it to decide what to (re)send — which requires the server to have retained enough state (a buffered tail of recent events, or a resumable generation) to make that meaningful, something most naive implementations don't do.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">MID</span>Q27. How do you correctly propagate a request-scoped value, like a tenant ID from a security context, through a reactive streaming chain, given that WebFlux doesn't rely on <code>ThreadLocal</code>?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because a single reactive chain can hop across multiple threads as it executes, <code>ThreadLocal</code> cannot reliably carry context the way it does in a thread-per-request Servlet model. Reactor's answer is the <code>Context</code> mechanism: values are written onto the <code>Flux</code>'s context (e.g., via <code>.contextWrite()</code>) and read back downstream with <code>Mono.deferContextual()</code>/<code>Flux.deferContextual()</code>, and this context automatically flows through Spring Security's reactive integration so a tenant ID or authenticated principal set at the top of the chain remains accessible deep inside a streaming pipeline, including inside advisors that persist memory or log usage.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">MID</span>Q28. What's the risk in writing <code>.doOnNext(chunk -&gt; saveToDb(chunk))</code> directly inside a pipeline that also serves the client's streaming response?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>If <code>saveToDb()</code> is a blocking JDBC call, running it inside <code>doOnNext()</code> on the same reactive chain that's delivering chunks to the client blocks the event-loop thread on every single chunk, both slowing down (or stalling) the client-facing stream and starving other concurrent requests sharing that thread. The blocking write should either be offloaded to a bounded elastic scheduler via <code>.publishOn(Schedulers.boundedElastic())</code> for that specific side effect, or — better for per-chunk persistence — batched and performed once after the full text is aggregated, rather than once per chunk.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. Sketch a Spring WebFlux controller method that exposes an SSE endpoint streaming a Spring AI chat response.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The controller returns a <code>Flux&lt;String&gt;</code> (or <code>Flux&lt;ServerSentEvent&lt;String&gt;&gt;</code> for named events), declares <code>produces = MediaType.TEXT_EVENT_STREAM_VALUE</code>, and simply forwards the <code>ChatClient</code>'s streamed content — no manual buffering, no <code>.block()</code> anywhere in the chain.</p>
+<pre><code>@GetMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;String&gt; streamChat(@RequestParam String message) {
+    return chatClient.prompt()
+        .user(message)
+        .stream()
+        .content();
+}</code></pre>
+</div>
+
+<div class="question" id="q30"><span class="level">MID</span>Q30. What's the difference between using <code>SseEmitter</code> (Spring MVC's async support) and a native WebFlux <code>Flux&lt;ServerSentEvent&lt;...&gt;&gt;</code> for streaming, and when might you still reach for the former?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>SseEmitter</code> lets a traditional Spring MVC (Servlet-stack) application push SSE events asynchronously without adopting reactive types throughout the codebase — you manually call <code>emitter.send(...)</code> as data becomes available and <code>emitter.complete()</code> when done, with the Servlet container's async request handling underneath. A WebFlux <code>Flux</code> return type is more idiomatic for a genuinely reactive app and composes cleanly with the rest of a Reactor pipeline. Teams with an existing large Spring MVC codebase that don't want to (or can't yet) migrate to WebFlux often reach for <code>SseEmitter</code> as a pragmatic way to add streaming to one endpoint without a stack-wide rewrite.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">MID</span>Q31. Why might a team choose WebSocket over SSE for an AI chat feature even though the model's output itself is fundamentally one-directional?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The choice is usually driven by the surrounding feature, not the model output alone: if the client also needs to send data back mid-stream — a "stop generation" signal, live typing indicators, collaborative multi-user chat state, or push notifications unrelated to the current generation — a single persistent full-duplex WebSocket connection can be simpler to reason about than layering a separate channel alongside a one-directional SSE stream. If the interaction really is just "send one prompt, receive one streamed answer," SSE remains the simpler, more infrastructure-friendly default.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. When streaming a tool-calling response, how does the client distinguish "this delta is assistant text" from "this delta is part of a tool call"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>This has to be an explicit part of the event/message schema rather than something inferred from the text itself — typically by using named SSE events (e.g., <code>event: text-delta</code> vs. <code>event: tool-call-delta</code> vs. <code>event: tool-result</code>) or a discriminated JSON payload with a <code>type</code> field on every chunk. Without this explicit tagging, a client has no reliable way to know whether a given piece of incoming data should be appended to the visible chat bubble or accumulated separately as function-call arguments.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. What's a practical strategy for streaming structured output when the client needs valid JSON, but no individual chunk on its own is valid JSON?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Two common approaches: (1) buffer chunks server-side and only forward to the client once a validity check (attempting a parse, or tracking bracket/quote balance) confirms the accumulated text is a complete, valid JSON document — sacrificing some streaming granularity for guaranteed-valid output; or (2) stream raw text deltas as-is and let the client use a "tolerant" streaming JSON parser (one designed to incrementally interpret partial/incomplete JSON and emit best-effort partial object state as more arrives), accepting that intermediate states are approximate. The right choice depends on whether the client needs to render partial structured data progressively (favoring option 2) or only needs the complete object at the end but still wants perceived responsiveness elsewhere in the UI (favoring option 1).</p>
+</div>
+
+<div class="question" id="q34"><span class="level">MID</span>Q34. If an LLM call fails partway through a stream — say the upstream provider connection drops after 40% of tokens have been sent — what has already happened on the client, and what should the server do?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The client has already received, rendered, and possibly begun acting on a partial, incomplete answer — that cannot be undone by the server. The server's responsibility at that point is to terminate the stream cleanly and explicitly rather than just letting the TCP connection die silently: emit a distinguishable error event (not just closing the connection) so the client can visually mark the response as incomplete/failed, stop any downstream side effects that assumed a complete response (e.g., don't persist the partial text to conversation memory as if it were the final turn, or clearly flag it as partial if it must be persisted), and log enough detail to distinguish "upstream provider failure" from "our own bug" for on-call triage.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. How do you signal an error to an SSE client cleanly, given that the HTTP status code (200 OK) was already sent before the error occurred?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Since the HTTP headers and status line are committed the moment the response starts streaming, you cannot retroactively change the status code — the error has to be communicated inside the stream's own payload, typically as a distinct SSE event type (e.g., <code>event: error</code> with a JSON body describing what went wrong) that the client is written to specifically watch for, followed by cleanly ending the stream. Relying on the client to infer failure purely from an abrupt, unexplained connection close is fragile and indistinguishable from a normal network hiccup.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">MID</span>Q36. Describe how you'd integration-test a streaming endpoint using <code>WebTestClient</code>.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p><code>WebTestClient</code> supports asserting directly against a streaming response body, e.g. via <code>.get().uri(...).exchange().expectStatus().isOk().returnResult(String.class)</code> and then collecting the returned <code>Flux</code> with <code>StepVerifier</code>, or using <code>.expectBodyList(String.class)</code> when the number of expected elements is known and finite. This lets a test assert both on individual chunk content/ordering and on the final aggregated text, and — combined with mocking the underlying <code>ChatModel</code> to return a controlled, deterministic <code>Flux</code> — avoids needing a real, non-deterministic LLM call in the test suite.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">MID</span>Q37. What does it mean for a <code>Flux</code> to be "cancelled," and what typically triggers cancellation when a browser tab is closed mid-stream?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Cancellation is a Reactive Streams signal a subscriber sends upstream to say "stop sending me elements, I no longer need them," letting the publisher release resources early rather than running to completion for no one. When a browser tab is closed, the underlying TCP connection closes, WebFlux's HTTP layer detects this and propagates a cancel signal up through the reactive chain, which — if the pipeline is wired correctly — should also cancel the underlying subscription to the LLM provider's streaming call rather than letting it keep generating (and being billed for) tokens nobody will ever see.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. Why does closing a client connection early on a streaming LLM call matter for cost, and how do you ensure the upstream provider call is actually stopped, not just the client-facing stream?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Most LLM providers bill per generated token regardless of whether anyone was still listening, so an abandoned generation that keeps running server-side after the client disconnects is pure wasted spend, and at scale (many abandoned chats, e.g., from impatient users navigating away) this adds up. Making sure cancellation propagates correctly means every operator in the chain between the client-facing endpoint and the underlying provider call must respect the Reactive Streams cancel signal — which is normally automatic if the pipeline is composed purely of standard reactive operators, but breaks if any stage bridges into an imperative, non-cancellable call (e.g., a blocking HTTP client invoked via <code>Mono.fromCallable</code> without proper cancellation wiring) that keeps running even after downstream cancels.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">MID</span>Q39. How would you aggregate a full assistant response from its streamed chunks in order to persist it once the stream completes, without blocking the client-facing stream?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Rather than collecting into a separate structure and blocking on it, you tap the stream with an operator that accumulates state as a side effect and fires only on completion, letting every chunk still flow to the client immediately and unbuffered.</p>
+<pre><code>StringBuilder full = new StringBuilder();
+
+Flux&lt;String&gt; clientStream = chatClient.prompt()
+    .user(message)
+    .stream()
+    .content()
+    .doOnNext(full::append)
+    .doOnComplete(() -&gt; conversationRepository.save(full.toString()));
+
+return clientStream; // still streams every chunk to the caller in real time</code></pre>
+<p>The accumulation happens synchronously alongside emission (cheap, in-memory <code>StringBuilder</code> append), and the actual persistence write in <code>doOnComplete</code> should itself be non-blocking or offloaded, since by that point it's no longer on the client's critical path but can still block a shared event-loop thread if done carelessly.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. What's the difference between <code>Flux.collectList()</code> and using a reducing accumulator (e.g., <code>Flux.reduce()</code>) when aggregating streamed text chunks, and which is more appropriate here?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>collectList()</code> buffers every emitted element into a <code>List</code> and emits that list as a single value once the source completes — useful when you need the individual chunks preserved. <code>reduce()</code> folds the elements into one running accumulated value (e.g., concatenating text as it goes) and also emits once, on completion. For reconstructing full response text, <code>reduce()</code> (or the <code>doOnNext</code>-with-side-effect pattern in Q39) is usually preferable since you don't need each intermediate chunk retained afterward, just the final concatenated string — but critically, either approach only produces its result <em>after</em> the source completes, so it must be a separate tap on the stream, never the thing the client-facing response is built from, or you're back to fully buffering before responding.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">MID</span>Q41. How do <code>StepVerifier</code>'s virtual time features help you test a streaming pipeline that includes timeouts or delays?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>StepVerifier.withVirtualTime()</code> lets a test simulate the passage of time (e.g., "advance the clock by 30 seconds") without the test actually taking 30 real seconds to run, which is essential for testing timeout logic, retry backoff, or delayed-emission scenarios in a streaming pipeline quickly and deterministically. Without it, testing a 30-second stream timeout would mean either a genuinely 30-second-long test or reducing the timeout to an unrealistic value just to make the test fast — both worse than asserting against virtual time.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">MID</span>Q42. Why might streaming reduce peak server memory usage compared to a fully-buffered response, for very long generations?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A non-streaming implementation must hold the entire generated response in memory (and often re-serialize it as one large payload) before sending anything, so memory usage scales with total response length and with however many concurrent long-running requests are in flight simultaneously. A properly streaming implementation only needs to hold a small chunk at a time in flight — each piece is forwarded to the client and can be released almost immediately — so peak memory per request stays roughly constant regardless of total response length, which matters more as generations get longer or concurrency gets higher.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. What's the role of the <code>id:</code> field in an SSE frame, and how does it enable resuming a stream after reconnection?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Each SSE event can carry an <code>id:</code> value that the browser's <code>EventSource</code> remembers as "the last event I successfully received." On reconnection after a drop, the browser automatically sends that value back to the server in a <code>Last-Event-ID</code> request header, and a server designed to support resumption can use it to look up what's already been delivered (from a buffered tail of recent events, or replay state) and send only what's missing — but this only works if the server-side implementation explicitly reads and honors that header; nothing does it automatically.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">MID</span>Q44. How would a reactive HTTP client, like Spring's <code>WebClient</code>, consume a streaming endpoint exposed by another internal service?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>WebClient</code> can request an SSE stream and decode the body directly into a <code>Flux</code> of the element type, e.g. <code>webClient.get().uri(...).retrieve().bodyToFlux(String.class)</code>, which yields a reactive stream of chunks as they arrive over the wire rather than waiting for the full response — letting one internal service consume another's streaming endpoint and, in turn, re-stream (or transform and re-stream) that data onward without ever fully buffering it in the intermediary.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">MID</span>Q45. What's a common mistake when logging streamed chunks that leads to log volume explosion or garbled logs?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Logging every individual chunk at INFO level (one log line per token or small text fragment) generates enormous log volume for very little diagnostic value, and interleaved logs from many concurrent streaming requests become nearly unreadable since fragments from different requests appear interspersed without an obvious way to reconstruct which fragment belongs to which conversation. The better pattern is to log once per stream at a coarse level (start, completion, error, total chunk count/latency), tag every log line with a correlation/request ID so fragments can be reconstructed if needed, and reserve per-chunk logging for a debug-level, sampled, or explicitly-enabled diagnostic mode.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. How do you handle a case where the client only wants the final aggregated answer, but you still want to stream internally to keep TTFT-related metrics accurate?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>You still call <code>.stream()</code> against the model (so you can record when the first chunk actually arrived, for TTFT instrumentation) and aggregate the chunks internally with a <code>reduce</code>/accumulator, but only expose the collected final value to that particular client — effectively converting a streaming source into a blocking-style response at the edge while retaining the fine-grained internal telemetry that a true <code>.call()</code> would not give you.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">MID</span>Q47. Why is it important to flush chunks promptly at the servlet/reactive layer rather than letting them buffer even briefly in application code?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Any accidental buffering in the application layer — collecting several chunks before emitting, or an operator that unintentionally batches emissions — directly reintroduces the latency streaming was meant to eliminate, even if the underlying HTTP layer is correctly configured to stream. This is a subtler version of the classic "NGINX buffers the response" bug, except the buffering culprit is your own code rather than the proxy, and it's easy to introduce accidentally with operators like <code>.buffer()</code>, <code>.collectList()</code>, or a poorly chosen combination of <code>.delayElements()</code> used for a different purpose.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">MID</span>Q48. What's the difference in testing approach between asserting on individual SSE events versus asserting on the fully aggregated content?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Asserting on individual events verifies the streaming mechanics themselves — correct chunk boundaries, correct event types/ordering, correct handling of a specific mid-stream scenario like a tool call or an injected error — and is essential for exercising streaming-specific code paths that a fully-aggregated assertion would never catch. Asserting on the fully aggregated content verifies end-to-end correctness of what the user ultimately sees, independent of exactly how it was chunked, and is more resilient to incidental changes in chunking strategy. A solid test suite for a streaming feature needs both: chunk-level tests for the plumbing, aggregate-level tests for the actual content correctness.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">SENIOR</span>Q49. Design a reconnection/resume strategy for a streaming chat endpoint so a client that drops mid-response can resume from where it left off instead of restarting the whole generation.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>True resumption requires the server to retain enough state to answer "what have I already sent for this specific in-flight generation, and can I continue it or replay the remainder?" A practical design: assign each streaming request a stable ID, buffer emitted chunks (with SSE <code>id:</code> fields) in a short-lived server-side store (in-memory with a TTL for single-instance deployments, or a shared cache like Redis for multi-instance ones) as they're produced, and have the client send that request ID plus its <code>Last-Event-ID</code> on reconnect. The server then replays any buffered-but-unacknowledged chunks immediately, and — if the underlying generation is still in progress — resubscribes the reconnected client to the live tail of the same ongoing <code>Flux</code> (via a hot/shared publisher) rather than triggering a brand-new, separately-billed LLM call.</p>
+<p>If the original generation already completed before the client reconnects, the server can simply replay the buffered full text as a fast, non-billed "catch-up" stream. The key trade-off to name explicitly: this adds real state and complexity (buffer storage, TTLs, request-ID plumbing) that a naive "just reconnect and restart" implementation avoids — worth it for costly, long generations or high-value conversations, often not worth it for cheap, short ones where simply restarting is acceptable.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">SENIOR</span>Q50. How would you add distributed tracing spans across a streaming boundary, given that a single logical request now spans a long-lived, multi-chunk emission?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The trace context (trace ID, parent span ID) needs to be captured once at the start of the request and propagated through the reactive chain via Reactor's <code>Context</code> — not <code>ThreadLocal</code> — so it remains available to every operator regardless of which thread actually executes a given stage. A single parent span typically covers the whole streaming request (opened when the subscription starts, closed on completion or error), with child spans or span events marking meaningful milestones inside it — first-token-received, tool-call-invoked, generation-completed — rather than one span per chunk, which would be far too granular and expensive at scale. Spring's Micrometer Tracing integration with WebFlux/Reactor Context propagation makes this largely automatic for standard reactive chains, but any point where the pipeline bridges into non-reactive code needs explicit attention to make sure context isn't silently dropped.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. A production streaming endpoint is causing thread pool exhaustion under load even though it's built on WebFlux. What are the likely causes, and how do you diagnose them?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The most common cause is a hidden blocking call somewhere in the reactive chain running on one of WebFlux's small, fixed-size event-loop threads — a JDBC call inside <code>doOnNext</code>, a synchronous HTTP client used for an auxiliary lookup, or a blocking library invoked without offloading to <code>Schedulers.boundedElastic()</code>. Because event-loop threads are few and shared across many concurrent connections, even one blocking call per request can quickly starve the whole application under load, producing symptoms that look like thread pool exhaustion despite WebFlux's reactive, non-blocking design.</p>
+<p>Diagnosis starts with a thread dump during the incident (looking for event-loop threads parked in blocking I/O rather than idle), Reactor's <code>BlockHound</code> instrumentation in non-production environments (it explicitly detects and fails fast on blocking calls made from reactive threads), and auditing every operator and dependency in the pipeline for anything that isn't guaranteed non-blocking, including third-party client libraries that quietly use blocking I/O under the hood.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">SENIOR</span>Q52. How do you design cost-tracking (token usage) for a streaming response, given that usage metadata typically only arrives in the final chunk or after completion?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Because most providers only attach authoritative token-usage metadata to the terminal chunk (or a distinct usage event after the last text delta), cost tracking has to be implemented as a completion-time side effect rather than something computed per chunk — tap the stream with <code>doOnNext</code> to detect and capture the usage-bearing chunk when it arrives, and persist/emit it in <code>doOnComplete</code>, alongside a defensive fallback (e.g., an approximate token count via a local tokenizer) for cases where the stream is cancelled or errors before that final usage chunk is ever sent, since partial generations that were still billed by the provider would otherwise go completely untracked.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">SENIOR</span>Q53. Your streaming endpoint needs to support tool-calling, where the model pauses mid-generation to invoke a function and then resumes streaming the final answer. Describe the event lifecycle a client needs to handle.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The client-visible lifecycle typically looks like: (1) a burst of text-delta events as the model streams any preamble; (2) one or more tool-call-delta events as the model streams the function name and incrementally-built JSON arguments for a call it wants to make; (3) a tool-call-complete signal once the arguments are fully formed; (4) a gap while the server actually executes the tool (during which the client should show a distinct "working" state, not a stalled stream); (5) a tool-result event once execution finishes; and (6) resumed text-delta events as the model streams its final answer incorporating the tool's result — possibly repeating steps 2-5 for multiple sequential tool calls before reaching a final terminal completion event.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Emphasize that the tool-execution gap (step 4) is the part naive implementations get wrong — either the connection appears to hang with no indication anything is happening, or worse, the client's UI shows a spinner indistinguishable from a stalled/broken stream. A well-designed protocol makes tool execution an explicit, visible state transition, not a silent pause.</div>
+
+<div class="question" id="q54"><span class="level">SENIOR</span>Q54. How do you prevent a slow, misbehaving, or malicious client from holding server resources open indefinitely on a streaming connection?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Several layered protections: an idle/inactivity timeout that closes the connection if the client hasn't acknowledged data (or the underlying TCP write buffer stays full) for too long; an absolute maximum stream duration independent of activity, so even a technically-progressing but abnormally slow consumer can't hold a connection open forever; a cap on the total number of concurrent streaming connections per client/IP/API key to bound worst-case resource usage; and ensuring cancellation propagates correctly (Q37/Q38) so a genuinely abandoned connection is detected and cleaned up promptly rather than lingering. These need to be tuned carefully since legitimate long generations are also long-lived by design — the goal is bounding pathological cases, not penalizing normal usage.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">SENIOR</span>Q55. What observability signals would you specifically add for a streaming AI endpoint that you wouldn't need for a synchronous one?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Beyond standard request-level metrics (rate, error rate, total duration), streaming needs: TTFT as its own tracked metric (distinct from total duration, since it's the number that actually drives perceived UX quality); inter-token/inter-chunk latency to detect stalls happening mid-generation rather than only at the start or end; concurrent-open-streams as a gauge (not just requests-per-second) since that's the real capacity constraint (Q8); cancellation/abandonment rate, to catch both client-side UX problems and provider-side cost leakage; and stream-level error rate broken out separately from pre-stream request errors, since a request that returns 200 and then fails 60% of the way through is a fundamentally different failure mode than one that fails immediately, and needs its own alerting.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">SENIOR</span>Q56. How would you implement rate limiting for streaming endpoints, given that a single request now occupies a connection for many seconds rather than milliseconds?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Simple requests-per-second rate limiting is a poor fit, since it doesn't capture that one streaming connection can hold resources open far longer than one ordinary request — two clients issuing "1 request per second" can impose wildly different loads if one's requests complete in 50ms and the other's stream for 30 seconds each. A better model limits on concurrently-open streams per client (directly reflecting the actual resource constraint from Q8's capacity-planning discussion) and/or on a token-based budget (Q89) that accounts for how much generation work a client is consuming over time, rather than treating every request as equivalent regardless of how long it holds a connection open.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. Explain how you'd design graceful shutdown for a Spring Boot application serving many concurrent long-lived SSE streams, e.g., during a rolling deployment.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>An ordinary graceful shutdown (stop accepting new connections, wait for in-flight requests to finish) works poorly when "in-flight requests" can legitimately run for tens of seconds — either the shutdown grace period has to be unrealistically long, or active streams get killed mid-response during every deploy. A better pattern: mark the instance as not-ready (removing it from load balancer rotation, so no new streaming connections are routed to it) while letting existing streams run to completion within a bounded, generous grace period; for streams still active when that grace period expires, send a clean, distinguishable termination event (not just a hard connection drop) so the client can retry cleanly against a healthy instance rather than treating it as a mysterious failure; and coordinate the grace period with load balancer/ingress timeout settings so they're not fighting each other.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">SENIOR</span>Q58. How should structured-output streaming validate partial JSON incrementally, without either blocking until the end or crashing on every intermediate parse attempt?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A naive <code>ObjectMapper.readValue()</code> call against an incomplete JSON fragment throws on essentially every intermediate chunk, since valid JSON syntax is only guaranteed once the document is complete. The practical approach is either (a) track structural balance incrementally — counting open/close braces and brackets while respecting string/escape context — to know when a syntactically complete unit exists before attempting a real parse, or (b) use a purpose-built tolerant/streaming JSON parser designed to represent "best current understanding of a partial document" (common in JSON-mode streaming client libraries) so the UI can progressively render fields as they become available, rather than treating every intermediate parse failure as an error.</p>
+<pre><code>StringBuilder buf = new StringBuilder();
+int depth = 0;
+for (char c : chunk.toCharArray()) {
+    buf.append(c);
+    if (c == '{' || c == '[') depth++;
+    if (c == '}' || c == ']') depth--;
+    if (depth == 0 &amp;&amp; buf.length() &gt; 0) {
+        emitCompleteJsonUnit(buf.toString());
+        buf.setLength(0);
+    }
+}</code></pre>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. What's the architectural difference between streaming raw provider deltas straight through to the client versus normalizing/re-chunking them server-side, and why might you choose the latter?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Passing raw provider deltas straight through is the simplest possible implementation but tightly couples every client to that specific provider's exact chunking behavior, event names, and payload shape — switching providers, or supporting multiple providers behind one API, then becomes a breaking client-facing change. Normalizing server-side (defining your own stable event schema and re-chunking/translating provider output into it) adds a layer of indirection and slightly more server-side work, but decouples clients from provider-specific quirks, lets you evolve or swap the underlying model/provider without touching client code, and gives you one consistent place to add cross-cutting behavior (moderation, logging, tool-call normalization) regardless of which provider generated a given response.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">SENIOR</span>Q60. How do you handle multi-turn conversations where memory persistence must see the complete streamed assistant turn before the next user turn arrives, without introducing a race?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>If the client is allowed to send the next user message before the server has finished persisting the previous assistant turn's aggregated text (which completes asynchronously in <code>doOnComplete</code>, slightly after the client sees the stream end visually), the next turn's memory-loading step can race with that write and load an incomplete conversation history. The safest fix is to make the persistence write happen — and be awaited/confirmed — as part of the same reactive completion signal the client's stream completion is tied to, so "stream done" and "turn persisted" are effectively the same moment from the system's perspective, or alternatively to explicitly gate acceptance of the next turn's request until the previous turn's persistence has been confirmed, accepting a small amount of added latency between turns in exchange for correctness.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. Describe a strategy for load-testing a streaming endpoint — what's different about simulating concurrent SSE clients versus concurrent normal HTTP requests?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>A normal HTTP load test tool that fires a request and measures time-to-response-complete misses the metrics that actually matter for streaming (TTFT, inter-chunk latency, total connection hold time) and may not even keep the connection open long enough to observe realistic streaming behavior. A proper streaming load test needs a client that actually opens and holds each connection for its full realistic duration, measures TTFT and per-chunk arrival times individually, and — critically — models realistic concurrency in terms of <em>simultaneously open</em> streams (per the capacity-planning discussion in Q8), not just requests-issued-per-second, since that's the dimension that actually stresses server resources for this workload.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. How would you implement per-chunk content moderation without meaningfully increasing time-to-first-token?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Run a lightweight, low-latency classifier against a small rolling window of recently-emitted text (rather than the accumulated whole, which would grow more expensive to re-check over time), on the same critical path but budgeted to add only single-digit milliseconds of overhead per check — keeping TTFT nearly unaffected since the first chunk's moderation check is cheap by construction. This deliberately trades some detection accuracy (a lightweight per-window classifier will miss some violations a full-response classifier would catch) for maintaining responsiveness, which is the same fundamental trade-off discussed in the moderation-vs-streaming tension question (Q7) but pushed toward the "accept slightly reduced detection, keep latency low" side of that spectrum.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. What failure modes does an API gateway or CDN sitting in front of a streaming endpoint introduce, beyond the classic reverse-proxy buffering issue?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Beyond buffering: idle-connection timeouts tuned for typical short-lived API traffic can kill a legitimately long-running stream mid-generation if the gateway's timeout is shorter than realistic generation time; caching layers may attempt to cache a streaming response incorrectly (or refuse to cache anything at all for an entire route, even non-streaming parts of it, if misconfigured); connection-count or concurrency limits set with request/response traffic in mind can be far too low for long-held streaming connections; and some gateways rewrite or strip headers relevant to SSE (like <code>Content-Type</code> negotiation or custom headers used for resumption) unless explicitly configured to pass them through. Every hop between client and origin needs to be individually verified against real, realistic-duration streaming traffic — not assumed compatible by default.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">SENIOR</span>Q64. How do you decide, architecturally, whether to expose streaming via SSE, WebSocket, or gRPC server-streaming for a new AI product surface?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>SSE is the right default for a browser-facing, one-directional text stream over standard HTTP infrastructure — simplest to deploy and debug, works with ordinary load balancers and proxies once buffering is disabled. WebSocket earns its added complexity when the client genuinely needs bidirectional, low-latency, session-oriented communication beyond just receiving generation output. gRPC server-streaming fits best for internal service-to-service streaming (not typically browser-facing) where you already have a gRPC-based architecture and want strongly-typed contracts and HTTP/2 multiplexing benefits. The decision should be driven by the actual communication pattern needed and the existing infrastructure/client ecosystem, not by which is currently trendiest.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. Your team wants to add a client-side "stop generation" button. Trace what needs to happen from the browser click through to the upstream LLM provider call actually stopping.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The click needs to trigger the client closing its side of the connection (for <code>EventSource</code>, calling <code>.close()</code>; for a <code>fetch</code>-based stream, aborting via an <code>AbortController</code>) or, more explicitly and reliably, sending a distinct cancellation signal the server is listening for. On the server, that connection close (or explicit signal) must propagate as a cancel through the reactive chain — which, per Q37/Q38, only actually stops upstream billing and generation if every stage of the pipeline correctly forwards cancellation rather than swallowing it, all the way down to the call against the LLM provider's streaming API actually being torn down, not just the client-facing <code>Flux</code> being unsubscribed from while the underlying provider call keeps running unobserved in the background.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">SENIOR</span>Q66. How does idempotency change, or not, for a streaming request that's retried after a mid-stream failure?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>A naive retry of a failed streaming request simply issues a brand-new generation from scratch, which is not idempotent in the sense of producing "the same result" (LLM output is inherently non-deterministic across calls even with an identical prompt) and, worse, means the user already saw a partial answer from the failed attempt and now sees a second, different, independently-generated one. A more careful design either (a) explicitly discards/replaces the partial UI state so the retry is presented as a clean fresh attempt rather than a confusing continuation, or (b) if resumption state (Q49) exists, attempts to continue the original generation rather than starting over — the choice depends on whether the failure was transient-and-resumable (network blip) versus the underlying generation itself having actually failed (in which case only a fresh retry makes sense).</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. What's a sound approach to versioning the SSE event schema so streaming clients don't break when you add new event types, like tool-call events?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Clients should be written defensively from day one to ignore unrecognized <code>event:</code> names or unknown fields in a <code>data:</code> payload rather than erroring on them, which lets new event types be introduced additively without breaking older client versions still in the field. Genuinely breaking changes (renaming an existing event, changing an existing payload's shape incompatibly) should go through an explicit version negotiation — a version indicator in the initial request or connection handshake, or a versioned endpoint path — rather than being silently pushed to all clients simultaneously, since unlike a typical request/response API, a long-lived streaming client may have already started a connection using assumptions from an older schema version before a server-side deploy changes it mid-flight.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">SENIOR</span>Q68. How would you instrument and alert on TTFT and inter-token latency in production, and what would a regression in each typically indicate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>TTFT is measured as the time between the request starting and the first chunk being emitted to the client, recorded as a histogram (so you can track p50/p95/p99, not just an average that hides tail latency) and broken down by provider/model, since different models have meaningfully different first-token latency. A TTFT regression typically points to upstream provider queueing/load, a growing prompt (larger prompts take longer to process before the first output token), or added latency from pre-generation steps like RAG retrieval or advisor chains running before the model call even starts. Inter-token latency (time between successive chunks) is measured similarly, and a regression there — as opposed to TTFT — more often points to generation-time throughput issues on the provider side, or a rate limit/throttling being silently applied mid-stream, rather than anything about how the request started.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. Describe how you'd test that backpressure is actually being respected end-to-end, not just that the reactive code compiles correctly.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium at senior level</p>
+<div class="answer">
+<p>A <code>StepVerifier</code> test can explicitly control demand via <code>.thenRequest(n)</code> and assert that no more than <code>n</code> elements are emitted until further demand is signaled, directly exercising whether a custom operator or source respects Reactive Streams' request-based flow control rather than eagerly pushing everything regardless of downstream readiness. For a genuinely end-to-end check, a test harness that deliberately consumes slowly (e.g., a test subscriber that delays between requesting each element) combined with monitoring memory/buffer growth on the producer side can reveal whether an intermediate stage is unboundedly buffering instead of correctly propagating backpressure — a bug unit tests against fast consumers would never surface.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">SENIOR</span>Q70. How do you handle a scenario where two different downstream consumers of the same generation need it at different speeds — e.g., a UI streaming display and a synchronous compliance-logging pipeline?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium at senior level</p>
+<div class="answer">
+<p>Since the underlying <code>ChatModel.stream()</code> <code>Flux</code> is cold (Q24), you cannot simply subscribe to it twice without triggering two separate, independently-billed generations — you need to convert it to a hot, shared publisher (via <code>.share()</code> or a <code>Sinks.Many</code>-based multicast) once, then let each consumer subscribe to that shared sequence at its own pace. A slow synchronous consumer like a compliance pipeline should not be allowed to backpressure or slow down the fast, latency-sensitive UI consumer — this typically means giving the slow consumer its own buffering strategy (e.g., an unbounded or generously-bounded internal buffer it drains asynchronously) so it absorbs the mismatch itself rather than propagating backpressure upstream to the shared source and, transitively, to the UI-facing branch.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. What changes in your error-handling design once you accept that, for a streaming response, "partial success" is a first-class outcome rather than an edge case?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A request/response mental model treats a call as binary — it either succeeds with a complete result or fails — but streaming makes "succeeded partially, then failed" a routine, expected outcome that needs first-class handling rather than being shoehorned into the same success/failure dichotomy. Practically this means: the client-visible error signal (Q35) must be designed to coexist with content already shown, not replace it; persistence logic must decide explicitly whether a partial response is worth saving (clearly marked as incomplete) versus discarding; retry logic must account for the fact that a user has already seen something, not nothing; and metrics/alerting need a distinct "partial failure" category separate from both clean success and immediate failure, since conflating it with either hides a meaningfully different failure signature from on-call engineers.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">SENIOR</span>Q72. How would you design health checks and readiness probes for a service holding many long-lived streaming connections, so a rolling deploy doesn't abruptly kill in-flight streams?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Liveness (is the process healthy at all) and readiness (should the load balancer route new traffic here) need to be distinct signals: during a planned shutdown, the instance should quickly start failing readiness (so no new streaming connections get routed to it) while continuing to report liveness normally and keep serving already-open streams, giving orchestration (Kubernetes, an ALB, etc.) the information needed to drain the instance gracefully rather than treating a still-healthy-but-draining instance as broken. This has to be paired with the graceful-shutdown grace period discussed in Q57 — readiness alone doesn't help if the shutdown grace period is too short for realistic stream durations, killing the connections readiness was trying to protect anyway.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. Streaming works fine for short responses but users report stalls specifically on long ones. What would you investigate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Symptoms that scale with response length rather than appearing uniformly point away from a simple all-or-nothing buffering bug (which would affect short and long responses alike) and toward something that degrades over time or accumulated volume: a client-side rendering bottleneck where appending to a growing DOM/state tree gets progressively slower per update as the message grows (Q85's territory); a per-chunk operation whose cost scales with accumulated state, like re-parsing the entire response-so-far on every chunk instead of only the new delta; an idle/inactivity timeout at some proxy hop that's fine for typical short streams but gets triggered by a longer-than-usual gap between chunks during a longer generation; or a memory/GC pressure issue on the server from an unintentionally growing buffer (Q42) that only becomes noticeable once accumulated size crosses a threshold. The investigation should start by reproducing with instrumentation at each hop — client render time per update, per-chunk server processing time, and gap durations between chunks — to localize where the slowdown actually accumulates rather than guessing.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">STAFF</span>Q74. Design a fully robust streaming chat endpoint end-to-end: backpressure handling, reconnection/resume semantics, and observability. Walk through your architecture.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Start from the transport layer: SSE over WebFlux for the browser-facing leg (simplest, most infrastructure-compatible choice for a one-directional stream), explicitly verified unbuffered through every hop of the real deployment topology (proxy, gateway, CDN), with an idle/max-duration timeout policy tuned against real generation-length distributions. Backpressure is handled by construction — a pure Reactor pipeline from the <code>ChatModel</code>'s <code>Flux</code> through to the HTTP response, with zero blocking calls on the reactive path (verified with BlockHound in CI, not just code review) and any slow side consumer (persistence, compliance logging) isolated behind its own buffering rather than propagating backpressure upstream into the fast UI-facing path.</p>
+<p>Resume semantics use a request-ID-per-generation scheme: chunks are tagged with SSE <code>id:</code> values and buffered server-side (with a bounded TTL, backed by a shared cache for multi-instance deployments) so a reconnecting client presenting a <code>Last-Event-ID</code> can replay missed chunks or, if the generation is still live, be resubscribed to a hot/shared version of the same ongoing stream rather than triggering a new, separately-billed generation — with an explicit, documented fallback to "just restart" for generations too cheap or short to justify the added state.</p>
+<p>Observability layers in TTFT and inter-chunk-latency histograms (not just total duration), concurrent-open-streams as a first-class capacity gauge, cancellation/abandonment rate, a distinct partial-failure error category, and distributed tracing spans propagated via Reactor <code>Context</code> with milestone events (first-token, tool-call, completion) rather than per-chunk spans. Graceful shutdown marks the instance not-ready while draining existing streams within a grace period coordinated against gateway timeout settings, so rolling deploys don't manifest as user-visible stream failures. Every one of these pieces exists because a naive "just return a <code>Flux</code>" implementation gets the happy path working in an afternoon but silently fails at exactly the failure modes — proxy buffering, blocking calls under load, abandoned connections, deploy-time drops — that only surface in production at scale.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> The strongest staff-level answers explicitly rank these investments by cost/benefit rather than presenting all of them as equally mandatory — e.g., noting that full resumption state is often not worth building until real usage data shows abandoned-and-reconnected streams are common enough to matter, whereas unbuffered-through-every-hop verification and blocking-call auditing are non-negotiable from day one because their failure modes are silent and catastrophic.</div>
+
+<div class="question" id="q75"><span class="level">STAFF</span>Q75. How do you evolve a streaming API's contract over years — new event types, new tool-calling shapes, potentially multiplexed streams — without breaking every existing client integration?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>The foundational discipline is the same one covered at the tactical level in Q67 — clients must be built from the start to ignore unrecognized event types and unknown fields — but at a staff/platform level this needs to be an enforced contract, not a hopeful convention: a schema registry or shared type definitions consumed by both server and every client codebase, contract tests that fail the build if a "breaking" change (renaming an event, removing a field clients depend on) is introduced without an explicit version bump, and a documented deprecation policy with a real timeline for how long an old event shape continues to be emitted alongside a new one. Genuinely structural evolutions — like introducing multiplexed streams (multiple logical sub-streams, e.g., separate reasoning and answer channels, over one connection) — are significant enough that they usually warrant a new protocol version negotiated explicitly at connection time rather than an in-place mutation of the existing schema, so old and new clients can coexist against the same backend during a long migration window rather than requiring a synchronized big-bang cutover across every consuming team.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">STAFF</span>Q76. Your org runs multiple LLM providers behind a unified streaming gateway, and each provider chunks and formats streaming deltas differently. How do you design the abstraction layer?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>The gateway should define its own stable, provider-agnostic event schema (the normalization approach from Q59, applied at platform scale) and implement a thin per-provider adapter whose only job is translating that provider's native streaming format — different chunk granularities, different tool-call event shapes, different usage-metadata timing — into the common schema, so every downstream consumer only ever needs to understand one contract regardless of which provider actually served a given request. This adapter layer is also where provider-specific quirks get absorbed rather than leaked: one provider might not support true token-level streaming at all and instead needs to be simulated by chunking a less-granular response server-side; another might emit usage metadata as a separate event rather than attached to the final chunk. The design should treat "add a new provider" as "write one new adapter conforming to an existing internal interface," never as "touch every consumer," and should be validated with a shared adapter conformance test suite so a new or updated adapter can be verified against the common contract before it ships.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">STAFF</span>Q77. What organizational and platform-level investments, beyond code, are needed to make streaming a safe default across dozens of teams' AI features, rather than something each team reinvents and subtly gets wrong?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Left to individual teams, the same handful of streaming bugs — proxy buffering, blocking calls on reactive threads, unhandled mid-stream errors, uncontrolled abandoned-generation cost — tend to get independently rediscovered (and independently, imperfectly fixed) by every team that builds a streaming feature. The higher-leverage move is a shared internal library or platform primitive that provides a correctly-implemented streaming endpoint scaffold (SSE wiring, cancellation propagation, standard error-event schema, TTFT/latency instrumentation baked in) so individual teams compose their prompt/business logic on top of an already-hardened foundation rather than re-deriving reactive pipeline correctness from scratch. That needs to be paired with a pre-launch checklist (explicitly including "verified unbuffered through every real deployment hop," echoing the earlier NGINX lesson) enforced through review or CI rather than left as tribal knowledge, and a small number of people with deep reactive/streaming expertise made available for consultation, since these bugs are exactly the kind that are invisible in code review to engineers without hands-on Reactor experience.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">STAFF</span>Q78. How would you design a system-wide SLO for AI streaming endpoints, and what's fundamentally different about defining an SLO for a long-lived streaming interaction versus a simple request/response one?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>A request/response SLO is naturally expressed as a single latency threshold over a single completion event ("p99 latency under 500ms"). A streaming interaction has no single meaningful latency number — it needs at minimum a separate TTFT SLO (governing perceived initial responsiveness) and an inter-chunk/stall SLO (governing whether the stream keeps flowing smoothly once started, since a stream that starts fast but then stalls for ten seconds mid-generation is a distinct failure mode TTFT alone would never catch), plus a completion-rate SLO tracking what fraction of streams that start actually terminate successfully rather than erroring or hanging partway through. Defining "success" itself is also more nuanced — a partial-but-graceful-error stream (Q71) may deserve to count differently in the SLO than either a clean success or a hard failure, and the SLO design needs to make that classification decision explicit rather than forcing every streaming outcome into a binary that doesn't actually fit the shape of the workload.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">STAFF</span>Q79. Discuss the trade-offs of building resumable streams — a client can reconnect mid-generation and continue exactly where it left off — versus simply restarting generation on reconnect. When is the added complexity worth it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Resumable streams require real, ongoing investment: per-generation chunk buffering with TTLs, a shared store reachable across instances for multi-node deployments, request-ID and <code>Last-Event-ID</code> plumbing through every layer, hot/shared publisher semantics to let a reconnecting subscriber rejoin a still-live generation, and testing coverage for a meaningfully larger state space (reconnect-during-generation, reconnect-after-completion, reconnect-after-buffer-expiry, concurrent reconnect attempts). Simply restarting is dramatically simpler to build and reason about, and for short, cheap generations (a few seconds, low per-token cost) the user experience cost of an occasional full restart is genuinely minor.</p>
+<p>The investment earns its keep specifically when generations are long and/or expensive relative to network reliability on the client side — mobile clients on unstable connections, very long-form generation (extended reasoning, long documents), or high per-token cost models where a wasted, restarted generation is a real, measurable cost, not just an inconvenience. A staff-level answer names this as a genuine build-vs-buy-complexity decision gated on real usage data (how often do reconnects actually happen, and how long/expensive are the generations they're interrupting) rather than building resumability speculatively because it's the "more correct" architecture in the abstract.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">STAFF</span>Q80. You're asked to design capacity planning and autoscaling policy for a fleet serving streaming AI endpoints. What signals do you scale on, and why are CPU- or RPS-based autoscaling rules usually wrong for this workload?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>CPU-based autoscaling assumes load correlates with compute usage, but a fleet of WebFlux instances holding open thousands of long-lived, mostly-idle-between-chunks streaming connections can sit at very low CPU utilization while still being close to a real capacity limit — the actual constraint is concurrently-open connections and their associated memory/file-descriptor/connection-pool footprint (per Q8's Little's Law framing), not instruction throughput. RPS-based scaling similarly under-counts load, since a streaming request that holds a connection open for 20 seconds imposes far more sustained resource pressure than twenty ordinary 1-second requests arriving at the same aggregate rate would.</p>
+<p>The right primary signal is concurrent open streams (or a proxy for it, like active connection count), tracked as a gauge and scaled against empirically-determined per-instance capacity limits established through the kind of realistic streaming load test described in Q61 — not synthetic RPS benchmarks. Secondary signals worth including: event-loop responsiveness/latency (a leading indicator of an instance approaching saturation before connection count alone would show it) and queue depth if requests are fronted by any admission-control layer. The autoscaling policy also needs slower, more conservative scale-down behavior than a typical stateless HTTP service, since forcibly terminating instances still holding open streams (rather than draining them per Q72/Q57) directly produces user-visible broken generations.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">JUNIOR</span>Q81. What does "chunk" mean in the context of an LLM streaming response — is it guaranteed to be exactly one token?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>No — a "chunk" is simply whatever unit of text a given provider or server-side implementation chooses to emit as one streaming event, and this is not standardized across providers or even guaranteed to be consistent from response to response within the same provider. It might be a single token, a few tokens grouped together, or a re-chunked unit if the server normalizes provider output (Q59) — application code should never assume any specific granularity, such as "one chunk equals one word," when parsing or rendering streamed output.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">JUNIOR</span>Q82. Why does a streaming response typically use <code>Content-Type: text/event-stream</code> instead of <code>application/json</code>?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>application/json</code> implies a single, complete, well-formed JSON document as the entire response body — something that, by definition, isn't available until generation finishes, defeating the point of streaming. <code>text/event-stream</code> signals a fundamentally different response shape: an open-ended sequence of discrete text-formatted events sent over time, which is exactly what streaming needs and what browser APIs like <code>EventSource</code> are built to consume.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">JUNIOR</span>Q83. If a user is on a slow mobile connection, does streaming still provide meaningful value even if the total time to see the full answer ends up similar to a non-streaming call?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>Yes — the value of streaming is concentrated in TTFT, not total duration, so even on a slow connection where total time-to-completion is similar either way, a user who sees the first words appear quickly experiences the interaction as responsive and knows the system is working, versus staring at a blank/loading state for the same overall duration with a non-streaming call, which reads as unresponsive or possibly broken regardless of what's happening on the backend.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">JUNIOR</span>Q84. What's a simple client-side pattern for appending each streamed chunk to a growing message bubble in a chat UI?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Maintain a single mutable string (or equivalent UI state variable) representing the in-progress assistant message, and on each received chunk, append the new text delta to it and re-render just that one message element — rather than re-fetching or reconstructing the entire chat history on every chunk, which would be both wasteful and, at high update frequency, a real performance problem (see Q85).</p>
+</div>
+
+<div class="question" id="q85"><span class="level">JUNIOR</span>Q85. Why should you avoid re-rendering an entire large chat history on every single incoming token in a streaming UI?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>If every incoming chunk triggers a full re-render of the whole conversation view rather than just the actively-updating message, rendering cost grows with total conversation length and gets repeated dozens or hundreds of times per response (once per chunk), which can visibly degrade UI smoothness — especially on longer conversations or less powerful devices. Scoping updates to just the single in-progress message (e.g., via component-level state isolation in a framework like React) keeps per-chunk rendering cost roughly constant regardless of how long the surrounding conversation has grown.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">JUNIOR</span>Q86. What does it mean that <code>Flux&lt;ChatResponse&gt;</code> is a "publisher" in Reactive Streams terms, and who is the "subscriber" in a typical Spring AI streaming setup?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>In Reactive Streams terminology, a publisher is a source that emits a sequence of elements over time to whoever subscribes, and a subscriber is the consumer that receives them (and signals demand/cancellation back). In a typical Spring AI streaming setup, the <code>Flux&lt;ChatResponse&gt;</code> from <code>ChatModel.stream()</code> is the publisher, and the subscriber is ultimately the WebFlux HTTP layer writing each emitted chunk out to the client connection — with any intermediate operators (<code>map</code>, <code>doOnNext</code>, etc.) sitting transparently in between as both subscribers to what's upstream and publishers to what's downstream.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">JUNIOR</span>Q87. Can you meaningfully log the full assistant response before the stream has finished sending to the client? Why or why not?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>No — the full response text doesn't exist as a complete value until generation has finished producing all of it, so any code path that logs "the full response" has to run after the stream completes (e.g., in a <code>doOnComplete</code> callback on an accumulator), not before or during. Logging attempted earlier would only ever see whatever partial text has arrived so far, which is fine if that's explicitly what's intended (partial-state debugging) but wrong if the goal is to record the complete final answer.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">JUNIOR</span>Q88. What's the basic reason streaming can't be retrofitted onto every existing synchronous endpoint just by changing the return type?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Changing a method's declared return type to a reactive one doesn't automatically make everything it calls non-blocking — if the implementation still calls a blocking API underneath (a synchronous JDBC repository, a blocking HTTP client, a `.call()` on the model instead of `.stream()`), wrapping that in a reactive type just hides a blocking operation inside a `Mono`/`Flux` without changing its fundamentally blocking behavior. Genuine streaming requires the underlying call chain — the model client, any data access, any downstream calls — to actually support non-blocking, incremental emission end to end, not just a type signature change at the boundary.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">MID</span>Q89. How would you rate-limit based on tokens streamed rather than requests received, and why might that be a more accurate cost control for AI streaming endpoints?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A per-request rate limit treats a one-line answer and a ten-thousand-token generation identically, which poorly reflects actual cost, since LLM billing (and server resource consumption) scales with tokens generated, not request count. A token-based limiter instead tracks a rolling budget of tokens consumed per client/API key over a time window, decrementing it as usage metadata becomes available (typically at stream completion, per Q52) and rejecting or throttling new requests once the budget is exhausted — giving a control that actually tracks the dimension driving cost and load, at the expense of being harder to enforce pre-emptively, since (unlike request count) the token cost of a given request generally isn't fully known until after it has already started streaming.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">MID</span>Q90. Summarize, as you would to a junior engineer, the single most common bug you see in first-time Spring AI streaming implementations, and how to avoid it.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The single most common bug is a stray blocking call somewhere in the pipeline — most often a `.block()` call on the `Flux` itself (sometimes added "just to test it works" and never removed), but sometimes a hidden blocking dependency like a synchronous database call inside a `doOnNext`. Either one silently defeats streaming: the code compiles fine, the feature appears to "work" in casual testing since a complete, correct response still eventually shows up, but the user experience is functionally identical to no streaming at all — no early tokens, no TTFT benefit — and worse, a `.block()` on a WebFlux event-loop thread also degrades every other concurrent request sharing that thread. The fix is a standing discipline: audit every operator and dependency in a streaming chain for blocking behavior, never call `.block()` in production reactive code, and verify the fix by actually watching network traffic (or timing TTFT specifically) rather than just confirming the final rendered answer looks correct — since a broken, non-streaming-in-practice implementation and a correctly streaming one produce an identical final result and are indistinguishable without checking timing.</p>
+</div>
+
 </div>
 
 <hr>

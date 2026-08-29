@@ -614,6 +614,529 @@ This is a topic large enough that Volume 5's guardrails chapters return to it in
 <p>Treat the tool catalog itself as a governed API surface, not an implicit side effect of which Spring beans happen to be wired up. Concretely: maintain a versioned, reviewable registry of tool specs (name, description, schema, owning team, risk classification — read-only vs. state-changing vs. financial/destructive); scope which tools are exposed per calling context (role, tenant, application) rather than exposing the full catalog everywhere; require the same authorization and validation discipline at each tool's execution boundary regardless of which assistant calls it; centralize audit logging of every tool invocation across teams; and require a documented review (similar to an API design review) before a new state-changing tool is added, given that a probabilistic caller now has access to it instead of only deterministic client code.</p>
 </div>
 
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. What does the <code>@Tool</code> annotation do, and what does a minimal tool method look like?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Placing <code>@Tool</code> on a public method marks it as something the model may be offered as a callable function. Spring AI reads the method's signature and the annotation's <code>description</code> to build a tool specification (name, description, JSON parameter schema) that gets attached to every chat request. A minimal example:</p>
+<pre><code>class WeatherTools {
+    @Tool(description = "Get the current temperature for a city")
+    String getTemperature(String city) {
+        return weatherClient.fetch(city).toString();
+    }
+}</code></pre>
+<p>Registering an instance of this class on a <code>ChatClient</code> makes <code>getTemperature</code> available for the model to invoke by name.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">JUNIOR</span>Q11. What requirements does a method have to satisfy to be usable as a tool?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It must be public (or at least accessible to the Spring AI reflection machinery), annotated with <code>@Tool</code>, and belong to an object instance you actually register — a plain unregistered class with the annotation does nothing on its own. Its parameters should be simple or well-structured serializable types (primitives, strings, enums, POJOs, collections of those) because each parameter has to be representable as JSON Schema, and its return type should be something that serializes cleanly to a string or JSON, since the return value becomes the content of a <code>ToolResponseMessage</code>.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. How do you tell Spring AI which methods to expose as tools on a given <code>ChatClient</code> call?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>You pass one or more objects containing <code>@Tool</code>-annotated methods to the fluent <code>.tools(...)</code> method on the <code>ChatClient</code> (either at <code>.builder()</code> configuration time so it applies to every call, or per-call via <code>.prompt().tools(myBean)</code>). Spring AI reflects over the object at that point, discovers every <code>@Tool</code> method, and builds a <code>ToolCallback</code> for each one, which is what actually gets attached to the outgoing request.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. Why does the <code>description</code> attribute on <code>@Tool</code> matter so much?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The description is the only signal the model has for deciding whether this tool is relevant to the user's request and how to fill in its arguments — it is not documentation for a human reader, it is the primary input to a selection decision made by a language model. A vague description ("does stuff with orders") produces unreliable tool selection and poorly-formed arguments; a precise one ("looks up the current shipping status of an order by its numeric order ID") lets the model match intent correctly and pass the right argument. The same applies to parameter-level descriptions, which is why sloppy descriptions are one of the most common causes of "the model just doesn't call my tool right" bug reports.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">JUNIOR</span>Q14. What is <code>@ToolParam</code> and how does it differ from <code>@Tool</code>?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><code>@Tool</code> annotates the method itself and describes the tool as a whole; <code>@ToolParam</code> annotates an individual parameter to give it its own description and to mark it explicitly as required or not. For example:</p>
+<pre><code>@Tool(description = "Refund an order")
+String refund(
+    @ToolParam(description = "The numeric order ID", required = true) long orderId,
+    @ToolParam(description = "Amount in cents") Integer amountCents) {
+    ...
+}</code></pre>
+<p>Without <code>@ToolParam</code>, Spring AI still infers a basic schema from the parameter's Java type and name, but the description defaults to empty, which weakens the model's ability to fill the argument correctly.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">JUNIOR</span>Q15. In terms of model round trips, what does a single tool call actually cost?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>At minimum two full inference calls to the model: one where the model receives the user's message plus the tool catalog and responds with a tool-call request instead of text, and a second where it receives the tool's real result appended to the conversation and produces the final answer (or another tool call). Each additional tool call the model decides it needs adds another round trip, so a question that requires chaining three tools costs at least four model calls end to end, not one.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">MID</span>Q16. How does Spring AI generate a JSON schema for a tool's parameters from a plain Java method signature?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>At tool-registration time, Spring AI reflects over the method's parameter list and, for each parameter, inspects its Java type, its name (or the name declared via <code>@ToolParam</code>), and any description/required metadata, then walks that type recursively to build a JSON Schema object: primitives and strings map to their obvious JSON types, enums become a schema with an <code>enum</code> constraint listing constants, arrays/collections become a schema with <code>items</code>, and POJOs become nested <code>object</code> schemas with their own properties derived the same way. This generated schema, together with the tool's name and description, is what actually gets serialized into the provider's function/tool-definition payload — the Java signature is effectively the source of truth for the contract the model sees.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">JUNIOR</span>Q17. Can a <code>@Tool</code> method return <code>void</code>? What happens then?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes — for tools whose purpose is a side effect rather than returning data (e.g., "send an email," "log an event"), a <code>void</code> method is valid. Spring AI still needs to put <em>something</em> in the <code>ToolResponseMessage</code> it feeds back to the model, so it substitutes a fixed placeholder result (effectively "Done" or similar) indicating the call completed, since the model still needs a message in that position of the conversation to know execution finished before it produces its next output.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">MID</span>Q18. How does a nested POJO parameter turn into a JSON schema, and what should you watch for?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Spring AI recurses into the POJO's fields the same way it handles top-level parameters, producing a nested <code>object</code> schema whose <code>properties</code> mirror the POJO's fields, with their own types, descriptions (via field-level <code>@ToolParam</code> or Jackson annotations), and required flags. What to watch for: every level of nesting adds tokens to every request the tool is registered on, so a deeply nested DTO with many optional fields can bloat the schema considerably; it's usually better to flatten a tool's inputs to only what the model genuinely needs to supply, and let your own code fill in the rest from application context.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">JUNIOR</span>Q19. How is a Java enum parameter represented in the generated tool schema?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It becomes a string-typed schema with an explicit <code>enum</code> array listing every constant's name, which constrains the model to choosing only one of those literal values rather than generating arbitrary free text — this is one of the cheapest, most effective ways to eliminate an entire category of invalid-argument errors, since the provider itself enforces that the returned value is one of the allowed strings before your code ever sees it.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">MID</span>Q20. Walk through the low-level request/response wire protocol for one tool-call round trip against the LLM provider.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Request 1: your app sends the conversation (system + user messages) plus a <code>tools</code> array, each entry containing a name, description, and JSON Schema for parameters. Response 1: instead of a normal assistant message with text content, the provider returns a message whose content includes one or more tool-call objects, each with a generated call ID, the chosen tool's name, and a JSON string of arguments. Your code parses that, executes the real method, and serializes its result. Request 2: you resend the full conversation, now including that assistant tool-call message plus a new tool-role message per call ID carrying the real result. Response 2: the model produces either a final text answer grounded in that result, or another tool-call message, repeating the cycle. Spring AI models this internally as <code>AssistantMessage</code> (carrying <code>ToolCall</code> entries) and <code>ToolResponseMessage</code>, translating them to/from each provider's specific wire format.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">MID</span>Q21. What is a <code>ToolResponseMessage</code>, and what does it carry?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It is the Spring AI message type representing the real result of a tool execution being fed back into the conversation. It carries a list of individual tool responses, each tying a <code>toolCallId</code> (matching the ID the model generated for that specific call) to the tool's <code>name</code> and its serialized result content. The ID correlation matters because a single assistant turn can request several tool calls at once, and the provider needs to know unambiguously which result answers which request.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">MID</span>Q22. What does <code>AssistantMessage.ToolCall</code> represent, and how does it relate to the request that follows it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>It is Spring AI's representation of one tool invocation the model asked for inside an assistant turn: an ID, the tool's name, and the raw JSON arguments string. That same assistant message (with its <code>ToolCall</code> entries intact) is preserved and resent as part of the conversation history on the next request, immediately followed by the matching <code>ToolResponseMessage</code>(s) — the provider expects to see the exact call it made, followed by the exact result, in order to keep the model's own reasoning about "what did I ask for, what did I get back" consistent.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">SENIOR</span>Q23. Why must a <code>ToolResponseMessage</code> immediately follow its corresponding tool-call-bearing <code>AssistantMessage</code>, and what happens if that ordering is violated?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Most providers validate conversation structure server-side: a tool-role message is only valid as a direct reply to the specific tool-call ID it references, and an assistant message containing unresolved tool calls with no matching tool response is an invalid, incomplete turn. If you reorder messages, drop a response, or insert unrelated messages between the call and its response — which can easily happen if you're manually managing conversation history, truncating context for token budget reasons, or merging multiple conversation branches — the provider will typically reject the request outright with a validation error rather than silently guessing, because tool call/response pairing is treated as a structural contract, not a stylistic convention.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. What is <code>ToolCallback</code>, and how does it relate to the <code>@Tool</code> annotation under the hood?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p><code>ToolCallback</code> is the actual abstraction Spring AI's chat infrastructure operates on: it exposes a <code>ToolDefinition</code> (name, description, JSON schema) and a <code>call(String arguments)</code> method that executes the tool and returns its result as a string. <code>@Tool</code> is a convenience layer on top of it — when you register an annotated object, Spring AI builds one <code>ToolCallback</code> per annotated method behind the scenes (reflectively invoking the real method inside <code>call(...)</code>), so at the level the framework actually operates, there is no difference between an annotation-derived tool and one you construct by hand.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. What is <code>ToolCallbackProvider</code> used for?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It's an abstraction for supplying a whole collection of <code>ToolCallback</code>s at once rather than registering objects one at a time — <code>MethodToolCallbackProvider</code>, for instance, scans one or more given bean instances for <code>@Tool</code> methods and produces the full set of callbacks in one step. It's the natural mechanism for centralizing "here is the full tool catalog available to this application" in one Spring-managed place, rather than scattering <code>.tools(...)</code> calls with individual objects across the codebase.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">JUNIOR</span>Q26. How do you register multiple tools on a single <code>ChatClient</code> call?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>By passing several tool-bearing objects (or a mix of objects and individual <code>ToolCallback</code>s) into <code>.tools(...)</code>, either as varargs or via a <code>ToolCallbackProvider</code>:</p>
+<pre><code>chatClient.prompt()
+    .user(userMessage)
+    .tools(weatherTools, orderTools, emailTools)
+    .call()
+    .content();</code></pre>
+<p>Spring AI merges every <code>@Tool</code> method found across all of them into one flat tool catalog sent with the request; the model can then choose any one (or several) of them by name.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">MID</span>Q27. Mechanically, how does the model choose which of several registered tools to call?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The provider receives the full list of tool specs (name, description, parameter schema) as part of the request and, during generation, produces a probability distribution over "answer directly" versus "call tool X with these arguments" for each registered tool, conditioned on the conversation so far — it is fundamentally the same next-token/next-structured-output prediction the model always does, just constrained to choose among the offered function signatures instead of free text. Nothing outside the model — no Spring AI code, no client-side heuristic — makes that selection; the framework's only job is to present the catalog faithfully and then execute whatever the model decided.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">SENIOR</span>Q28. What happens at the protocol/registration level if two tools registered on the same <code>ChatClient</code> call share the same name?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Tool names have to be unique within a single request's tool catalog because the provider correlates a tool call back to a definition purely by name, and because Spring AI itself typically keys its internal tool-callback resolution map by name — registering two callbacks under the same name results in one silently overwriting the other during registration (last one wins) rather than a graceful merge, which is a real production hazard if two unrelated teams' tool-bearing beans happen to expose a method with the same default name. The mitigation is explicit, namespaced tool names (e.g., <code>orders.refund</code> rather than just <code>refund</code>) rather than relying on Java method names, which have no cross-team uniqueness guarantee at all.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. What is <code>ToolCallingChatOptions.toolNames(...)</code> used for?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>It lets you narrow, per request, which of the tools already registered on a <code>ChatClient</code> are actually offered to the model this time, by name — the callbacks themselves stay registered globally, but only the named subset is included in that specific request's tool catalog. This is the mechanical building block for scoping tool availability dynamically (by user role, feature flag, or conversation state) without needing to construct a brand-new <code>ChatClient</code> or re-register tool objects for every variation.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">SENIOR</span>Q30. How would you scope which tools are available on a per-request basis — e.g., different roles get different tools — using the Spring AI API?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Register the full tool catalog once (e.g., via a <code>ToolCallbackProvider</code> at application startup), then at request time compute the allowed subset of tool names from the authenticated caller's role/permissions and pass that list into <code>ToolCallingChatOptions.toolNames(...)</code> (or the equivalent per-call options) so only that subset is sent to the model for this particular request. Critically, this is a defense-in-depth layer, not the actual authorization boundary — every tool implementation must still independently verify the caller is allowed to perform the action inside the method body itself, because omitting a tool from the offered list only stops the model from choosing to call it; it does nothing to stop a manually-constructed or externally-triggered call that bypasses this selection step.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">MID</span>Q31. What is the difference between internal and external (manual) tool execution in Spring AI?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>By default, Spring AI's <code>ChatClient</code>/<code>ChatModel</code> handles the entire tool-call loop internally: it detects a tool-call response, executes the matching <code>ToolCallback</code>, builds the <code>ToolResponseMessage</code>, and resends the request automatically, returning only the final text answer to your code. With internal execution disabled (<code>internalToolExecutionEnabled(false)</code> on the relevant options), the framework instead returns the raw tool-call response to your application, and it becomes your responsibility to execute the tool(s) and manually issue the follow-up request with the results — giving you a manual, external execution loop instead of an automatic one.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">SENIOR</span>Q32. Why would you disable Spring AI's automatic tool-execution loop and handle tool calls yourself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Several legitimate reasons: you need to run the tool asynchronously or on a different thread/queue than the request thread (e.g., a long-running job dispatched to a worker); you need a human-in-the-loop confirmation step before a state-changing tool actually executes, so the "call" has to surface to a UI and wait rather than run immediately; you want custom cross-cutting behavior around every tool execution (rate limiting, additional auditing, a bespoke retry policy) that doesn't fit Spring AI's built-in execution path; or you're building a UI that needs to show the user "the assistant wants to do X" as a distinct, inspectable step rather than a black box that resolves before your code sees anything.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. What does the <code>returnDirect</code> attribute on <code>@Tool</code> do, and when would you use it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>When <code>returnDirect = true</code>, Spring AI treats that tool's raw result as the final response of the whole interaction, skipping the second model round trip that would normally let the model turn the result into prose. This is appropriate for tools that already produce a complete, user-ready payload — e.g., a tool that returns a fully-formed chart, document, or structured object your UI renders directly — where sending the result back through the model a second time would add cost and latency for no benefit, or could even risk the model paraphrasing/corrupting structured data it was never meant to touch.</p>
+<pre><code>@Tool(description = "Generate a downloadable invoice PDF link", returnDirect = true)
+String generateInvoice(long orderId) { ... }</code></pre>
+</div>
+
+<div class="question" id="q34"><span class="level">SENIOR</span>Q34. If the model requests one <code>returnDirect</code> tool alongside another ordinary tool in the same turn, what should happen?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>This is a genuine edge case worth reasoning through explicitly in an interview: conceptually, <code>returnDirect</code> means "stop and hand this straight back," but if a second, non-direct tool call was requested in the same assistant turn, blindly short-circuiting could discard a call the model considered necessary. In practice you want a deliberate policy rather than accidental behavior — either execute all requested calls in the turn and only skip the extra model round trip if every one of them is marked <code>returnDirect</code>, or treat a mixed batch as a design smell to avoid in the first place by keeping <code>returnDirect</code> tools single-purpose and rarely combined with others, and verifying with a test what your specific Spring AI version actually does rather than assuming.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. How does Spring AI handle multiple tool calls returned by the model in a single assistant turn?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Providers that support parallel tool calling can return several <code>ToolCall</code> entries on one <code>AssistantMessage</code> in a single response — e.g., the model deciding it needs both a weather lookup and a calendar lookup to answer one question. Spring AI executes the corresponding <code>ToolCallback</code> for each entry and assembles all of the individual results into one <code>ToolResponseMessage</code> carrying multiple tool responses, each correlated back to its own call ID, before sending the single follow-up request that includes all of them at once — the model doesn't see a separate round trip per tool call within the same turn.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">SENIOR</span>Q36. Are parallel tool calls within a single turn executed sequentially or concurrently, and what does that imply for your tool implementations?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Spring AI's default internal execution processes the tool calls in a turn one after another on the calling thread rather than fanning them out concurrently, so overall latency for that turn is the sum of every requested tool's execution time, not the max. This matters for design: if you have several genuinely independent, slow tool calls in a turn (multiple external API lookups, for instance), sequential-by-default execution is a real latency cost you may need to address deliberately — either by making the individual tools fast enough that it doesn't matter, or by taking over execution manually (disabling internal execution) so you can dispatch the calls concurrently yourself and reassemble the responses before issuing the follow-up request.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">SENIOR</span>Q37. What thread-safety guarantees must a <code>@Tool</code>-annotated method provide, given how it may be invoked?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Because the same tool-bearing bean is typically registered once and reused across many concurrent chat requests (and potentially invoked multiple times within one request when the model calls it repeatedly, or by different requests in parallel on a multi-threaded server), tool methods must be safe to call concurrently — no mutable instance state without proper synchronization, no reliance on thread-local context that wasn't explicitly set up for that call, and any collaborators (HTTP clients, repositories) used inside the method should themselves be thread-safe, exactly the same discipline you'd apply to any singleton-scoped Spring bean method handling concurrent requests.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. What happens when a <code>@Tool</code> method throws an exception during execution?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>By default, Spring AI catches the exception during internal tool execution and, rather than letting it propagate and abort the whole chat request, converts it into an error result that gets sent back to the model inside the <code>ToolResponseMessage</code> — effectively telling the model "this call failed, here's why" so it can reason about what to do next (retry with different arguments, try a different tool, or apologize to the user), instead of your application crashing on every downstream failure a tool happens to hit.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">SENIOR</span>Q39. How do you turn a tool execution failure into something the model can gracefully recover from, rather than crashing the whole conversation?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Design the tool method to catch expected failure modes itself and return a clear, structured, non-throwing error description as its normal string result (e.g., <code>"error: order 48213 not found"</code>) rather than letting an exception escape at all — this puts you in full control of exactly what the model sees and keeps the behavior identical across providers, instead of depending on however Spring AI's default exception-to-tool-response conversion happens to format things. Distinguish between errors the model can meaningfully act on (bad input it could correct, a resource that doesn't exist) versus ones it can't (an internal server outage) — for the latter, a concise, non-leaky message plus letting the model apologize and stop calling that tool is preferable to encouraging endless blind retries.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">SENIOR</span>Q40. What is a <code>ToolExecutionException</code>, and how would you use it deliberately?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>It's the exception type Spring AI recognizes specifically as "a tool failed in an expected, tool-execution-related way," which carries the information needed to build a proper error result for the model rather than being treated as an unexpected framework-level failure. Throwing it deliberately (instead of letting some arbitrary runtime exception bubble up) lets you attach a clean, model-appropriate error message while still using exception-based control flow in the tool's implementation, which keeps validation/failure code paths readable without manually constructing an error string return value at every failure point in the method body.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">JUNIOR</span>Q41. Why shouldn't a raw stack trace or internal exception message flow back to the model as a tool's error result?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A raw stack trace can leak internal implementation details — class names, package structure, database schema fragments, internal hostnames — into the conversation, and because the model's next output can end up quoted or paraphrased to the end user, that becomes an information-disclosure path with no security review in between. It's also just unhelpful: a stack trace gives the model noisy, low-signal text to reason from instead of a clear, actionable statement of what went wrong, so error messages returned from a tool should be deliberately written, concise, and free of internal detail, the same way you'd design a public API's error responses.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">SENIOR</span>Q42. Design an error-handling strategy for a tool that calls a flaky downstream microservice.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Wrap the downstream call with a bounded retry (a couple of attempts with short backoff) for transient failures like timeouts, since retrying inside the tool is invisible and cheap compared to letting the model retry by re-issuing the same call (which costs a full extra model round trip and isn't guaranteed to happen at all). Wrap that in a circuit breaker so a sustained outage fails fast instead of making every tool call in every conversation wait out the full timeout. If the call ultimately fails, catch it and return a clear, bounded error string ("the order service is temporarily unavailable, please try again shortly") rather than propagating the raw exception, and log the real failure with full context on your side for operational visibility — the model only ever needs to see the sanitized, user-safe version.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. What is <code>ToolContext</code> in Spring AI, and what problem does it solve?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p><code>ToolContext</code> is a side-channel map of application-supplied data that gets passed into a tool method alongside the model-supplied arguments, without ever being exposed to the model or included in the tool's JSON schema. It solves the problem of tools needing information the caller shouldn't (or can't safely) provide as a model-visible parameter — most commonly the authenticated user's ID, tenant, or request-scoped metadata — by letting your application code inject that context explicitly when building the request, and letting the tool method declare a <code>ToolContext</code> parameter to read it, entirely outside the model's control.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">SENIOR</span>Q44. How would you pass the authenticated user's identity into a tool method without letting the model see or forge it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Never make the user/tenant ID a model-supplied tool parameter — anything in the schema is something the model (or a prompt-injected instruction) can set to an attacker-chosen value. Instead, capture the real authenticated identity from your application's own security context (e.g., the current HTTP request's principal) at the point you build the chat request, inject it into <code>ToolContext</code>, and have the tool method read it from there and use it as the actual authorization key for whatever it does — so even if the model is manipulated into requesting "refund order X for user Y," the tool only ever acts as the real logged-in caller, and any mismatch between a model-supplied identifier and the real session becomes a check the tool enforces itself rather than trusting either the model or its own arguments.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">JUNIOR</span>Q45. Can a <code>@Tool</code> method be static? Does it need to be on a Spring bean?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It doesn't strictly need to be a Spring-managed bean — Spring AI's tool discovery works off any object instance you pass to <code>.tools(...)</code>, reflectively, so a plain POJO instance works fine. A static method generally isn't the pattern used, though, because tools typically need collaborators (an HTTP client, a repository) injected as instance state to do real work; registering an instance (often itself a Spring <code>@Component</code> so its own dependencies are wired normally) is the common and more testable approach.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. What's the difference between the <code>@Tool</code> annotation approach and the older <code>FunctionCallback</code>/<code>java.util.function.Function</code>-based tool registration?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The older approach registered tools as Spring beans implementing <code>Function&lt;Request, Response&gt;</code> (or similar functional interfaces), with the request/response record types themselves annotated (e.g., via Jackson) to drive schema generation, and the bean's name became the tool's name. <code>@Tool</code> is a more direct, declarative model: annotate the method you already have, describe it in place, and Spring AI derives everything from the method signature directly rather than requiring a dedicated functional wrapper type — less ceremony for simple tools, though the underlying mechanism (a callback exposing a definition plus an executable call) is conceptually the same either way, and both ultimately produce a <code>ToolCallback</code>.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">MID</span>Q47. How do you build a <code>ToolCallback</code> manually with a builder instead of using <code>@Tool</code>, and when would that be preferable?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Spring AI provides a fluent builder (<code>FunctionToolCallback.builder(name, function)</code> style) that lets you specify the name, description, input schema/type, and the executing function explicitly rather than deriving them from an annotated method:</p>
+<pre><code>ToolCallback refundTool = FunctionToolCallback
+    .builder("refundOrder", (RefundRequest req) -> refundService.refund(req))
+    .description("Refund an order by ID")
+    .inputType(RefundRequest.class)
+    .build();</code></pre>
+<p>This is preferable when the "tool" doesn't map cleanly to an existing annotated method — e.g., you want to register a lambda, a method reference from a class you don't own and can't annotate, or a tool whose behavior needs to be assembled dynamically at runtime (different implementations per environment or tenant) rather than being a fixed method body.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">JUNIOR</span>Q48. How does the model know a tool parameter is optional versus required?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The generated JSON schema for the tool includes a <code>required</code> array listing exactly which parameter names must be present; anything not in that list is treated as optional. Spring AI infers this primarily from the Java type (a primitive like <code>long</code> can't be absent, so it's required by default; a boxed type like <code>Long</code> or a type explicitly marked optional can be omitted) and from any explicit <code>required</code> flag set via <code>@ToolParam</code>, which always takes precedence over the inferred default.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">MID</span>Q49. How would you explicitly mark a tool parameter as required if it isn't already inferred correctly?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Set it directly on the parameter's <code>@ToolParam</code> annotation: <code>@ToolParam(required = true)</code>. This is necessary any time the inferred default doesn't match intent — most commonly a boxed wrapper type (<code>Integer</code>, <code>String</code>) that Spring AI would otherwise treat as optional because it's nullable in Java, but that your tool's business logic genuinely cannot proceed without; being explicit here removes any ambiguity for the model rather than relying on type-inference defaults that can silently diverge from what the method actually needs.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">SENIOR</span>Q50. Why is JSON-schema argument validation not the same as semantic/business validation, and what's the risk of assuming otherwise?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Schema validation only guarantees shape: a string is a string, a number is within its declared type, an enum value is one of the listed options. It says nothing about whether the value makes sense in context — an <code>orderId</code> of the right type that doesn't exist, belongs to a different customer, or was already refunded all pass schema validation cleanly. The risk of treating "the provider validated the arguments against my schema" as sufficient is that it creates a false sense of safety around exactly the checks that actually prevent harm — ownership, state transitions, business invariants — none of which a JSON Schema can express, so every tool implementation still needs to perform its own semantic validation on every call, identically to how a REST controller can't skip business validation just because a request body deserialized successfully.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. A tool takes a free-text <code>query</code> string used to build a database query inside the implementation. What are the risks, and how do you mitigate them?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The risk is structurally identical to SQL injection from any other untrusted input source — the model's argument generation is influenced by conversation content, which can include text pulled from documents, tool results, or user messages that themselves contain adversarial instructions (prompt injection), so a free-text argument used to construct a query string can end up carrying injected SQL or query-language syntax the model never "intended" maliciously but reproduced faithfully from manipulated input. Mitigation is the same discipline as any other untrusted-input boundary: never concatenate the argument into a query string, always use parameterized queries or prepared statements, prefer narrow structured parameters (an ID, an enum filter) over a single freeform search string wherever the use case allows it, and apply allow-listing/length limits on any text field that does have to stay freeform.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">SENIOR</span>Q52. How would you prevent a tool call's arguments from being used to trigger arbitrary code execution or filesystem access beyond intended scope?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The core rule is that a tool's implementation must never use a model-supplied argument to dynamically construct or select what code runs — no building a class name, script, or shell command from a string argument and executing it via reflection, a process launcher, or an interpreter, because that turns argument generation (a probabilistic text process) directly into a code-execution primitive. For a file-path-style argument, validate it against an explicit allow-list of permitted paths or resource identifiers rather than the raw string (canonicalize and check for path traversal sequences if a path must be accepted at all), and if the tool must support something inherently powerful like running user-provided code (a "code interpreter" style tool), that execution belongs in a sandboxed, resource-limited environment (container, gVisor/microVM, no network or scoped network) entirely separate from the application process, never inline in the tool method itself.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> The strongest answer draws the line explicitly: schema-typed, narrow parameters plus server-side validation prevent most injection classes outright; anything that must remain a powerful freeform capability (code execution, arbitrary file access) needs isolation at the infrastructure level, because no amount of prompt engineering or schema constraint is a substitute for a real security boundary.</div>
+
+<div class="question" id="q53"><span class="level">MID</span>Q53. Why is it safer to design tool parameters as narrow, typed values rather than a single freeform string the model composes itself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A narrow parameter (an <code>orderId</code> as a <code>long</code>, a status as an enum) has a schema the provider itself enforces before your code ever runs, and a much smaller space of things that can go wrong — there's no injection surface in an integer. A single freeform string that the model is expected to compose correctly (e.g., "a SQL WHERE clause" or "a shell command") pushes all of the correctness and safety burden onto the model's text generation, which is neither reliable nor a trust boundary; narrow, structured parameters shift validation to compile-time-checked types plus explicit business rules in your own code, which is exactly the same reasoning that favors typed API request DTOs over a single freeform payload field in ordinary web development.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">STAFF</span>Q54. Design the security review checklist you'd require before a new state-changing tool is allowed onto a production tool-calling assistant.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>At minimum: (1) every parameter is as narrow and typed as the use case allows, with no freeform field used to construct queries, commands, or file paths; (2) the implementation performs its own authorization check against the real authenticated caller from <code>ToolContext</code>, never trusting a model-supplied identity; (3) the action's blast radius is bounded — amount limits, rate limits, or a required confirmation step for anything irreversible or above a threshold; (4) errors are caught and converted to sanitized, non-leaky messages before reaching the model; (5) every invocation is logged with full arguments, caller identity, and outcome for audit; (6) the tool has automated tests covering both its business logic and adversarial/malformed-argument inputs; and (7) the tool's description and parameter schema have been reviewed for ambiguity that could cause accidental misuse by the model, the same way an API's public contract would be reviewed before shipping. This should be a documented, repeatable review gate, not an ad hoc judgment call per team.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">MID</span>Q55. What's the difference between the JSON schema sent to the provider and Bean Validation (JSR-380) annotations on the same DTO — do both run?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The JSON schema is enforced by the LLM provider before the tool call is even returned to your application — it constrains what shape of arguments the model is allowed to emit. Bean Validation annotations (<code>@NotNull</code>, <code>@Min</code>, <code>@Size</code>, and so on) on the same DTO are a separate, server-side check that only runs once the arguments are deserialized inside your own code, and Spring AI does not automatically trigger Bean Validation for you on tool arguments — if you want it, you invoke a <code>Validator</code> explicitly at the top of the tool method (or via AOP/interceptor). The two are complementary, not redundant: schema validation is a provider-side courtesy that catches gross shape mismatches early and cheaply, while Bean Validation plus custom business checks are the layer you actually control and can rely on for correctness.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">SENIOR</span>Q56. How would you sandbox execution of a particularly risky tool — e.g., one that runs generated code or shell commands?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Never execute such a tool's logic in the same process, container, or trust domain as the rest of your application. Run it in an isolated, ephemeral sandbox — a locked-down container or microVM with no access to your internal network, a read-only or scratch-only filesystem, strict CPU/memory/time limits, and egress network access disabled or tightly allow-listed — and treat every invocation as untrusted regardless of how the arguments were validated upstream. Tear the sandbox down after each execution rather than reusing it, so no state or side effect from one call can leak into another, and stream only the sandbox's captured stdout/result back into the tool's return value, never raw execution artifacts.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">MID</span>Q57. How do you unit test a <code>@Tool</code>-annotated method in isolation, without invoking any LLM?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Because a <code>@Tool</code> method is just a regular Java method with an annotation on it, you test it exactly like any other unit — instantiate the class (mocking its collaborators, e.g. a repository or HTTP client), call the method directly with hand-constructed arguments, and assert on its return value or thrown exceptions:</p>
+<pre><code>@Test
+void refundReturnsErrorMessageForUnknownOrder() {
+    OrderTools tools = new OrderTools(mockOrderRepository);
+    when(mockOrderRepository.find(999L)).thenReturn(Optional.empty());
+    String result = tools.refund(999L, 500);
+    assertThat(result).contains("not found");
+}</code></pre>
+<p>No LLM, no <code>ChatClient</code>, and no schema generation is involved at all — that machinery is entirely orthogonal to whether the tool's own logic is correct, which is exactly why this layer should be covered by fast, ordinary unit tests, not integration tests that spin up a model.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">MID</span>Q58. How would you test that the JSON schema Spring AI generates for a tool matches your expectations?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Build the <code>ToolCallback</code> the same way your application does (via <code>MethodToolCallbackProvider</code> or the builder), call <code>getToolDefinition()</code> on it, and assert directly on the resulting name, description, and schema string/object — e.g., parsing the schema JSON and asserting a given field is present in <code>required</code>, or that an enum parameter lists the expected constants. This catches real regressions like an accidental parameter rename breaking the contract the model relies on, or a forgotten description turning an important parameter unhelpfully generic, without needing to involve a live model call at all.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. How would you write an integration test verifying the full tool-call round trip without hitting a real LLM provider?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Stub the provider's HTTP boundary rather than the model's reasoning — using something like a mock web server (WireMock/MockRestServiceServer) configured to return a canned first response containing a tool-call payload for a known tool/arguments pair, followed by a canned second response containing the final assistant text, matching exactly the shape the real provider would send. Wire the real <code>ChatClient</code>, real <code>ToolCallback</code>s, and real Spring AI tool-execution machinery against that stub server, then assert that: your real tool method was actually invoked (e.g., via a spy) with the expected arguments, the second outgoing request correctly included a <code>ToolResponseMessage</code> with your tool's real result, and the final content returned to the caller is what the stub's second response specified. This exercises the entire serialization/execution/deserialization pipeline deterministically and without cost, which a live-model integration test cannot guarantee.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">MID</span>Q60. How do you mock a <code>ToolCallback</code> in a test that exercises <code>ChatClient</code> logic without executing the real tool body?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Since <code>ToolCallback</code> is an interface with <code>getToolDefinition()</code> and <code>call(String)</code>, you can hand-construct a stub or use a mocking framework to return a fixed <code>ToolDefinition</code> and a canned string from <code>call(...)</code>, then register that stub via <code>.tools(...)</code> instead of your real tool-bearing bean. This is useful when the test's actual focus is something else in the chat pipeline — a custom advisor, request/response logging, error-handling wiring — and you want the tool-execution step to be deterministic and free of any real side effects or dependencies.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. How would you assert, in a test, that a given user prompt correctly triggers exactly one specific tool call with the expected arguments, using a mocked provider response?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Set up the stubbed provider response to return a tool-call payload naming your tool and containing a specific arguments JSON (this is standing in for "the model decided to call this tool this way," which you are not asserting the model actually would do — that's a separate, prompt-quality concern, not a wiring concern). Register a spy/mock in place of the real tool bean, run the request through the real <code>ChatClient</code>, and verify the mock's method was invoked exactly once with arguments matching your expectation (deserialized correctly from the stubbed JSON into your Java parameter types). This confirms the mechanical pipeline — schema-to-invocation deserialization, dispatch to the right tool, single-call semantics — works correctly; it deliberately does not, and cannot, prove the model will choose to call that tool for that prompt in production, which is a prompt/description-quality question outside what a deterministic test can verify.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">JUNIOR</span>Q62. Why is it hard to write a fully deterministic test for "does the model choose to call this tool," and how do teams work around it?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Tool selection is a probabilistic model decision, so even with temperature at zero, behavior can drift across model versions, provider-side updates, or subtle prompt changes, making a strict "given this exact input, always call this exact tool" assertion against a live model brittle and prone to flaky failures unrelated to your code changing. Teams typically split this into two tiers: fast, deterministic unit/integration tests (as above) that stub the provider and verify the mechanical pipeline, plus a smaller, separately-run evaluation suite against a real or near-real model that checks tool-selection accuracy statistically (e.g., "calls the right tool in 95%+ of a labeled sample of prompts") rather than as a pass/fail unit test, accepting that this layer is inherently probabilistic rather than pretending it can be pinned down exactly.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">MID</span>Q63. What's the difference between testing a tool's business logic and testing the tool-calling integration layer, and why do both matter?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Business-logic tests exercise the tool method directly with hand-built arguments and assert on its behavior — no schema, no model, no Spring AI plumbing involved — the same as testing any other service method. Integration-layer tests exercise the plumbing around it: does the generated schema match expectations, does a stubbed tool-call response get correctly dispatched to the right method with correctly deserialized arguments, does the result get correctly packaged back into a <code>ToolResponseMessage</code>. Both matter because they catch different classes of bugs — a business-logic test won't catch a broken parameter name that silently desyncs the schema from what the model expects to send, and an integration test won't catch that the refund amount calculation itself is wrong; skipping either leaves a real gap the other can't cover.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">MID</span>Q64. How does streaming interact with tool calling — can the model stream a tool call the same way it streams normal text?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Providers that support streaming tool calls send the tool call's fields (its ID, name, and especially the arguments JSON) incrementally as a sequence of partial deltas rather than one atomic object, the same delta-based mechanism used for streaming normal text tokens. Your client-side (or Spring AI's internal) accumulation logic has to buffer and reassemble those fragments into a complete, valid arguments JSON string before the tool call is actually executable — a partial delta mid-stream is not valid JSON and cannot be parsed or invoked yet, so streaming doesn't let you start executing a tool call early; it only changes how the request for that call arrives over the wire.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. Walk through what actually happens under a streaming chat response when the model decides mid-stream to invoke a tool.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The stream begins delivering chunks that, instead of populating a growing text answer, populate a tool-call structure — typically an initial chunk with the call's ID and tool name, followed by a series of chunks each appending a fragment of the arguments JSON string, until a terminal chunk signals the tool-call portion of the response is complete. Spring AI's streaming machinery accumulates these fragments internally; only once the full tool-call object is assembled and the stream segment finishes does it become something that can be executed like a non-streamed tool call — the tool is invoked, its result packaged into a <code>ToolResponseMessage</code>, and a new request is issued (which may itself be streamed) to get the model's next output. From the caller's perspective, if internal tool execution is enabled, this entire assembly-then-execute-then-continue sequence typically stays hidden, and what surfaces through the public streaming API is the eventual continuation of visible text output.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">SENIOR</span>Q66. Why can't a client render a tool's result to the user incrementally the same way it renders streamed text tokens?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Streamed text tokens are the final output itself, so showing them as they arrive is exactly what the user should eventually see, just delivered progressively. A tool's result, by contrast, is an intermediate value the model still needs to consume, reason over, and incorporate into its actual response — it is not itself the answer, and showing it raw as it streams would expose internal plumbing (raw JSON, backend field names) the user was never meant to see and that the model hasn't yet had a chance to translate into a coherent, grounded answer. What can reasonably be streamed to the UI as an intermediate signal is a status indicator ("looking up order status…") derived from the fact that a tool call is happening, not the tool's literal payload.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. If a tool call is detected while streaming, does Spring AI still complete a full non-streamed round trip for that tool internally?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Effectively yes for the tool-execution step itself: once the streamed tool-call fragments are fully assembled into a complete call, executing the tool is not itself a streaming operation — the <code>ToolCallback</code>'s <code>call(...)</code> runs synchronously and returns a complete result, exactly as it would in a non-streaming flow. What streaming changes is only how the surrounding model output (the assembly of the tool-call request, and the model's eventual continuation after receiving the result) is delivered over the wire in chunks; the actual tool-execution boundary in the middle is not itself a streamed operation and behaves the same regardless of whether the enclosing chat interaction is streamed or not.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">JUNIOR</span>Q68. Does the presence of tool definitions in a request affect token cost even if the model doesn't end up calling any tool?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Yes. The full tool catalog — every registered tool's name, description, and parameter schema — is serialized and included in the input sent to the model on every single request where those tools are registered, regardless of whether the model ultimately decides to call one, call none, or call several. That means a large tool catalog carries a fixed input-token tax on every request, purely from being available as an option, which is a real and often underestimated cost driver in tool-heavy applications.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">MID</span>Q69. How would you keep tool-definition token overhead down when a large number of tools are registered?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Keep individual descriptions concise and information-dense rather than verbose prose — every extra sentence in a description or parameter description is paid on every request. More impactfully, avoid registering the entire catalog on every call in the first place: scope the tool set actively per request (by feature area, user role, or conversation context) using <code>toolNames(...)</code> or an equivalent filtering step, so a request that only needs order-related tools isn't also paying to describe forty unrelated ones, and periodically flatten unnecessarily deep parameter POJOs, since nested schema structure adds tokens with no benefit if the nesting doesn't reflect a genuine input complexity the model needs to navigate.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">SENIOR</span>Q70. How would you decide, per request, which subset of a large tool catalog to actually expose to the model — driven by cost and latency rather than access control?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Rather than always sending the full catalog, use a cheap upstream retrieval or classification step — a lightweight embedding similarity search over tool descriptions against the user's message, or a simple intent classifier/router — to select the small handful of tools most plausibly relevant to this specific request, and pass only that filtered set into <code>toolNames(...)</code>. This treats tool selection itself as a retrieval problem analogous to RAG chunk retrieval: you're not changing what the tool does or who's allowed to call it, purely trading a small amount of extra pre-processing latency and cost for a much smaller, cheaper, and often more accurate main request, since a shorter, more relevant tool list also improves the model's selection accuracy the same way removing near-duplicate tools does.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">STAFF</span>Q71. Design the <code>ToolCallback</code> resolution pipeline for an application with 200+ internal tools such that adding a new tool never requires touching a central registration class.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Make tool registration declarative and discoverable rather than centrally enumerated: each owning module exposes its own tool-bearing beans (annotated <code>@Tool</code> methods on ordinary Spring components), and a single shared <code>ToolCallbackProvider</code> (or a thin custom aggregator built on Spring's component scanning / <code>ObjectProvider&lt;List&lt;...&gt;&gt;</code> injection) collects every such bean present in the application context at startup, with no per-tool line anywhere for a human to remember to add. Layer per-request filtering (role/feature-scoped subset selection, as above) on top of that automatically-assembled full catalog, rather than filtering at registration time, so "which tools exist" (a deployment-time, code-driven concern) stays fully decoupled from "which tools are offered right now" (a request-time, policy-driven concern) — a new team can ship a new tool purely by adding an annotated method to their own module and it's live everywhere it should be with zero coordination.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">STAFF</span>Q72. How would you build an audit trail capturing every tool call — arguments, result, latency, caller identity — across a large tool-calling application, without instrumenting every individual <code>@Tool</code> method?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Instrumentation has to live at the framework seam every tool call already passes through, not inside individual tool bodies, or coverage will always be incomplete and inconsistent across teams. Concretely: wrap every registered <code>ToolCallback</code> with a decorator (built once, applied automatically at registration time rather than opted into per tool) that, around the real <code>call(...)</code> invocation, captures the tool name, the caller's identity (pulled from <code>ToolContext</code>, never trusted from arguments), the arguments and result (redacting/truncating sensitive fields via a configurable policy rather than logging everything verbatim), start/end timestamps for latency, and success/failure status, and emits that as a structured log event or trace span correlated to the parent chat request's trace ID. Because the decorator wraps the <code>ToolCallback</code> interface itself, any tool registered through the normal pipeline — regardless of team or annotation style — gets full audit coverage automatically, with no per-tool code to write or forget.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. How would you rate-limit calls to a single expensive or dangerous tool, independent of the overall chat request rate limit?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Apply the rate limit at the tool-execution boundary, keyed by both the tool's identity and the calling user/tenant, rather than only at the outer chat-endpoint level — a single chat request's rate limit says nothing about how many times a model might invoke one specific tool across the conversation's tool-call loop, or across many concurrent conversations from the same user. The cleanest place to implement this is the same wrapping-decorator pattern used for auditing: a rate-limiter check (token bucket or sliding window, backed by something shared like Redis in a multi-instance deployment) runs before the real tool body executes, and on rejection the tool returns a clear "rate limit exceeded, try again later" result the model can relay, rather than silently failing or letting the underlying resource get hammered.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">STAFF</span>Q74. How would you add a circuit breaker around a specific tool's downstream dependency without that failure taking down the entire chat request handling?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Scope the circuit breaker to the specific tool (or more precisely, to the downstream dependency it calls), not to the chat request or the model client as a whole — a resilience library's breaker (e.g., Resilience4j) wrapped around the tool method's actual downstream call, keyed per dependency, so one flaky tool tripping open only affects calls to that tool. Design the open-circuit behavior to degrade gracefully at the tool-response level: instead of throwing and risking the whole tool-execution pipeline erroring out, the tool method itself catches the breaker's rejection and returns a normal (non-exceptional) "temporarily unavailable" result string, so the surrounding chat request completes successfully with the model simply informed that this one capability isn't available right now — isolating the failure entirely within the tool-call/tool-response exchange rather than letting it propagate up and abort the user's entire interaction.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">MID</span>Q75. What does Spring AI do if the model's tool-call arguments JSON can't be deserialized into your method's parameter type?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Deserialization happens via the same JSON binding machinery (Jackson, under the hood) used elsewhere in the framework, so a mismatch — malformed JSON, a value that doesn't fit the declared type, a missing field the method genuinely needs — throws a deserialization/binding exception at that step, before your tool's actual method body ever runs. Left unhandled, this surfaces the same way any other tool-execution failure does: it's caught and converted into an error result fed back to the model as a <code>ToolResponseMessage</code>, effectively telling the model its arguments were malformed so it has a chance to reformulate the call, rather than being silently swallowed or crashing the whole request.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">SENIOR</span>Q76. How would you version a tool's schema — e.g., renaming or adding a required parameter — without breaking already-deployed clients or confusing the model mid-migration?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Because the "client" of a tool's schema is effectively the model's in-context understanding at request time rather than a compiled artifact, most breaking changes are actually safe to roll out instantly — every request carries the current schema fresh, so there's no stale-client cache to worry about the way there would be with a versioned REST API consumed by external code. The real risk is a change that breaks something that <em>does</em> persist: any tool-call/tool-response pairs sitting in a currently-open conversation's history reference the old argument shape, so mid-conversation, changing what a required parameter means (not just adding an optional one) can desync the model's understanding built from earlier turns. The safe pattern is to add new tool versions under a new, distinct name (<code>refundOrderV2</code>) rather than mutating an existing tool's contract in place while old conversations may still be active, and retire the old name only once you're confident no in-flight conversation still depends on it.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">MID</span>Q77. Are tool-naming rules identical across providers, or does Spring AI have to normalize differences?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>No — different providers impose different constraints on what characters and lengths are valid in a function/tool name (typically some flavor of alphanumeric plus underscores/hyphens, with a maximum length), and these constraints aren't identical across every provider Spring AI supports. Because Spring AI's portable abstraction lets you register the same tool-bearing code against different chat models, it's worth defaulting to conservative, widely-safe tool names (plain identifier-style names, no spaces or special characters, reasonably short) rather than assuming whatever happens to work against one provider will pass validation unchanged against another if you ever switch or support multiple providers.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">SENIOR</span>Q78. How does Spring AI's tool-calling manager differ in responsibility from the <code>ChatModel</code> itself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The <code>ChatModel</code>'s job is narrowly the provider integration: serialize a request (including whatever tool definitions were attached), send it, and deserialize the raw response — it has no opinion about what happens after a tool-call response comes back. The tool-calling manager sits above that: it's the component responsible for recognizing that a response contains tool calls, resolving each call's name against the registered <code>ToolCallback</code>s, invoking them, assembling the resulting <code>ToolResponseMessage</code>, and deciding whether to loop back through the <code>ChatModel</code> again — i.e., it owns the orchestration of the multi-round-trip protocol described earlier, while the <code>ChatModel</code> only ever executes one request/response exchange at a time and stays unaware that a "tool-calling conversation" spanning several of its own invocations is even happening.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">MID</span>Q79. What's the practical difference, in the request payload, between letting the model choose freely among tools versus forcing a specific one?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>By default, the request signals to the provider that tool use is available but optional and unconstrained — the model can answer directly, pick any registered tool, or (where supported) call several. Forcing a specific tool changes that signal in the payload to require exactly one named tool to be called this turn, which is useful for narrow, deterministic sub-flows where you already know a tool must run (e.g., always run a lookup before letting the model respond to a certain intent) and don't want to leave the decision to the model's judgment at all — Spring AI exposes this as an option on the chat request rather than something encoded in the tool definitions themselves, since it's a per-request policy, not a property of the tool.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">JUNIOR</span>Q80. If the model "returns" a tool call, who actually invokes the Java method?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Your own application code does, via Spring AI's tool-calling machinery — the model only ever produces a structured description of a call; it has no ability to execute anything itself since it's a stateless text/token generation service on the provider's infrastructure, with no access to your JVM, network, or data. Spring AI's internal tool-execution logic (or your own code, if you've disabled internal execution) is what deserializes the arguments, looks up the matching registered <code>ToolCallback</code>, and reflectively (or directly, for a builder-registered lambda) invokes the real method — the same as any other piece of code in your application calling a method, just triggered by a decision the model made rather than a line you wrote directly.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">MID</span>Q81. How would you log/trace an individual tool invocation so it correlates correctly with its parent chat request in distributed tracing?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Create a child span for the tool execution nested under the same trace context as the enclosing chat request/turn, rather than logging the tool call as an unrelated, top-level event — this is most cleanly done in the same wrapping layer used for auditing, since that's the one place every tool call already passes through regardless of which team wrote it. Tag the span with the tool's name, key argument fields (redacted as needed), success/failure, and duration, so a slow or failing chat response can be traced down to exactly which tool call, in which turn of the conversation, was responsible — without that correlation, tool-call latency is invisible inside the aggregate "model response time" your tracing otherwise reports, which is usually where the real bottleneck actually is.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">STAFF</span>Q82. A tool exposes an internal "deleteAccount" operation. Beyond confirmation flows, what mechanical/API-level safeguards would you put in the Spring AI tool-calling layer itself?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Treat it as the most privileged category of tool and layer safeguards at the mechanism level, not just the UX level: require the tool to be explicitly, individually allow-listed into <code>toolNames(...)</code> for a request rather than being part of any default catalog, so it's only ever reachable from the specific, deliberately-built flow meant to expose it. Make <code>returnDirect</code> false and disable internal automatic execution for this tool specifically (route it through the manual/external execution path) so a human application layer sits between "model requested this" and "this actually runs," rather than it firing automatically inside the standard tool loop. Enforce authorization from real <code>ToolContext</code> identity, require a second, distinct signal beyond the initial model request (a separately-confirmed follow-up call, not just the same call retried), rate-limit it aggressively, and make every invocation — attempted or executed — a high-priority audit event with alerting, since a probabilistic caller having any path at all to an irreversible destructive operation is inherently higher risk than the equivalent button behind a deterministic UI click.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">SENIOR</span>Q83. How would you handle a tool whose execution legitimately takes 30+ seconds, given that the model is waiting synchronously for the result?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The synchronous tool-call/tool-response exchange in the standard protocol isn't designed for long-running work — the model (and typically the user-facing request) is blocked waiting the whole time, which is both a poor user experience and a real risk of hitting request or provider-side timeouts. The usual redesign is to make the tool itself fast: it kicks off the long-running work asynchronously (a job queue, a background task) and immediately returns a small, fast acknowledgment — "started, job ID 4471, check back for status" — as its actual tool result, and expose a second, separate lightweight tool ("checkJobStatus") the model can call on a later turn (prompted by the user asking, or the application nudging a follow-up) to poll for completion. This keeps every individual tool-call round trip fast and bounded while still supporting genuinely slow underlying work, rather than trying to stretch the synchronous protocol beyond what it was designed for.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">MID</span>Q84. What's a sensible style/length target for a tool's description, and why does verbosity have a real cost?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Aim for a single, precise sentence (or two at most) that states what the tool does, what it's for, and anything that disambiguates it from similarly-named or similarly-purposed tools — concrete and specific ("looks up the live shipping status of a single order by numeric order ID") rather than vague or padded with unnecessary caveats. Verbosity has a real, compounding cost because the description is resent on every single request the tool is registered on, for the lifetime of that tool's usage — a wordy paragraph multiplied across a high-traffic endpoint and dozens of registered tools becomes a meaningful, ongoing token expense for zero gain in model comprehension, since past a certain point extra words don't improve disambiguation, they just add noise the model has to read through.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">JUNIOR</span>Q85. What Java type would you use for a tool parameter that must be one of a fixed set of string values, and why?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A Java <code>enum</code>, rather than a plain <code>String</code> with a description saying "must be one of X, Y, Z" — the enum gets compiled directly into the schema's <code>enum</code> constraint, which the provider enforces before your code even receives the call, guaranteeing the value your method receives is always one of the valid constants. A plain string relying only on a prose description for that constraint is far weaker: the model can still technically emit any string, pushing an entirely avoidable validation burden onto your tool method that a stronger type would have eliminated for free.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">MID</span>Q86. How do collection-typed parameters like <code>List&lt;String&gt;</code> get represented in the generated schema, and what constraints can you add?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A collection parameter becomes an <code>array</code>-typed schema entry whose <code>items</code> field describes the element type (a plain string schema for <code>List&lt;String&gt;</code>, a nested object schema for <code>List&lt;SomePojo&gt;</code>, and so on, recursively). You can layer on additional JSON Schema constraints where the underlying type or annotations support it — bounding array length (<code>minItems</code>/<code>maxItems</code>), for instance — which is worth doing for any list-typed tool parameter where an unbounded array could translate into an unbounded amount of work or an unbounded downstream call, rather than leaving that boundary entirely to the tool's runtime validation.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">SENIOR</span>Q87. Compare <code>@Tool</code>-annotation-based registration to hand-building <code>ToolCallback</code> beans in terms of testability and explicitness — which would you pick for a large, complex tool with intricate validation?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p><code>@Tool</code> keeps the tool's definition and implementation co-located and minimizes boilerplate, which is ideal for the common case of straightforward, single-purpose tools — but the schema and behavior are somewhat implicit, derived by reflection from the method signature, which can make it harder to see or unit-test the exact contract in isolation without actually building the callback. A hand-built <code>ToolCallback</code> (via the builder) makes the name, description, schema, and execution function all explicit, separately-testable pieces you assemble yourself, which pays off for a tool with genuinely intricate validation, conditional schema behavior, or non-trivial construction logic (e.g., wiring is environment-dependent) — for a large, complex tool, the explicitness and the ability to unit-test schema construction and execution as distinct concerns generally outweighs the extra verbosity, whereas for the bulk of ordinary tools <code>@Tool</code>'s conciseness is the better default.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">JUNIOR</span>Q88. What's the difference between a tool's "name" and its Java method name — do they have to match?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>By default, Spring AI uses the method's own name as the tool's name, but you can override it explicitly via the <code>@Tool</code> annotation's <code>name</code> attribute (or the builder's name argument for a manually-built callback), so they don't have to match. Overriding is common when the method name isn't a great model-facing identifier (too generic, or colliding with another tool's default name) or when you want a stable, namespaced public tool name (<code>orders.refund</code>) that's decoupled from whatever the underlying Java method happens to be called, which also means you can freely rename the method during a refactor without silently changing the tool's contract with the model.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">MID</span>Q89. When you call <code>.tools(myBean)</code> on a <code>ChatClient</code> builder, what exactly does Spring AI do with that object at configuration time?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>It reflects over <code>myBean</code>'s class, finds every method annotated <code>@Tool</code>, and for each one builds a <code>ToolCallback</code> whose <code>ToolDefinition</code> is derived from the method's name/description/parameters as covered earlier, and whose executable <code>call(...)</code> closes over that specific method and that specific bean instance (so calling it later invokes the real method on the real object you passed in, with its real injected dependencies intact). Those callbacks are then held by the <code>ChatClient</code> (or its builder's default configuration) and attached to the tool catalog of every subsequent request made through it, unless narrowed per-call via <code>toolNames(...)</code> — the discovery and callback construction happens once at this registration step, not freshly on every request.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">STAFF</span>Q90. Your assistant has 40 tools, several mutating and financially sensitive. Design the layered mechanical safeguards — schema, execution boundary, testing, observability — you'd require in the tool-calling implementation itself.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Layer 1, schema: every tool parameter is as narrow and typed as possible (enums, IDs, bounded numbers), with no freeform field used to build a query, command, or path, and every mutating tool's description is unambiguous about its effect. Layer 2, execution boundary: mutating and financial tools never rely on schema validation alone — each independently re-authorizes against the real caller identity from <code>ToolContext</code>, applies amount/frequency limits, and for anything irreversible or above a threshold, requires a distinct confirmation signal rather than firing on the first model-proposed call; consider routing this class of tool through manual/external execution specifically so a deliberate application-layer gate sits before invocation. Layer 3, testing: every tool has unit tests for its business logic including adversarial/malformed inputs, plus integration tests (stubbed provider) verifying the full call/response wiring, and mutating tools additionally get tests asserting the authorization and confirmation gates actually block an unauthorized or unconfirmed attempt. Layer 4, observability: a single shared wrapping decorator applied to every registered <code>ToolCallback</code> emits structured, trace-correlated audit events (caller, arguments, result, latency, outcome) for every invocation, with alerting on anomalous patterns (unusual volume or amounts) on the sensitive subset specifically. The unifying principle across all four layers is that no individual tool author should be trusted to remember to build these protections themselves — they should be structural properties of the shared registration and execution pipeline that every tool inherits automatically.</p>
+</div>
+
 </div>
 
 <hr>

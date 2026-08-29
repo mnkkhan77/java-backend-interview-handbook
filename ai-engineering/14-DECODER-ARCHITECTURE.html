@@ -574,6 +574,522 @@ The decoder architecture itself has a narrower direct security surface than, say
 <p>The encoder-decoder split assumes a clean boundary between "reading" and "writing," which fits fixed-transformation tasks like translation but does not fit open-ended, multi-turn interaction where the model's own prior output becomes context for what it writes next. A decoder-only stack treats all tokens — user input and the model's own previous generations — uniformly as one growing causal sequence, which is what allows a single architecture to scale across chat, coding, summarization, and reasoning-style tasks via prompting alone, without task-specific architectural changes. For a platform team, this implies that general-purpose conversational and agentic systems (Volume 4) should default to decoder-only chat models behind an abstraction like Spring AI's <code>ChatModel</code>, while encoder-only or encoder-decoder models remain the right, narrower choice for specific sub-tasks like embedding generation for retrieval (Volume 3) or fixed-format translation/summarization pipelines — the two families are not competitors so much as tools suited to structurally different problems.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. What shape does the causal mask matrix have, and how would you generate it in code for a sequence of length n?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The causal mask is an n×n lower-triangular matrix: for row i (the query position) and column j (the key position), the entry is "allowed" (0) when j ≤ i and "forbidden" (-infinity) when j > i. In code it is typically built once and reused:</p>
+<pre>
+mask = full((n, n), -infinity)
+for i in range(n):
+    for j in range(i + 1):
+        mask[i][j] = 0
+# equivalently: mask = triu(full((n,n), -inf), diagonal=1)
+</pre>
+<p>This matrix is added element-wise to the raw QK^T attention scores before softmax, so every "future" entry collapses to zero probability regardless of what the Query/Key dot products actually computed.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">MID</span>Q10. Is the causal mask the same across every attention head and every layer, or does it differ per head/layer?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The causal mask itself is identical across every head and every layer — it is a structural property of position, not something learned or varied. What differs per head and layer are the Query, Key, and Value projection weights, which determine <em>how much</em> attention weight is distributed among the allowed (non-masked) positions. The mask only ever decides which positions are eligible to receive any weight at all; the weights themselves are learned and layer/head-specific.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">MID</span>Q11. How does causal masking interact with padding masks when you batch sequences of different lengths together?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>When sequences of different lengths are batched, shorter sequences are padded to match the longest one, and a separate padding mask marks which positions are real tokens versus filler. Both masks are combined additively before softmax: a position is only attendable if it satisfies <em>both</em> "not in the future" (causal mask) <em>and</em> "not a padding token" (padding mask). If either mask marks a position as forbidden, negative infinity is added and that position receives zero attention weight — the two masks compose rather than compete.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">SENIOR</span>Q12. Why is the causal mask applied additively via negative infinity before softmax rather than by simply zeroing out attention weights after softmax?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Zeroing weights after softmax would leave the softmax denominator computed over all positions, including forbidden future ones — the remaining "allowed" weights would no longer sum to 1, and the forbidden positions would have already influenced the normalization even though their final weight is set to zero. Adding negative infinity <em>before</em> softmax ensures forbidden positions contribute nothing to the exponential sum in the first place, so the surviving probability mass is correctly renormalized only over legitimately visible positions. It is the difference between "excluding a candidate from the vote" versus "counting their vote and then discarding it after."</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. What made GPT-1 and GPT-2 "decoder-only," as opposed to following the original Transformer's two-part encoder-decoder shape?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>GPT dropped the encoder half entirely and kept only a stack of causally-masked decoder blocks. Instead of encoding a source sequence and generating a separate target sequence, GPT simply treats the prompt as the beginning of the sequence it is continuing — there is no cross-attention into a separate encoder representation, only self-attention over the single growing token stream (prompt plus generated tokens so far).</p>
+</div>
+
+<div class="question" id="q14"><span class="level">JUNIOR</span>Q14. If a decoder-only model has no encoder, how does it "read" and understand the prompt at all?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It reads the prompt the same way it reads its own previously generated tokens — as part of the one causal sequence fed through masked self-attention. During prefill, the entire prompt is processed in parallel through every decoder block, and each prompt token's representation is built by attending over the earlier prompt tokens. There is no separate "understanding" phase; comprehension and generation both happen through the identical mechanism, just applied to different portions of the same token sequence.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">MID</span>Q15. Compare BERT's (encoder-only) training objective to GPT's (decoder-only) training objective, and explain why each objective fits its architecture.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>BERT is trained with masked language modeling: random tokens in the input are hidden, and the model must predict them using context from <em>both</em> directions — which requires full bidirectional attention, i.e. an encoder. GPT is trained with next-token prediction: given a prefix, predict the single next token, using only leftward context — which is exactly what causal self-attention provides. Each objective is not just compatible with its architecture, it is only well-defined given that architecture: you cannot do meaningful bidirectional mask-filling with a causal-only model, and next-token prediction with full bidirectional attention would trivially "see the answer" sitting in the input.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">MID</span>Q16. Why do encoder-decoder models like T5 still exist today, and when would you choose one over a decoder-only chat model?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Encoder-decoder models remain a good fit when a task has a genuinely fixed, well-defined "source" that should be fully understood with bidirectional attention before any generation begins — canonical examples are machine translation and structured summarization of a fixed input document. The encoder can build a complete, non-causal representation of the source once, and the decoder repeatedly attends into that fixed representation while generating, which can be more parameter-efficient for narrowly-scoped transformation tasks. A decoder-only chat model is the better default for open-ended, multi-turn, or agentic use cases where "source" and "generation" are not cleanly separable.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">SENIOR</span>Q17. What specific scaling and engineering advantages does a decoder-only stack have over an encoder-decoder design at very large parameter counts?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A decoder-only model is architecturally uniform — one block type repeated N times — which simplifies distributed training infrastructure (pipeline/tensor parallelism partitions identical blocks rather than two structurally different components with a cross-attention bridge between them). It also means every parameter is exercised on every token, whereas an encoder-decoder split allocates capacity between two components whose optimal ratio isn't obvious and can waste parameters if the split doesn't match the task mix. Finally, uniform self-attention-only blocks make it straightforward to reuse the exact same training data format (raw text continuation) across every task via prompting, avoiding the need for task-specific encoder-decoder data curation at massive scale.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">JUNIOR</span>Q18. What is "prefill" in the context of decoder generation?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Prefill is the phase where the entire input prompt is processed through the decoder stack in a single parallel forward pass, producing the Key/Value vectors for every prompt position (populating the KV cache) and the next-token probability distribution for the very first generated token. Because the causal mask already prevents any position from seeing the future within that one pass, all prompt tokens can be processed simultaneously rather than one at a time.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">MID</span>Q19. Walk through, step by step, what happens computationally when a decoder-only model receives a 500-token prompt and is asked to generate 100 tokens.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>First, the 500 prompt tokens are embedded and fed through every decoder block in one parallel pass (prefill); this populates the KV cache with Keys/Values for all 500 positions and produces logits for position 500, from which the first new token (position 501) is sampled. Then decode begins: token 501 is embedded, fed through the stack, and at each layer its Query attends over the cached Keys/Values for positions 1–500 plus its own newly computed Key/Value, producing logits used to sample token 502. This repeats — each new token attends over an ever-growing cache — for 100 iterations, so 100 sequential forward passes occur after the single prefill pass, each one only computing fresh Q/K/V for exactly one new position.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">MID</span>Q20. What is the "decode phase," and why does each decode step require a full pass through every layer just to produce one new token?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The decode phase is the repeated loop that runs after prefill: at each iteration, exactly one new token is embedded and pushed through the entire decoder stack — every block, every layer — because each layer builds progressively richer representations on top of the previous layer's output, and the LM head at the very end needs the final layer's representation to produce next-token logits. There's no shortcut that skips layers, because each layer's transformation is a genuine function of the one below it; you can't jump straight to layer 40's output without computing layers 1 through 39 for that new token first.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">SENIOR</span>Q21. How does the sequence length passed into the model differ between the prefill call and each subsequent decode call, and how does the KV cache change that?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Without a KV cache, a naive implementation would re-feed the entire growing sequence (prompt + all tokens generated so far) at every decode step, so sequence length passed in would grow with each iteration: 501, 502, 503... tokens. With the KV cache, only the single newest token is fed in at each decode step — the Keys and Values for every earlier position are already cached from prior passes and simply reused, so the "new work" per decode step is O(1) tokens of fresh computation combined with an attention lookup over an O(n)-sized cache, rather than O(n) tokens of fresh computation at every step.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">SENIOR</span>Q22. If you disabled the KV cache entirely, how would per-token decode cost scale with generated sequence length, and why?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Without caching, generating the k-th token would require recomputing Keys and Values for all k-1 preceding positions from scratch at every layer, then attending — so the cost of a single decode step grows linearly with current sequence length, and the total cost to generate n tokens grows quadratically (roughly 1 + 2 + 3 + ... + n ∝ n²) instead of linearly. For a 1,000-token generation this is the difference between roughly 1,000 units of redundant work and 500,000 — which is why every serious inference engine implements KV caching as a baseline, non-optional optimization rather than a nice-to-have.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">JUNIOR</span>Q23. What does the "language modeling head" do at the end of a decoder stack?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The LM head takes the final decoder block's output vector at a position and projects it, via a single linear layer, from the model's hidden dimension into a vector of vocabulary-size logits — one raw score per possible next token. A softmax is then applied to turn those logits into a genuine probability distribution over the entire vocabulary, from which a token is sampled (or the top one taken, under greedy decoding).</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. What is weight tying between the input embedding matrix and the output LM head, and why is it commonly used?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Weight tying reuses the same matrix for both the input token embedding lookup (token ID → vector) and the output LM head projection (vector → vocabulary logits), just transposed. This roughly halves the parameter count consumed by embeddings, which can be a substantial fraction of total parameters for large vocabularies, and empirically tends to improve training stability and quality because it forces the model to use one consistent geometric space for "what a token means" whether it's being read in or predicted out.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. Why is the final linear projection in the LM head sized [hidden_dim × vocab_size], and what does that imply about compute cost as vocabulary size grows?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The projection must map a hidden_dim-sized vector into one logit per vocabulary entry, so the weight matrix necessarily has hidden_dim × vocab_size parameters, and computing the logits is a matrix-vector multiply of that size at every single position. As vocabulary size grows (modern tokenizers often exceed 100K–250K entries), this final projection becomes a non-trivial fraction of total compute per forward pass — at decode time, where only one new position is processed per step, the LM head's cost relative to the rest of that step's work is proportionally larger than during prefill, which processes many positions at once and amortizes better.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">SENIOR</span>Q26. How does the softmax over the vocabulary interact with the sampling strategy chosen at inference time — is the full softmax always computed?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Conceptually every decoding strategy operates on the same underlying full logit vector, but in practice a full, numerically stable softmax over the entire vocabulary is usually computed once per step (it's a cheap elementwise-plus-normalize operation compared to the matrix multiplies around it), and then the chosen decoding strategy — greedy argmax, top-k truncation, top-p truncation, or temperature rescaling — filters or reweights that distribution before sampling. Some highly latency-sensitive serving stacks do fuse or approximate parts of this (e.g., only computing softmax over a pre-filtered top-k logit subset) as a micro-optimization, but functionally the model always produces a distribution over the full vocabulary; the decoding strategy decides what to do with it.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">STAFF</span>Q27. Design implication: how would you reduce LM-head compute cost for a very large vocabulary (e.g., 250K tokens) at serving time without changing model quality?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>A few production levers exist without retraining: fuse the final linear projection and softmax into a single optimized kernel to avoid materializing the full logit vector in memory twice; during decode (where only one position needs logits per step), skip computing logits for intermediate positions entirely and only project the final position's hidden state; and if the application only needs top-k or top-p sampling, some serving stacks compute an approximate top-candidates set via a cheaper mechanism before falling back to exact logits only for the surviving candidates. None of these change the model's weights or outputs — they only avoid redundant computation, which is the same "don't do unnecessary work" principle behind the KV cache, just applied to the output projection instead of the attention mechanism.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">JUNIOR</span>Q28. What is greedy decoding, and what's a simple example where it produces suboptimal output?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Greedy decoding always picks the single highest-probability token at every step, with no exploration of alternatives. It can produce suboptimal output because the locally best token at step 1 doesn't always lead to the globally best sentence — for example, given the prefix "The weather today is", greedy might pick "nice" (highest single-step probability) even though "absolutely wonderful" (a lower-probability first word, "absolutely," followed by a higher combined-probability continuation) would have formed a more fluent, higher total-likelihood sentence. Greedy decoding has no mechanism to look ahead or reconsider — it's myopic by construction.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">JUNIOR</span>Q29. What does "temperature" do to a model's output distribution before sampling?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Temperature rescales the logits before softmax by dividing them by a temperature value T: <code>logits / T</code>. A temperature below 1.0 sharpens the distribution (makes the model more confident/deterministic, pushing probability mass toward the already-highest-scoring tokens), while a temperature above 1.0 flattens it (makes the model more random, giving lower-probability tokens a more competitive chance of being sampled). Temperature = 1.0 leaves the distribution unchanged from the model's raw output.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">JUNIOR</span>Q30. What is top-k sampling in plain terms?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Top-k sampling restricts sampling to only the k highest-probability tokens at each step, discarding everything else and renormalizing the probabilities among that fixed-size shortlist before sampling. It prevents the model from ever picking a wildly implausible token from the distribution's long tail, while still allowing some randomness among the genuinely competitive candidates.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">MID</span>Q31. Explain top-p (nucleus) sampling and how it differs from top-k, with a worked numeric example.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Top-p sampling includes the smallest set of highest-probability tokens whose cumulative probability reaches a threshold p, then samples only from that set — the size of the candidate set varies dynamically per step, unlike top-k's fixed size. Example: suppose four candidate tokens have probabilities 0.50, 0.30, 0.15, 0.05. With top-p = 0.8, you'd include "0.50" and "0.30" (cumulative 0.80) and stop there — only two candidates survive. With top-k = 3 on the same distribution, you'd keep three candidates (0.50, 0.30, 0.15) regardless of how much cumulative probability that represents. Top-p adapts to how "peaked" or "flat" the distribution is at each individual step; top-k always keeps the same count even when the model is extremely confident (wasting slots on near-zero-probability tokens) or extremely uncertain (unfairly excluding several plausible tokens).</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. Explain beam search and why it is rarely used for open-ended chat generation despite being common in translation.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Beam search maintains the top-B partial sequences (beams) at every step instead of just one, expanding each beam by all plausible next tokens, scoring the resulting sequences, and keeping only the best B again — approximating a search for the overall highest-probability full sequence rather than committing greedily one token at a time. In translation this works well because there is usually one "correct" target sentence and beam search reliably finds a high-likelihood one. For open-ended chat, beam search tends to produce bland, repetitive, overly "safe" text — because the highest-likelihood sequence in an open-ended distribution is often generic and repetitive (the model hedges toward common phrasing), whereas sampling-based methods (top-p, temperature) better preserve the diversity and creativity real conversation needs.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. Worked example: given logits [2.0, 1.0, 0.5, 0.1, -1.0] for 5 candidate tokens, show qualitatively how temperature 0.1 versus temperature 1.5 changes the resulting distribution.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>At temperature 0.1, dividing each logit by 0.1 multiplies the gaps between them by 10× (e.g., 2.0 becomes 20, 1.0 becomes 10), so after softmax the top token's probability approaches ~1.0 and the rest collapse toward 0 — the distribution becomes nearly deterministic, functionally close to greedy decoding. At temperature 1.5, dividing by 1.5 shrinks the gaps (2.0 becomes ~1.33, 1.0 becomes ~0.67), so after softmax the probabilities are much closer together — the lowest-scoring token that was nearly unreachable at low temperature now has a meaningfully higher chance of being sampled. This is why "low temperature = deterministic/focused" and "high temperature = random/creative" is the correct mental shorthand, and why temperature 0 is typically implemented as a special case that just does greedy argmax (dividing by 0 is undefined).</p>
+</div>
+
+<div class="question" id="q34"><span class="level">MID</span>Q34. What's the difference between "sampling" decoding and "search" decoding (beam search), and what failure mode does each avoid or introduce?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Sampling decoding (greedy, top-k, top-p, temperature) draws from the model's probability distribution at each step independently, optionally reshaped — it avoids the "bland, repetitive" failure mode that pure likelihood-maximization tends toward, at the cost of introducing genuine randomness (the same prompt can produce different outputs across runs). Search decoding (beam search) explicitly tries to find a high-total-likelihood full sequence by exploring multiple candidate continuations in parallel — it avoids randomness and produces reproducible output, but tends toward generic phrasing and can loop or degenerate on open-ended tasks precisely because "most likely overall" and "most interesting/useful" are not the same target.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">SENIOR</span>Q35. Why does greedy decoding combined with a repetitive prompt often produce degenerate repeated loops of text, and how does that connect to the autoregressive feedback loop?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Once a phrase repeats once in the context, the model's learned statistics make "repeat the pattern again" a very high-probability continuation — language genuinely does contain repeated structures, so the model isn't malfunctioning, it's following its training distribution. Under greedy decoding there is no mechanism to break out of a locally-maximal choice: each repetition raises the conditional probability of repeating again, since the model now has direct evidence in its own context that "this is a text that repeats this phrase," and that evidence is fed straight back in via autoregression at the very next step. Because the decoder cannot un-emit a token, once a short loop starts, greedy decoding tends to reinforce and continue it rather than escape it — this is precisely why sampling randomness, repetition penalties, and no-repeat n-gram constraints exist as production mitigations.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">SENIOR</span>Q36. How would you combine temperature, top-p, and top-k together in one decoding configuration, and what does each parameter contribute when combined?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A common production pipeline applies them in sequence: first temperature rescales the raw logits to sharpen or flatten the overall distribution shape; then top-k (if set) truncates to a fixed-size candidate shortlist as a hard safety ceiling against extremely long-tail garbage tokens; then top-p further truncates that shortlist to the smallest subset reaching the cumulative probability threshold, adapting dynamically to how confident the model is at this particular step; finally, the surviving candidates are renormalized and sampled from. Each parameter contributes a different kind of control — temperature shapes "how spread out," top-k sets a hard cap on candidate count, and top-p adapts the candidate count to the model's actual per-step confidence — and using all three together is standard in most commercial chat completion APIs, though many teams find top-p alone (with a moderate temperature) sufficient for most use cases.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">SENIOR</span>Q37. In what scenario would you deliberately choose beam search over sampling in a production decoder-only deployment?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Beam search is the right choice when there is a genuinely well-defined "best" output and reproducibility/determinism matters more than diversity — for example, generating a short, constrained caption or label from a fixed input, or a translation-like transformation where the goal is closely matching a single correct target rather than exploring creative alternatives. It is a poor choice for anything resembling open-ended chat, brainstorming, or long-form generation, where its tendency toward generic, repetitive high-likelihood sequences actively hurts perceived quality — which is why virtually every consumer chat product defaults to sampling-based decoding instead.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. What is repetition penalty, and mechanically how does it modify logits?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Repetition penalty reduces the logit score of any token that has already appeared in the generated sequence so far, making it less likely to be picked again. A common implementation divides (for positive logits) or multiplies (for negative logits) the logit of an already-seen token by a penalty factor greater than 1 before softmax: <code>logit = logit / penalty if logit &gt; 0 else logit * penalty</code>. This is a blunt, uniform mechanism — it penalizes a token equally whether it appeared once or ten times, and regardless of whether repeating it here would actually be natural (e.g., function words like "the" legitimately repeat often).</p>
+</div>
+
+<div class="question" id="q39"><span class="level">MID</span>Q39. Explain the difference between frequency penalty and presence penalty as used in OpenAI-style APIs.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Presence penalty applies a fixed logit reduction to any token that has appeared at least once already, regardless of how many times — it discourages introducing repeated topics/tokens at all, but doesn't further punish heavy repetition. Frequency penalty scales the logit reduction proportionally to how many times a token has already appeared, so a token used five times gets penalized far more heavily than one used once — it specifically discourages a token from being <em>overused</em>, even if using it once or twice would be fine. In practice they're often combined: presence penalty nudges the model toward new vocabulary, frequency penalty prevents any single token from dominating.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. What is logit bias, and give a concrete production use case for manually biasing specific token logits?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Logit bias lets a caller add a fixed offset to specific token IDs' logits before softmax, directly increasing or decreasing the chance those exact tokens are sampled — a large negative bias can make a token essentially impossible to generate, while a large positive bias can force it to dominate. A concrete use case: banning profanity or a competitor's brand name from a customer-facing generation by applying a strongly negative bias to those tokens' IDs, or nudging a classification-style completion to strongly prefer specific label tokens (e.g., biasing the tokens for "POSITIVE" and "NEGATIVE" upward when the completion is meant to be a single-word sentiment label).</p>
+</div>
+
+<div class="question" id="q41"><span class="level">MID</span>Q41. What is constrained/grammar-guided decoding, and how does it mechanically restrict which tokens can be sampled at each step?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Constrained decoding enforces that the generated output conforms to a formal grammar (e.g., valid JSON matching a schema, or a regular expression) by computing, at every decode step, the set of tokens that would keep the sequence-so-far a valid prefix of some string in the grammar, and masking out every other token's logit to negative infinity before sampling — exactly the same additive-mask mechanism used for causal masking, just driven by grammar state instead of position. Concretely, an automaton tracking the grammar's current state is advanced after each token is emitted, and at the next step only the transitions valid from that state are left unmasked; the model is still doing ordinary next-token sampling, it is simply never offered an invalid token as an option.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">SENIOR</span>Q42. How does JSON-mode / structured-output decoding work internally — is it fine-tuning, a decoding-time constraint, or both?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>In production systems it's typically both, layered together. Fine-tuning (or instruction-following training more broadly) biases the model to <em>want</em> to produce well-formed JSON when asked, which improves quality and reduces how aggressively the decoding-time constraint needs to intervene. The decoding-time constraint — grammar-guided decoding against a JSON grammar, or a schema-derived automaton for JSON-mode-with-schema — is what provides the actual guarantee: at every step, only tokens that keep the output a syntactically valid (and, for schema mode, structurally conforming) partial JSON document are left unmasked. Relying on fine-tuning alone gives high-probability-but-not-guaranteed valid JSON; the decoding-time mask is what converts "usually valid" into "always valid" for the JSON layer specifically (semantic correctness of the field values is a separate concern the grammar cannot enforce).</p>
+</div>
+
+<div class="question" id="q43"><span class="level">SENIOR</span>Q43. Walk through what happens mechanically at each decode step when a grammar constraint (e.g., a JSON schema) is applied — how is the vocabulary mask computed?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The schema is first compiled into an automaton (or a pushdown automaton for nested structures like JSON objects/arrays) whose states correspond to "positions" within a valid document — e.g., "expecting an opening brace," "inside a string value," "expecting a comma or closing brace." At each decode step, given the automaton's current state, the constraint engine determines which vocabulary tokens, if appended, would still form a valid partial string according to the grammar (this can require checking token-level string content against the automaton's transition table, since a single token may represent multiple grammar-level characters). Every token not in that valid set has its logit set to negative infinity before softmax, exactly like the causal mask; the model samples normally from what remains, then the automaton's state is advanced based on the token actually emitted, ready for the next step's mask computation.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">SENIOR</span>Q44. A teammate wants to guarantee 100% valid JSON output from a decoder-only model. Compare prompt-engineering-only versus constrained decoding as solutions.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Prompt engineering alone (few-shot examples, explicit "respond only with valid JSON" instructions) meaningfully raises the probability of valid JSON but cannot guarantee it — the model is still free-sampling over the full vocabulary at every step, and any low-probability deviation (a stray trailing comma, an unescaped quote, truncation at the max-token limit mid-object) breaks validity, with failure rate typically in the low single-digit percentages even with good prompting, which is unacceptable for a hard-guarantee production dependency. Constrained decoding, by contrast, makes invalid tokens architecturally unsamplable at every step, so the output is syntactically valid JSON by construction, not by probability — the correct answer for a "100% guarantee" requirement is constrained decoding (with good prompting still layered on top to improve semantic quality of the content within the guaranteed-valid structure).</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly distinguishing "the model wants to produce X" (a training/prompting concern) from "the model is physically unable to produce not-X" (a decoding-time constraint concern) is the single clearest signal that a candidate understands decoding mechanics rather than just prompting folklore.</div>
+
+<div class="question" id="q45"><span class="level">STAFF</span>Q45. Design a decoding pipeline for a production feature that must emit syntactically valid SQL 100% of the time from a decoder-only model, including how you'd combine grammar constraints with sampling parameters.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Compile the target SQL dialect's grammar (or a safe subset of it, e.g., read-only SELECT statements if that's the actual requirement) into a token-level automaton and apply it as a hard logit mask at every decode step, guaranteeing syntactic validity by construction the same way JSON-mode does. Layer sampling parameters on top of that guaranteed-valid candidate set: low temperature (or near-greedy) for the parts of the query that should be deterministic given the schema (table/column names, matching a provided schema), with slightly higher temperature reserved only for genuinely open-ended parts like filter value choices if the task calls for creativity there — most SQL-generation features should actually run close to temperature 0 since there's usually one intended query. Add a schema-aware validation layer beyond pure grammar (e.g., only allow table/column tokens that exist in the actual database schema, encoded as an additional constraint on top of general SQL grammar) so the guarantee extends from "syntactically valid SQL" to "syntactically valid SQL against this schema." Finally, treat grammar-invalid completions from the underlying model as impossible by construction, but still validate and sandbox-execute (e.g., EXPLAIN-only or a read replica) before running against production data, since syntactic validity says nothing about the query being safe or semantically correct.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">JUNIOR</span>Q46. What is an EOS token, and how does a decoder-only model use it to know when to stop generating?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>EOS ("end of sequence") is a special reserved token in the vocabulary that the model is trained to produce when it judges the response to be complete. At each decode step, after a token is sampled, the generation loop checks whether that token is the EOS token; if so, generation stops immediately rather than continuing. It is not special at the architecture level — it's just another vocabulary entry — but the model learns during training to assign it high probability at genuinely natural stopping points.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">JUNIOR</span>Q47. What is a BOS token, and is it always required?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>BOS ("beginning of sequence") is a special token prepended to a sequence to mark its start, giving position 1 of the sequence a well-defined, consistent "anchor" token to attend to. Whether it's required depends on how a given model was pretrained — some model families prepend it to every input by convention and expect it at inference time too, while others don't use one at all or rely purely on chat-template special tokens (covered later in this section) to mark boundaries instead. Using the wrong convention for a given model (omitting an expected BOS, or adding one where none was used in training) can measurably degrade output quality even though nothing "errors out."</p>
+</div>
+
+<div class="question" id="q48"><span class="level">JUNIOR</span>Q48. Why doesn't padding matter during single-sequence generation but does matter during batched generation?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>When generating one sequence at a time, there is nothing to pad to — the sequence is simply as long as it is, and every position is real content. Padding only becomes necessary when multiple sequences of different lengths must be processed together as one batch (a fixed-size tensor), since GPUs require uniform tensor shapes; shorter sequences in the batch are padded with filler tokens so every sequence in the batch has matching length, and a padding mask ensures those filler positions never receive or contribute real attention weight.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">MID</span>Q49. How does a decoder-only model handle padding tokens in a batch without letting them corrupt attention for real tokens?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Padding positions are excluded from attention via the same additive-mask mechanism used for causal masking: a padding mask marks each pad position, and negative infinity is added to any attention score where the key position is a pad token, guaranteeing zero attention weight regardless of what the raw Query-Key dot product produced. The pad tokens still occupy space in the tensor (so the batch shape is uniform), but they are made functionally invisible to every real token's attention computation, and the LM head's output at pad positions is simply ignored/discarded rather than used for anything.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">MID</span>Q50. What are "stop sequences" in a chat API, and how do they relate to the model's own EOS token?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Stop sequences are application-defined strings (e.g., <code>"\n\nHuman:"</code> in a raw completion-style prompt, or a custom delimiter) that, when they appear in the generated output, cause the client-side or server-side generation loop to halt — even though the model itself never produced its trained EOS token. They're implemented as an additional check layered on top of the same decode loop: after each new token is appended, the accumulated text is checked against the configured stop sequences (in addition to checking for the model's own EOS token), and generation halts on either condition. This is commonly used to prevent a model from "continuing the conversation on both sides" when a raw prompt format doesn't clearly delimit turns.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. Explain why left-padding (not right-padding) is required for batched generation in decoder-only models, and what breaks if you right-pad instead.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>In a decoder-only model, generation always continues from the <em>last</em> position in the sequence — the next token is predicted from whatever sits at the final index. If sequences are right-padded (real content first, pad tokens appended after), the "last position" for shorter sequences in the batch would actually be a pad token, not the real last content token, so the model would be asked to predict a continuation from garbage/pad context. Left-padding (pad tokens first, real content aligned to the end) ensures every sequence's real final token sits at the same rightmost index across the batch, so generation correctly continues from real content for every sequence simultaneously, with positional encodings and the padding mask handling the fact that "position in the tensor" and "position in the real sequence" no longer match for the padded sequences.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">MID</span>Q52. Why is prefill described as compute-bound?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>During prefill, hundreds or thousands of prompt tokens are processed through the model in a single pass, which means the matrix multiplications at every layer involve large batches of positions at once — this gives the GPU plenty of independent arithmetic work to parallelize across, keeping its compute (FLOP) units highly utilized relative to the time spent moving data. The bottleneck is genuinely "how fast can the GPU do the math," because there's enough work queued up to saturate its arithmetic throughput — hence compute-bound.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">MID</span>Q53. Why is decode described as memory-bandwidth-bound?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>During decode, only one new token's worth of computation happens per step — a tiny amount of actual arithmetic — but every layer still must read the model's full weight matrices (and the growing KV cache) from GPU memory to perform even that small computation. The GPU spends most of its time waiting on data transfer from memory to its compute units rather than actually computing, because the amount of arithmetic per byte moved is very low. The bottleneck is genuinely "how fast can data move from memory," not "how fast can the GPU do math" — hence memory-bandwidth-bound.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">SENIOR</span>Q54. What specific hardware resource is decode-phase throughput usually limited by, and why doesn't adding more compute (FLOPs) fix it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Decode-phase throughput for a single sequence is typically limited by GPU memory bandwidth — the rate at which weights and KV cache entries can be streamed from high-bandwidth memory (HBM) into the GPU's compute cores. Adding more raw compute capacity (more or faster FLOP units) doesn't help because those units are already sitting idle waiting for data; the constraint isn't "not enough math capacity," it's "not enough data delivery rate to keep the math units fed." This is exactly why the fix for decode-phase throughput is increasing arithmetic intensity — most commonly via larger batch sizes, so the same memory read (of the weights) is reused across many concurrent sequences' worth of computation instead of being read once per sequence.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">SENIOR</span>Q55. How does batch size affect prefill versus decode differently, given their different bottlenecks?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Prefill is already compute-bound with a single long sequence, so increasing batch size (processing multiple prompts' prefill simultaneously) helps up to the point where the GPU's compute units are saturated, after which further batching mostly just queues more work without proportionally increasing throughput. Decode is memory-bandwidth-bound with a single sequence — a huge amount of unused compute capacity sits idle — so increasing decode batch size (serving many concurrent users' decode steps together) is almost pure upside up to a much higher ceiling: the same weight read from memory is reused across every sequence in the batch, dramatically raising arithmetic intensity and GPU utilization without a proportional latency cost per request, which is exactly the mechanism continuous batching exploits.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">SENIOR</span>Q56. What is "arithmetic intensity," and why is the decode phase's arithmetic intensity low compared to prefill's?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Arithmetic intensity is the ratio of compute operations performed to bytes of data moved from memory — a high ratio means a GPU is doing lots of math per byte fetched (compute-bound territory), a low ratio means it's mostly waiting on data movement relative to the math it gets to do (memory-bound territory). Prefill has high arithmetic intensity because processing many prompt tokens at once means each weight matrix, once loaded from memory, is reused across all those tokens' computations in the same pass. A single sequence's decode step has low arithmetic intensity because the same weight matrices are loaded from memory but used for just one token's worth of math before the step ends — most of the "work" is data movement, not arithmetic, until batching multiple sequences' decode steps together raises the reuse (and thus the intensity) back up.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. Explain how larger batch sizes during decode can improve GPU utilization without proportionally increasing latency per request.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Because decode is memory-bandwidth-bound for a single sequence, the GPU's compute units are mostly idle during any one sequence's decode step — there's substantial spare compute capacity. Batching multiple sequences' decode steps together means the same weight-matrix reads from memory are reused across every sequence in the batch in the same pass (the memory transfer, which was the bottleneck, doesn't scale linearly with batch size the way the useful work does), so throughput (total tokens generated per second across all sequences) rises substantially. Latency per individual token for any one sequence in the batch rises only modestly, because the extra work added by batching is mostly absorbed by previously-idle compute capacity rather than adding proportional new bottleneck time — up until the batch is large enough to become compute-bound itself, at which point further batching starts trading latency for throughput more directly.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">STAFF</span>Q58. You're designing a low-latency streaming chat service and profiling shows GPU compute utilization is only 15% during decode despite full queue depth. Diagnose and propose a fix.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Low compute utilization with a full request queue during decode is the textbook signature of being memory-bandwidth-bound with an under-batched serving configuration — the GPU is spending most of its cycles waiting on weight/KV-cache reads from memory rather than doing math, even though there's plenty of demand queued up. The fix is to increase effective decode batch size via continuous batching: instead of serving decode steps for only a small number of concurrent sequences (or worse, serializing requests), the inference engine should interleave decode steps from many concurrent sequences into the same forward pass, so each expensive weight-matrix memory read is amortized across far more useful computation. Concretely: verify the serving framework (e.g., vLLM-style continuous batching, or the provider's equivalent) is actually batching decode steps across requests rather than processing them one-at-a-time or in small static batches; check whether KV cache memory is the limiting factor preventing larger batches (if so, consider cache-efficient techniques like paged attention or quantized KV cache to fit more concurrent sequences in the same memory budget); and confirm request scheduling isn't artificially serializing traffic upstream of the batching layer (e.g., a synchronous per-request client pattern instead of a shared inference server pool).</p>
+</div>
+
+<div class="question" id="q59"><span class="level">MID</span>Q59. What is continuous batching, and how does it differ from static/request-level batching?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Static batching groups a fixed set of requests together, runs their prefill and decode together, and waits for the <em>entire</em> batch to finish generating before accepting new requests into a fresh batch — meaning a batch's throughput is limited by its longest-running request, and GPU capacity freed up by requests that finish early sits idle until the whole batch completes. Continuous batching instead treats each request's decode loop independently: at every single decode step, the scheduler checks which sequences in flight still need a next token, batches exactly those together for that one step, and immediately admits newly arrived requests into the next step's batch — so a GPU slot freed by one finished sequence is picked up by a waiting sequence within a single decode iteration rather than sitting idle until an entire batch completes.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">MID</span>Q60. Why does continuous batching specifically target the decode phase rather than prefill?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Prefill is a single, comparatively fast, parallel pass per request that is already compute-efficient on its own — there's less idle capacity to reclaim by interleaving it with other requests' prefill work (though it can still be batched to some degree). Decode is the long-running, sequential, memory-bandwidth-bound part of a request's lifecycle where individual sequences leave substantial GPU compute capacity unused at any given moment — that's precisely the idle capacity continuous batching reclaims by packing many concurrent sequences' single-token decode steps into the same forward pass, which is why the technique's biggest throughput wins show up specifically in decode-heavy, high-concurrency serving scenarios.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. Walk through what happens when a new request arrives mid-stream while 20 other requests are already in their decode loop, under continuous batching.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>The new request first goes through its own prefill pass (typically scheduled opportunistically, sometimes interleaved with or prioritized around the ongoing decode batch depending on the scheduler's policy), populating its KV cache and producing its first generated token. From that point on, at every subsequent decode iteration, the scheduler simply adds this 21st sequence's single-token decode step into the same batched forward pass as the other 20 — each sequence contributes one new token's worth of Query/Key/Value computation, all processed together in one GPU kernel launch, with each sequence attending only over its own cached history via appropriate masking. The new request doesn't wait for any of the 20 in-flight sequences to finish; it simply joins the shared decode loop at the next available iteration.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. What complications does continuous batching introduce for KV cache memory management across many concurrent requests?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Because requests enter and leave the batch at different times with different, growing sequence lengths, naively allocating a fixed-size contiguous memory block per sequence's KV cache either wastes memory (over-allocating for worst-case length) or requires expensive reallocation/copying as sequences grow. Production inference engines solve this with techniques like paged attention, which manages KV cache memory in fixed-size, non-contiguous "pages" (analogous to OS virtual memory paging) that can be allocated and freed per sequence on demand, avoiding both fragmentation and the need to pre-reserve worst-case memory for every concurrent request. Without such a scheme, the maximum number of concurrent sequences a GPU can serve under continuous batching would be far lower, since memory (not compute) becomes the binding constraint on batch size.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">STAFF</span>Q63. Propose a batching strategy for a mixed workload of short chat completions and long document-generation requests sharing the same GPU pool.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>The core risk in a mixed workload is head-of-line blocking under naive static batching — a handful of long document-generation requests can dominate a batch's decode iterations, starving short chat requests of GPU time and destroying their latency (bad for an interactive product surface). Continuous batching largely solves the scheduling half of this by giving every in-flight sequence a fair shot at each decode iteration regardless of how long it's been running, but memory pressure from many long-running KV caches can still crowd out capacity for new short requests, so I'd add priority-aware admission and eviction: reserve a portion of KV cache capacity/batch slots for interactive/short-latency-SLA traffic, and consider routing long document-generation workloads to a separate pool (or a lower-priority queue with relaxed SLAs) so a burst of long-form generation traffic can't degrade the interactive chat experience sharing the same hardware. I'd also monitor tokens-per-second and time-to-first-token separately per traffic class, since a single blended metric would mask one class's degradation behind the other's healthy numbers.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">JUNIOR</span>Q64. Why does streaming generation feel natural for chat UIs, given how decoders actually produce output?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A decoder genuinely produces its output one token at a time, sequentially, with each token only becoming available once the previous one has been generated and fed back through the model — there is no moment where the "full answer" exists all at once before that point. Streaming simply exposes this real, incremental generation process to the user as it happens rather than artificially buffering it until the end, which both matches the model's actual computational rhythm and improves perceived responsiveness by showing the first token almost immediately instead of making the user wait for total generation time.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">JUNIOR</span>Q65. In Spring AI, what does calling <code>.stream()</code> on a <code>ChatClient</code> actually correspond to at the model-serving level?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It opens a connection (typically server-sent events or a chunked HTTP response) to the inference server and subscribes to receive each newly generated token as an individual event, roughly as soon as that token is sampled at the end of one decode iteration on the server. The <code>Flux&lt;ChatResponse&gt;</code> returned in Java code is a reactive representation of exactly that server-side decode loop — each element emitted downstream corresponds to one token becoming available, not a client-side illusion of streaming over an already-complete response.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">MID</span>Q66. How does server-sent events (SSE) map onto the decode loop token by token?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>SSE keeps a single long-lived HTTP response open and lets the server push discrete "events" (small chunks of data) down that connection as they become available, rather than requiring the client to poll. In a decoder's serving pipeline, each time a decode iteration produces a new sampled token, the inference server immediately writes that token as one SSE event over the open connection — there's a near-direct one-to-one correspondence between "a decode step completed" on the server and "an SSE event was emitted" to the client, which is what makes streaming feel like watching generation happen live rather than watching a pre-recorded playback.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">MID</span>Q67. What happens to a Spring AI <code>Flux&lt;ChatResponse&gt;</code> subscriber if the underlying decode loop stalls mid-generation, and how would you handle that in code?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>If the server-side decode loop stalls (GPU contention, an upstream network hiccup, a provider-side issue), the subscriber simply stops receiving new elements on the <code>Flux</code> — reactive streams don't inherently distinguish "slow" from "about to fail" without an explicit timeout. In code, you'd typically guard against this with a <code>.timeout(Duration)</code> operator on the stream (raising a <code>TimeoutException</code> if no new token arrives within an expected interval) combined with proper error handling in the subscriber's error callback, and potentially a retry/fallback policy — because an indefinitely stalled stream will otherwise just leave the client hanging with no explicit signal that anything is wrong.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">SENIOR</span>Q68. Design consideration: what's the difference in how you'd handle backpressure for a decoder's token stream versus a typical database result stream?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A database result stream is usually producer-paced by the consumer's request rate in a fairly literal sense — the database can genuinely pause row production while the consumer catches up, since rows already exist in storage and simply aren't being read yet. A decoder's token stream is fundamentally different: tokens are being <em>actively computed</em> server-side by an expensive, ongoing GPU decode loop that is often shared across many concurrent requests via continuous batching — you generally cannot cheaply "pause" that computation mid-flight the way you can pause reading from a table, because doing so would mean holding GPU/KV-cache resources idle for a slow consumer while other requests wait. In practice, backpressure for LLM streaming is more often handled by buffering a modest number of tokens client-side (rather than propagating true backpressure to the generation loop itself) and, if a consumer genuinely can't keep up, cancelling the underlying generation request entirely rather than throttling it — because throttling a GPU-bound generation loop trades one request's slowness for wasted expensive compute capacity across the whole serving pool.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">JUNIOR</span>Q69. What's the difference between "prompt tokens" and "completion tokens" in a chat API bill?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Prompt tokens are the tokens in everything sent <em>to</em> the model — the system prompt, conversation history, retrieved context, and the current user message — processed during the prefill phase. Completion tokens are the tokens the model actually <em>generates</em> in response, produced one at a time during the decode phase. Most providers bill these two categories at different per-token rates (completion tokens are typically priced higher than prompt tokens), directly reflecting the fact that decode is more resource-intensive per token than prefill.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">JUNIOR</span>Q70. Does a decoder-only model process prompt tokens and completion tokens through fundamentally different code paths?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>No — both prompt and completion tokens flow through the exact same decoder blocks, the same weights, and the same causal-masking rules; there is no architectural distinction between "prompt" and "completion" tokens once they're inside the model, they're just positions in one growing sequence. The distinction is purely about serving-pipeline phase and billing: prompt tokens are all processed together in one prefill pass before generation starts, and completion tokens are produced one at a time afterward during decode — but the model itself treats a completion token exactly the same way it treats a prompt token once that token becomes part of the context for whatever comes next.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">MID</span>Q71. Why might a request with a huge prompt but a tiny completion cost less in latency than a tiny prompt with a huge completion, even with similar total token counts?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Prefill processes the entire prompt in one parallel, compute-bound pass, so even a very large prompt (say, 4,000 tokens) typically completes in a relatively small, roughly-flat amount of wall-clock time. Decode, by contrast, requires one full sequential pass through the entire model per generated token, and each of those passes has real latency that accumulates linearly with output length — so a request generating 4,000 completion tokens takes on the order of 4,000 sequential decode iterations' worth of time, which is dramatically slower than one parallel prefill pass over a similarly-sized prompt. This asymmetry is exactly why "time to first token" and "output length" are the two separate latency levers worth optimizing independently, rather than treating "total tokens" as a single undifferentiated cost.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">JUNIOR</span>Q72. What is a chat template, and why is it needed for a decoder-only model that only understands "continue this sequence of tokens"?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>A chat template is a formatting rule that converts a structured conversation (a list of role-labeled messages — system, user, assistant) into a single flat sequence of text/tokens, using special delimiter tokens to mark where each turn begins and ends and who is speaking. It's needed because a decoder-only model has no native concept of "roles" or "turns" at the architecture level — it only ever sees one linear token sequence — so the template is what encodes conversational structure into that sequence in a consistent, learnable format that matches how the model was fine-tuned to interpret role boundaries.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">JUNIOR</span>Q73. How does a multi-turn conversation with system/user/assistant roles get converted into a single token sequence for a decoder-only model?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Each message in the conversation is wrapped with role-marking special tokens or textual delimiters and concatenated, in order, into one long string, which is then tokenized as a single sequence — for example, a system message, a user message, and an assistant reply might become <code>&lt;system&gt;...&lt;/system&gt;&lt;user&gt;...&lt;/user&gt;&lt;assistant&gt;...&lt;/assistant&gt;</code> (exact delimiter tokens vary by model family), all fed through the decoder as one causal sequence exactly like any other prompt. The model was fine-tuned on data formatted this same way, so it has learned to treat text following an "assistant" opening marker as "my turn to generate" and to stop (emit EOS or a turn-closing token) at the appropriate point.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">MID</span>Q74. Show a worked example of what a chat template does to a 3-turn conversation (system, user, assistant, user) before it reaches the tokenizer.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Given the structured messages:</p>
+<pre>
+system:    "You are a concise assistant."
+user:      "What's the capital of France?"
+assistant: "Paris."
+user:      "And of Japan?"
+</pre>
+<p>a typical chat template (using illustrative, model-family-generic markers) would flatten this into one string before tokenization:</p>
+<pre>
+&lt;|system|&gt;You are a concise assistant.&lt;|end|&gt;
+&lt;|user|&gt;What's the capital of France?&lt;|end|&gt;
+&lt;|assistant|&gt;Paris.&lt;|end|&gt;
+&lt;|user|&gt;And of Japan?&lt;|end|&gt;
+&lt;|assistant|&gt;
+</pre>
+<p>Note the trailing, unclosed <code>&lt;|assistant|&gt;</code> marker at the end with no content after it — this is what signals to the decoder that generation should continue from here as the assistant's turn, and the model's own next-token prediction picks up exactly where this flattened sequence leaves off.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">MID</span>Q75. What role do special tokens like turn/role markers play in chat-formatted decoder input, and are they part of the normal vocabulary?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>These markers are typically reserved vocabulary entries added specifically for chat formatting — they occupy real token IDs in the model's vocabulary (and consume real embedding rows), but they never appear in ordinary prose, which is precisely what makes them reliable, unambiguous structural signals rather than something a model could confuse with genuine user content. During fine-tuning, the model learns strong statistical associations between these markers and behavior — e.g., "after an assistant-turn-open marker, generate a helpful reply and end with EOS or a turn-close marker" — which is how role structure gets baked into next-token prediction despite the underlying model having no architectural notion of "roles" at all.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">SENIOR</span>Q76. What breaks if your application constructs the chat-formatted prompt slightly differently than the format the model was fine-tuned on?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Nothing "errors" in any visible way — the model will still tokenize and process a malformed or mismatched template just fine, since it has no built-in validation of chat structure. What degrades is generation quality and reliability: the model's fine-tuning taught it strong statistical expectations about exactly how role boundaries and special tokens appear, and a subtly wrong format (missing a closing marker, using the wrong delimiter for that model family, inconsistent whitespace around markers) puts the input outside the distribution the model was actually tuned on. Symptoms include the model ignoring system instructions, failing to respect turn boundaries (continuing to "speak as the user"), degraded instruction-following, or unexpected EOS behavior — which is exactly why using the model provider's official chat-template utility (rather than hand-rolling string concatenation) is a strong production best practice.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">SENIOR</span>Q77. How does instruction-tuning change what a decoder-only base model "wants" to generate after a chat template is applied, compared to a raw pretrained base model given the same templated input?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A raw pretrained base model has only ever learned "predict plausible continuations of internet-scale text," so if you feed it a chat-templated prompt, it will tend to treat the special markers as unusual text and may continue in unhelpful ways — hallucinating additional fake user turns, ignoring the instruction implicit in the system message, or simply continuing whatever textual pattern seems statistically likely regardless of whether it's "helpful." Instruction-tuning (further training on curated conversational data that follows the chat template format, typically with a helpful/harmless/honest objective) reshapes the model's learned next-token distribution specifically at those role-boundary markers, so that following an assistant-turn-open marker, the highest-probability continuation becomes "a genuinely helpful, on-topic response that respects the system instruction and ends appropriately" rather than an arbitrary statistically-plausible continuation of internet text. The architecture is identical in both cases — the difference is entirely in what the training data taught the same decoder-only mechanism to do at those specific structural positions.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">SENIOR</span>Q78. What do decoder-only scaling laws practically tell an engineering team choosing between a smaller fine-tuned model and a larger general model for a fixed task?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Scaling laws for decoder-only models show that quality improves predictably (though with diminishing returns) as a function of parameter count, training data volume, and compute, roughly following power-law curves — which practically means a much larger general-purpose model reliably outperforms a much smaller one on broad, open-ended capability, but the marginal quality gain per additional parameter shrinks. For a narrow, well-defined production task, a smaller model fine-tuned specifically on that task's distribution can often match or exceed a much larger general model's task-specific performance, because fine-tuning effectively "spends" the smaller model's limited capacity entirely on the task at hand rather than spreading it across broad general capability the task doesn't need. The practical decision hinges on task narrowness and latency/cost sensitivity: narrow, latency-sensitive, high-volume tasks favor a smaller fine-tuned model; broad, open-ended, lower-volume tasks favor a larger general model where fine-tuning a narrow model isn't even well-defined.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">SENIOR</span>Q79. Why don't latency scaling laws follow the same curve as quality scaling laws, given that decode is inherently sequential?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Quality scaling laws describe how output quality improves with more parameters/data/compute spent on training — a property of the trained model itself. Latency at inference time, by contrast, is dominated by the decode loop's sequential structure: the number of decode iterations required equals the number of output tokens, completely independent of how large or capable the model is, and each iteration's wall-clock cost scales primarily with model size (bigger models mean more weight data to move per decode step) rather than with anything related to the quality curve. This means a model can get meaningfully "smarter" per parameter added (following the quality scaling curve) while simultaneously getting linearly slower per token generated (following a completely separate, size-driven latency relationship) — the two curves are related only through model size as a shared input, not through any deeper connection between quality and speed.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">STAFF</span>Q80. Given a fixed inference latency budget, how would you reason about the tradeoff between a bigger model with fewer generated tokens versus a smaller model generating more tokens (e.g., via chain-of-thought)?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Total decode latency is roughly proportional to (per-token decode cost, driven by model size) × (number of output tokens), so the two levers genuinely trade against each other under a fixed budget: a larger model that reaches a correct, concise answer in fewer tokens (better prompting, less need for explicit intermediate reasoning) may cost about the same wall-clock time per response as a smaller, faster-per-token model that needs several times more tokens (via chain-of-thought reasoning) to reach comparable accuracy. The right choice depends on which lever is cheaper to pull for the task at hand: if the task genuinely benefits from visible step-by-step reasoning to reach correctness, a smaller model with more reasoning tokens can be both cheaper and comparably accurate; if the task is more about world-knowledge/nuance than stepwise computation, a bigger model answering directly and concisely often wins on both latency and quality simultaneously. I'd validate this empirically per task rather than assuming either direction — total latency and accuracy should both be measured, not inferred from parameter count or token count alone.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">STAFF</span>Q81. How do scaling and hardware-bottleneck considerations motivate speculative decoding with a draft/target model pair, and what decoder-only property makes this technique work at all?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Because decode is memory-bandwidth-bound and under-utilizes available compute for a single sequence, there is substantial idle arithmetic capacity sitting unused at every decode step — exactly the same idle capacity continuous batching reclaims across multiple requests, but speculative decoding reclaims it within a <em>single</em> request. A small, fast "draft" model generates several candidate next tokens autoregressively (cheaply, since it's small), and then the large "target" model verifies all of those candidate tokens <em>in a single parallel forward pass</em> — because verifying a proposed token (checking whether the target model would have assigned it non-trivial probability) is architecturally identical to prefill-style parallel processing of a known sequence, not sequential generation. If the target model accepts several draft tokens as plausible, multiple tokens' worth of output are produced for roughly the cost of one target-model decode step; if a draft token is rejected, the target model's own prediction is used instead and drafting resumes from there. This works specifically because verification (checking many known tokens at once) is compute-bound and parallel, exactly like prefill, while generation (producing new tokens one at a time) is memory-bound and sequential — speculative decoding essentially converts part of the decode workload into prefill-shaped work to exploit the GPU's otherwise-idle compute capacity.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">STAFF</span>Q82. You're asked to design a low-latency streaming chat service. Walk through the key architectural decisions driven specifically by decode-phase bottlenecks.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>First, serve behind an inference engine that implements continuous batching with paged (or equivalent) KV cache management, since decode's memory-bandwidth-bound nature means throughput scales with how many concurrent sequences share each expensive weight read — a naive single-request-at-a-time server would leave most GPU capacity idle. Second, stream tokens to the client via SSE/websocket as soon as each decode iteration produces one, so perceived latency is dominated by time-to-first-token (a prefill-driven, largely prompt-length-dependent cost) rather than total generation time. Third, treat prompt length and output length as separate cost/latency levers in the product design — aggressively trim conversation history and retrieved context (cheap, since prefill is fast and parallel) while being more conservative about max output token limits (expensive, since decode is slow and sequential), and consider capping or steering verbosity for latency-sensitive surfaces. Fourth, consider speculative decoding if a suitable draft model exists for the domain, since it converts idle decode-phase compute into extra throughput. Fifth, instrument and alert on time-to-first-token and tokens-per-second as separate SLAs rather than one blended "response time" metric, since they're driven by different phases with different bottlenecks and different fixes.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">STAFF</span>Q83. A production decoder-only model has started producing visibly repetitive, degenerate text ("the the the...") for a subset of long-running conversations. Diagnose likely causes and fixes.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The most likely root cause is the autoregressive feedback loop discussed earlier: once a short repeated pattern appears in the context (often triggered by very low temperature/near-greedy decoding, an unusually long or self-similar context, or a degenerate earlier generation that was never corrected), the model's own repeated tokens become strong evidence in its own context that repetition is the expected continuation, and greedy or low-temperature decoding has no mechanism to escape that local trap. First-line fixes are decoding-parameter changes that don't require retraining: raise temperature modestly, ensure top-p/top-k are set to allow some exploration away from the single highest-probability token, and enable (or increase) a repetition penalty or frequency penalty so previously-used tokens become progressively less attractive. If those conversations specifically correlate with very long context (approaching the model's context window), check whether the degeneracy correlates with context length — some models degrade in coherence as the KV cache fills toward the training-time context limit, which would point toward context trimming/summarization as the actual fix rather than decoding parameters alone. Finally, add a production safeguard: detect repeated n-gram loops server-side (a cheap pattern check on the last k tokens) and truncate/regenerate with adjusted parameters rather than streaming visibly broken output to the user.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">STAFF</span>Q84. How would you choose decoding parameters differently for a deterministic production feature (e.g., a legal disclaimer generator) versus a creative one (e.g., a marketing copy generator), and why?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>For the deterministic feature, I'd use low temperature (near 0, functionally close to greedy) with tight or no top-p/top-k exploration, and possibly deterministic decoding entirely if the provider supports it — the goal is reproducibility and minimizing variance from the model's single highest-confidence continuation, since a legal disclaimer has essentially one "correct" phrasing per situation and any creative deviation is pure downside risk. I would also strongly consider constrained/grammar-guided decoding if the disclaimer needs to conform to an approved template structure, converting "usually correct" into "guaranteed structurally correct." For the creative feature, I'd use moderate-to-higher temperature combined with top-p sampling (rather than top-k, since top-p adapts better to how confident the model is at each step) to intentionally preserve variety across generations and avoid the bland, repetitive tendency of near-greedy decoding — and I'd deliberately avoid heavy grammar constraints, since creative copy benefits from the model's natural stylistic range rather than a rigid structure. The underlying principle in both cases is the same: decoding parameters don't change what the model "knows," they change how much of its learned probability distribution's tail is allowed to influence the sampled output, and that knob should be set based on whether variance is a production risk or a product feature.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">MID</span>Q85. What is speculative decoding, and how does it exploit the fact that decode is memory-bandwidth-bound rather than compute-bound?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Speculative decoding uses a small, cheap "draft" model to quickly generate several candidate next tokens, then has the large "target" model check all of those candidates in one single parallel forward pass — which is computationally similar to prefill (verifying known tokens) rather than standard sequential decode (generating unknown tokens one at a time). Because a single sequence's decode step already under-utilizes the GPU's compute capacity (the bottleneck is memory bandwidth, not arithmetic), verifying several draft tokens at once costs barely more than verifying one, since the same memory-bound weight reads happen either way — so when the target model accepts multiple draft tokens as plausible, several tokens of real output are produced for close to the latency cost of a single normal decode step.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">SENIOR</span>Q86. How does quantizing a decoder-only model (e.g., to INT8 or INT4) affect decode-phase throughput versus prefill-phase throughput, and why the asymmetry?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Quantization shrinks the size of the model's weights in memory (e.g., roughly 4× smaller going from FP16 to INT4), which directly reduces the volume of data that must move from memory to compute units at every step. Since decode is memory-bandwidth-bound, this is a near-direct win — less data to move per decode step means each step completes faster and/or more concurrent sequences fit in the same bandwidth budget, often producing a substantial decode throughput improvement. Prefill, being compute-bound rather than memory-bound, benefits far less from quantization's memory-size reduction alone (though some quantization schemes also speed up the arithmetic itself, which does help prefill) — the asymmetry exists because quantization primarily attacks the specific resource (memory bandwidth) that limits decode, while prefill's bottleneck (raw compute throughput) is a comparatively separate concern.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">MID</span>Q87. What is min-p sampling, and how does it address a weakness of top-p sampling with very flat or very peaked distributions?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Min-p sampling sets a dynamic probability floor relative to the single most likely token: only tokens whose probability is at least (min_p × probability of the top token) are kept as candidates, then the survivors are renormalized and sampled from. This adapts naturally to the distribution's shape in a way plain top-p can behave oddly for at the extremes — when the model is extremely confident (one token near probability 1.0), top-p with a high threshold can still admit a long tail of low-probability tokens if their cumulative sum happens to cross the threshold slowly, whereas min-p's relative floor cleanly excludes anything far below the top candidate regardless of cumulative sum; conversely, when the distribution is very flat (genuine uncertainty), min-p naturally keeps a wider set of comparably-likely candidates rather than being overly restrictive.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">JUNIOR</span>Q88. What does a token's "logprob" tell you, and how is it derived from the decoder's output at each generation step?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A logprob is the natural logarithm of the probability the model assigned to a specific token at the moment it was generated (or would assign to a hypothetical token, when requested for candidates other than the one actually sampled). It comes directly from the same softmax distribution over the vocabulary that the LM head produces at every decode step — taking the log of the probability the softmax assigned to the token in question. A logprob close to 0 means the model was very confident in that token (probability near 1); a very negative logprob means the model considered that token quite unlikely at that point.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">MID</span>Q89. How can per-token logprobs returned by a decoding API be used to detect low-confidence generations in production?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because each logprob directly reflects the model's confidence in the specific token it generated at that position, a production system can inspect the sequence of logprobs across a completion and flag responses where confidence is unusually low — either a single very negative logprob at a critical position (suggesting an uncertain or possibly hallucinated fact) or a low average logprob across the whole response (suggesting the model was generally uncertain, perhaps operating outside its comfortable knowledge distribution). This is commonly used as a lightweight, cost-free-at-inference-time proxy signal for triggering a fallback behavior — e.g., asking a clarifying question, routing to a larger model, or flagging the response for human review — without requiring a separate confidence-scoring model.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">SENIOR</span>Q90. Why do code-generation features typically use low temperature / near-greedy decoding while creative-writing features use higher temperature, tying this back to what decoding parameters actually do to the next-token distribution?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Temperature and top-p/top-k don't change what the model "knows" — they change how much of the tail of its learned next-token probability distribution is allowed to influence the sampled output. Code has a comparatively narrow space of syntactically and semantically correct continuations at each point (a variable name must exist, a bracket must close correctly, a function signature must match its usage), so the model's highest-probability tokens at each step are usually also the objectively correct ones — low temperature reliably selects them and suppresses the small chance of sampling a lower-probability, likely-wrong token that would introduce a bug. Creative writing has a genuinely wide space of equally "correct" continuations at each point (many different next words could all produce good prose), so higher temperature intentionally samples further into that legitimate tail, producing variety and stylistic surprise that near-greedy decoding would flatten into generic, repetitive phrasing. The same mechanism (reshaping one probability distribution before sampling) produces opposite recommended settings purely because the two tasks have structurally different "correct answer" distributions.</p>
+</div>
+
 </div>
 
 <hr>

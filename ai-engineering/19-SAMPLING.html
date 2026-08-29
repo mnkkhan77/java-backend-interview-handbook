@@ -605,7 +605,6 @@ Second, in adversarial or red-teaming contexts, an attacker who can control samp
 <div class="answer">
 <p>Temperature rescales the sharpness of the probability distribution before sampling (lower = more deterministic, higher = more random); top-p (nucleus sampling) truncates the candidate pool to the smallest set of highest-probability tokens whose cumulative probability meets a threshold, discarding the unlikely long tail before sampling.</p>
 </div>
-</div>
 
 <div class="question" id="q2"><span class="level">JUNIOR</span>Q2. What happens if you set temperature to 0?</div>
 <p class="roi">ROI: ★★★★☆ · Frequency: High</p>
@@ -650,6 +649,568 @@ Second, in adversarial or red-teaming contexts, an attacker who can control samp
 <p>Instrument every generation call to log the exact resolved sampling parameters (temperature, top-p, top-k, penalties, model version, prompt hash) alongside the output, so any three of "prompt changed," "model changed," and "sampling config changed" can be independently ruled in or out during an incident, rather than conflated into a single "the model got worse" hypothesis. Build sampling-specific regression checks into the evaluation harness: run a fixed test set at the production sampling configuration across multiple samples per input to measure output variance directly (a sudden increase in variance on a task expected to be near-deterministic is itself a signal, independent of whether individual outputs pass quality checks), and separately track structured-output parse-failure rate as a leading indicator that a precision-sensitive path's temperature or top-p has drifted too high. Treat sampling configuration as versioned, reviewed configuration — changes should go through the same review and staged-rollout process as a prompt or model version change, not be adjustable ad hoc by any caller.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. Precisely, what does the softmax-with-temperature formula do differently at T=0, T=1, and T=2?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>The formula is P(token_i) = exp(z_i / T) / Σ_j exp(z_j / T). At T=1 the logits pass through unscaled — this is the model's raw, trained confidence. At T&gt;1 (e.g. T=2), dividing by a number greater than 1 shrinks the gaps between logits before exponentiating, which compresses the resulting distribution toward more uniform probabilities across many tokens. T=0 is not literally plugged into the formula (division by zero is undefined); every real implementation special-cases T=0 as pure argmax selection, which is the limiting behavior the formula approaches as T shrinks toward zero — probability collapses almost entirely onto the single highest-logit token.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. Is there a temperature value that makes sampling equivalent to picking a token uniformly at random from the entire vocabulary, ignoring the model's predictions?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Only in the limit — as T approaches infinity, dividing every logit by an enormous number pushes all the scaled logits toward 0, and exp(0) is 1 for every token, so softmax approaches a uniform distribution over the whole vocabulary. No production system actually sets temperature to infinity, but the direction is useful intuition: temperature only ever reshapes the model's own distribution, it never substitutes a different one, and even at very high (but finite) practical values like T=5 the output is still influenced by the model's relative token rankings, just very weakly.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">MID</span>Q11. Worked example: given logits [4.0, 3.0, 2.0] for three candidate tokens, compute the resulting probabilities at T=1, T=0.5, and T=2, and explain the pattern.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<pre><code>T = 1:   exp(4)=54.60, exp(3)=20.09, exp(2)=7.39   sum=82.08
+         P = [0.665, 0.245, 0.090]
+
+T = 0.5: exp(8)=2981.0, exp(6)=403.4, exp(4)=54.60  sum=3439.0
+         P = [0.867, 0.117, 0.016]
+
+T = 2:   exp(2)=7.39, exp(1.5)=4.48, exp(1.0)=2.72  sum=14.59
+         P = [0.507, 0.307, 0.187]</code></pre>
+<p>Lowering T from 1 to 0.5 pushed the top token's probability from 66.5% to 86.7% — a much sharper concentration. Raising T from 1 to 2 pulled it down to 50.7%, flattening the distribution so the second and third tokens become meaningfully more competitive. The ranking never changes (token 1 is always most likely) — only the relative gap between candidates changes, which is exactly why temperature is described as reshaping sharpness, not reordering.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">MID</span>Q12. Why does temperature have such an outsized, nonlinear effect on output diversity even though the formula itself just divides by a number?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because the division happens before an exponential, not after. exp() amplifies differences multiplicatively — a fixed additive gap between two logits translates into a probability ratio that grows or shrinks exponentially as that gap is scaled up or down by 1/T. A 20% change in T can therefore swing the top token's probability mass by tens of percentage points, as the worked example above shows, even though "divide by T" looks like a mild linear operation. This is precisely why small, seemingly innocuous temperature edits (0.7 to 0.9, say) produce output that "feels" much more different than the number itself suggests.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. Walk through the exact top-p algorithm as a sequence of steps, without referring to any specific numeric example.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Sort every candidate token by probability, highest to lowest. Walk down that sorted list, adding up probabilities as you go. Stop as soon as the running cumulative sum reaches or exceeds the threshold p — the tokens included up to and including that stopping point form the "nucleus." Discard every token after the cutoff, then renormalize the surviving tokens' probabilities so they sum to 1 again, and sample from that final restricted distribution.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">JUNIOR</span>Q14. What happens if you configure top-p to exactly 0.0?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>The cumulative-probability walk stops at the very first token in the sorted list, because even that single token's probability is greater than or equal to a threshold of 0. The nucleus therefore contains exactly one token — the highest-probability one — which makes top-p=0.0 behave identically to greedy decoding (temperature-0 argmax selection), regardless of what temperature is separately configured. This is a degenerate edge case worth knowing precisely, because it explains a bug where someone thinks they've configured "very low but nonzero randomness" and instead gets fully deterministic output.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">MID</span>Q15. Worked example: a step's distribution has probabilities [0.30, 0.25, 0.20, 0.10, 0.08, 0.05, 0.02] over its top seven tokens. Compute the nucleus size at p=0.5 and at p=0.9.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<pre><code>Cumulative: 0.30, 0.55, 0.75, 0.85, 0.93, 0.98, 1.00
+
+p = 0.5  → cumulative first crosses 0.5 at token 2 (0.55)   → nucleus size = 2
+p = 0.9  → cumulative first crosses 0.9 at token 5 (0.93)   → nucleus size = 5</code></pre>
+<p>Moving p from 0.5 to 0.9 — a 0.4 increase — more than doubled the nucleus from 2 tokens to 5. This is the adaptivity property in action: the same jump in p produces a very different-sized change in candidate pool depending on exactly how the probability mass is distributed at that particular step, which is why top-p cannot be reasoned about as "roughly k tokens" without actually looking at the distribution shape.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">SENIOR</span>Q16. Why is the size of the top-p nucleus at each step itself a useful production monitoring signal, independent of the final sampled token?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Nucleus size is a direct, per-step proxy for how confident the model is: a nucleus of one or two tokens means the model is highly certain about what comes next, while a nucleus of dozens of tokens means the model is genuinely uncertain among many plausible continuations. Logging the average and distribution of nucleus size across a feature's generations gives you a confidence signal that's cheaper to compute than running a separate uncertainty-estimation pass, and a sudden shift in typical nucleus size for a given prompt template — without any change to the prompt or model — is a strong, early leading indicator that something upstream (a data distribution shift, a subtly different system prompt, a model version swap) changed the model's actual confidence, which is often more diagnostic than watching output text alone.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">JUNIOR</span>Q17. State the top-k algorithm precisely, step by step.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Given the full probability distribution over the vocabulary (after any temperature scaling), sort tokens by probability descending, keep only the top k tokens by rank, discard every other token regardless of its probability, and renormalize the surviving k tokens' probabilities so they sum to 1. Sample from that restricted, renormalized set. Unlike top-p, the count of surviving candidates is always exactly k (or fewer, only if the vocabulary itself has fewer than k tokens with nonzero probability) — it never adapts to the shape of the distribution at that step.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">MID</span>Q18. Worked example: apply top-k=3 to the distribution [0.40, 0.25, 0.20, 0.10, 0.05] and show the renormalized probabilities actually sampled from.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<pre><code>Kept (top 3 by rank):     0.40, 0.25, 0.20   → raw sum = 0.85
+Discarded:                0.10, 0.05          → 0.15 of probability mass removed
+
+Renormalized (divide each by 0.85):
+  0.40 / 0.85 = 0.471
+  0.25 / 0.85 = 0.294
+  0.20 / 0.85 = 0.235
+  (sums to 1.000)</code></pre>
+<p>Notice the fourth-ranked token (originally 10% likely — not negligible) is excluded entirely, with no path back into consideration no matter how the distribution's shape looked at this particular step. That fixed, context-blind exclusion is exactly the weakness nucleus sampling was designed to fix.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">MID</span>Q19. Why is a very large top-k value (e.g. k=1000 on a 50,000-token vocabulary) often functionally a no-op, and when does that stop being true?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>In most generation steps, the vast majority of a language model's probability mass concentrates on a small number of tokens — often well under 100 — with the remaining thousands carrying vanishingly small probabilities. A top-k of 1000 rarely actually excludes any token that had meaningful probability, so in practice it behaves almost identically to having no top-k truncation at all. It stops being a no-op specifically at high-temperature settings, where flattening the distribution pushes meaningful probability mass further out into the tail — at T=1.5 or higher, tokens ranked in the hundreds can carry non-trivial probability, and a k=1000 cutoff starts actually doing truncation work rather than being redundant.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">JUNIOR</span>Q20. What happens if you set top_k=1, and does the value of temperature or top_p matter once you've done that?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Top_k=1 keeps only the single highest-probability token as the entire candidate set, so sampling from "a distribution of one token" always picks that one token — this is greedy decoding again, reached through a different parameter than temperature=0. Once top_k=1 has collapsed the candidate pool to a single option, temperature and top_p become irrelevant for that step: there is nothing left for them to reshape or truncate. This is a common source of confusion when someone tunes temperature and top_p carefully but leaves a stray top_k=1 set from an earlier experiment, and can't understand why output stopped varying.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">SENIOR</span>Q21. State the exact order of operations when temperature, top-k, and top-p are all configured together, and explain why that order matters rather than being arbitrary.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The standard production pipeline is: apply logit-level penalties first, then divide by temperature, then run softmax to get a real probability distribution, then apply top-k truncation (renormalizing), then apply top-p truncation on the surviving set (renormalizing again), then sample. The order matters because each truncation step operates on the probabilities produced by the step before it — top-p computed on the post-top-k renormalized distribution can produce a smaller or differently-shaped nucleus than top-p computed on the original full distribution, since renormalization after top-k changes the relative probabilities of the surviving tokens. Reversing the order (top-p first, then top-k) is possible in principle but is not what any major inference stack does, and would generally change results, so relying on a specific interaction behavior without checking the provider's documented order is a real correctness risk.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">SENIOR</span>Q22. If top-p were hypothetically applied before temperature scaling instead of after, would the resulting nucleus differ from the standard order — and why?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium at senior level</p>
+<div class="answer">
+<p>Yes, it would generally differ. Temperature scaling changes the relative probabilities of tokens nonlinearly (via the exponential in softmax), which can change which tokens fall inside versus outside a given cumulative-probability threshold. A token that's just outside the p=0.9 nucleus at T=1 might fall inside it at T=1.5, because flattening the distribution redistributes probability mass toward tokens that were previously below the cutoff. Applying top-p before temperature would compute the nucleus against the untouched distribution and then temperature-scale only within that already-fixed set, producing a systematically narrower effective candidate pool at high temperatures than the standard order does — which is exactly why the standard pipeline scales by temperature first, so the truncation reflects the distribution shape you actually intend to sample from.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">SENIOR</span>Q23. Worked example: show a case where combining top-k=50 and top-p=0.9 produces a smaller candidate set than either constraint would produce alone.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<pre><code>Suppose the top 5 tokens already carry cumulative probability 0.93,
+and the remaining 45 tokens (ranks 6-50) together carry only 0.04
+(the rest of the vocabulary carries the remaining ~0.03).
+
+Top-k=50 alone: keeps all 50 top-ranked tokens as candidates.
+Top-p=0.9 alone: the cumulative sum crosses 0.9 by rank 5,
+                 so the nucleus is just 5 tokens.
+
+Applied together (top-k first, then top-p on the surviving 50):
+  top-k narrows to 50 candidates, renormalizes,
+  top-p then finds the same 5-token nucleus within that set
+  → final candidate set = 5 tokens, identical to top-p alone here.</code></pre>
+<p>In this case top-k=50 did no independent narrowing because the real nucleus was already far smaller than 50 — top-p was the binding constraint. The general lesson: when both are set, the tighter constraint at that specific step dominates, and which one that is can flip from step to step within the same generation, which is exactly why logging the effective candidate-set size (not just the configured k and p) is valuable for debugging.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. What is min-p sampling, and what is its exact selection rule?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High (growing)</p>
+<div class="answer">
+<p>Min-p sampling sets a probability floor that scales with the model's confidence at that step, rather than a fixed cumulative-mass or fixed-count cutoff. Given the highest single-token probability p_max at a step and a configured min_p value, the selection rule keeps every token whose probability is at least min_p × p_max, discarding the rest and renormalizing. When the model is very confident (p_max is high), the absolute threshold is high and few tokens survive; when the model is uncertain (p_max is low), the threshold is proportionally low and more tokens survive — adapting to confidence the way top-p does, but through a different mechanism (a relative floor rather than a cumulative sum).</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. Worked example: the top token has probability 0.5 and min_p is set to 0.1. Which of these candidate tokens survive — 0.5, 0.20, 0.08, 0.04, 0.03?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<pre><code>threshold = min_p × p_max = 0.1 × 0.5 = 0.05
+
+0.50 ≥ 0.05  → survives
+0.20 ≥ 0.05  → survives
+0.08 ≥ 0.05  → survives
+0.04 <  0.05 → discarded
+0.03 <  0.05 → discarded
+
+Surviving set: [0.50, 0.20, 0.08] → renormalize by dividing by 0.78
+  → [0.641, 0.256, 0.103]</code></pre>
+<p>Three of the five candidates survive because their probability is at least 5% of the top token's probability. If the top token instead had probability 0.9, the same min_p=0.1 would set the threshold at 0.09 — noticeably stricter in absolute terms, automatically tightening as the model becomes more confident.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. In what specific situation does min-p behave more sensibly than top-p?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium (growing)</p>
+<div class="answer">
+<p>On a very flat, low-confidence distribution — where dozens of tokens carry small, similar probabilities — a fixed top-p threshold like 0.9 can end up including an unusually large number of tokens just to accumulate enough cumulative mass, some of which are individually quite weak candidates. Min-p instead looks at each token's probability relative to the single best token, so even on a flat distribution it only keeps tokens that are reasonably competitive with the top choice, rather than however many are needed to hit a fixed cumulative percentage. This tends to produce a more consistently "reasonable" candidate pool across both very confident and very uncertain steps, which is the specific weakness of top-p that motivated min-p's design.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">SENIOR</span>Q27. Would you recommend switching a production pipeline from top-p to min-p today? What would you weigh?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Min-p is a genuinely newer technique with real theoretical and some empirical advantages on flat distributions, but it has far less production track record than top-p, and not every inference provider or serving stack exposes it as a first-class parameter — meaning adopting it can mean added serving-stack complexity or provider lock-in to whichever vendors support it. The right call is task-specific: on a feature that already shows measurable quality problems traceable to top-p's fixed-cumulative-mass weakness on uncertain steps (verified via the kind of nucleus-size logging discussed earlier), it's worth an A/B test against min-p; for a stable, well-tuned production feature with no observed problem, switching purely because it's newer is not justified without evidence.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">MID</span>Q28. State the exact repetition-penalty formula and show a worked example on a token with logit 3.0 and one with logit -2.0, using a penalty of 1.5.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<pre><code>Rule: if logit > 0: logit_new = logit / penalty
+      if logit ≤ 0: logit_new = logit * penalty
+
+Token A (logit = 3.0), penalty = 1.5:
+  3.0 > 0  →  3.0 / 1.5 = 2.0        (pulled down)
+
+Token B (logit = -2.0), penalty = 1.5:
+  -2.0 ≤ 0 →  -2.0 * 1.5 = -3.0      (pushed further negative)</code></pre>
+<p>This asymmetric rule (divide positive logits, multiply negative ones) always pushes an already-generated token's logit toward being less competitive, regardless of whether it started above or below zero — which is why it's called a repetition penalty rather than a repetition bias: it can only discourage a token that has already appeared, never inadvertently boost one.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. State the exact frequency-penalty formula and compute the effect on a token with base logit 4.0 that has already appeared 1, 2, and 3 times, using alpha=0.8.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<pre><code>Rule: logit_new = logit - (alpha × count)
+
+count = 1:  4.0 - (0.8 × 1) = 3.2
+count = 2:  4.0 - (0.8 × 2) = 2.4
+count = 3:  4.0 - (0.8 × 3) = 1.6</code></pre>
+<p>The penalty compounds linearly with how many times the token has already been used in this response — a token used three times has its logit reduced three times as much as one used once. This is exactly why frequency penalty is the effective tool against escalating repetition loops: the more a model tries to lean on the same token, the harder it becomes to keep choosing.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">MID</span>Q30. State the exact presence-penalty formula and contrast the result with frequency penalty for a token used once versus five times, using beta=0.8 in both cases.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<pre><code>Presence penalty rule: logit_new = logit - (beta × [count > 0])
+  [count > 0] is 1 if the token has appeared at all, else 0.
+
+Used once (count=1):  logit - (0.8 × 1) = logit - 0.8
+Used five times (count=5): logit - (0.8 × 1) = logit - 0.8   (identical!)
+
+Frequency penalty (alpha=0.8) on the same cases:
+Used once:  logit - (0.8 × 1) = logit - 0.8
+Used five times: logit - (0.8 × 5) = logit - 4.0</code></pre>
+<p>Presence penalty applies the exact same flat deduction the moment a token appears even once, and never intensifies no matter how many more times it recurs — it's a one-time "have you shown up at all" signal, better suited to encouraging lexical variety across the whole response. Frequency penalty keeps scaling with count and is the correct tool specifically for stopping an escalating loop.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">SENIOR</span>Q31. Worked example combining both penalties: a token with base logit 5.0 has appeared 3 times; frequency penalty alpha=0.5 and presence penalty beta=1.0 are both configured. What is its final adjusted logit?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<pre><code>logit_new = logit - (alpha × count) - (beta × [count > 0])
+          = 5.0 - (0.5 × 3) - (1.0 × 1)
+          = 5.0 - 1.5 - 1.0
+          = 2.5</code></pre>
+<p>Both penalties subtract independently and additively from the same base logit — they are not alternatives you choose between, they compose. This matters operationally: a team that sets both to moderate values without realizing they stack can end up with a much stronger combined suppression than either was intended to provide alone, which is a common source of "the model refuses to reuse even necessary terms" bug reports.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">SENIOR</span>Q32. Describe a concrete production failure caused by an over-tuned frequency penalty on technical text, and how you'd diagnose it.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A code-generation or technical-documentation feature with an aggressively high frequency penalty will start avoiding legitimately necessary repeated tokens — a variable name used correctly six times in a function, a class name repeated across several method signatures, a unit like "ms" repeated in a table of latency figures — and substitute increasingly strained synonyms or outright incorrect alternate names as the penalty compounds with each repeated use. The diagnostic signature is specific: the failure gets worse the longer the generation runs (because frequency penalty accumulates with count), it concentrates around a small set of terms that are legitimately supposed to repeat, and it disappears immediately if you regenerate the same prompt with frequency_penalty set to 0 — which is the fastest way to confirm the penalty, not the model or prompt, is the root cause.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">JUNIOR</span>Q33. Can frequency or presence penalty values be negative, and if so, what would that be used for?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>Yes — most APIs that expose these parameters accept negative values, which flips the formula's effect from discouraging to encouraging repetition, since subtracting a negative number increases the logit instead of decreasing it. This is a niche but real use case: a feature that wants the model to consistently reuse a fixed set of terms — sticking closely to specific brand terminology, or repeating a template phrase like a disclaimer heading — could use a small negative penalty to nudge the model toward reusing tokens it has already used, though in practice most teams achieve this more reliably through prompting or constrained decoding rather than negative penalties, since the effect is diffuse across all previously-used tokens rather than targeted at specific ones.</p>
+</div>
+
+<div class="question" id="q34"><span class="level">SENIOR</span>Q34. Explain, mechanically, how floating-point non-associativity makes temperature-0 (greedy) decoding not fully deterministic on hosted GPU inference.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Floating-point addition is not associative: (a + b) + c can produce a very slightly different result than a + (b + c) due to rounding at each step. The matrix multiplications and summations inside a Transformer's forward pass — especially reductions like summing across the attention or feed-forward dimensions — are computed on GPUs using parallel reduction strategies, and the exact order in which partial sums are combined depends on low-level scheduling details like the batch size and composition of concurrent requests sharing the GPU at that moment. Because different orderings of the same set of floating-point additions can produce logits that differ in the last few bits of precision, an argmax comparison between two nearly-tied top logits can occasionally flip which one is larger — a difference invisible in any individual number, but capable of selecting a genuinely different token at that step, especially early in generation where a single flipped token then changes all downstream context and compounds into a materially different full response.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">SENIOR</span>Q35. How specifically does batching — other concurrent requests sharing the same GPU — change the numeric output for a fixed prompt at temperature 0?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Production inference servers batch multiple requests together to maximize GPU utilization, and the specific batch a given request ends up grouped with — which depends on exactly which other requests happen to arrive around the same time — can change low-level details of how the underlying matrix computations are tiled and executed on the hardware. Because of the floating-point non-associativity described above, a request processed alongside a different mix of concurrent requests can produce logits that differ by a tiny numerical margin from the same request processed in isolation or alongside a different batch composition, even though the model weights, prompt, and temperature=0 setting are all identical. This is why two engineers testing "the same" temperature-0 prompt at different times of day, under different traffic conditions, can occasionally observe different outputs — the variable isn't the model or the prompt, it's the ambient batch composition at the moment of the request.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">STAFF</span>Q36. Explain how Mixture-of-Experts routing can introduce non-determinism into a model's output even at temperature 0, and why this is a distinct mechanism from ordinary floating-point rounding.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>In a Mixture-of-Experts (MoE) architecture, each token is routed to a small subset of "expert" sub-networks by a learned router, and in many production MoE serving implementations the routing decision is influenced by batch-level factors — such as expert capacity limits that can cause a token to be dropped or rerouted to a different expert depending on how many other tokens in the same batch are competing for the same expert's limited capacity. This means the exact same input token, at the exact same position, can be routed to a genuinely different expert sub-network depending on what else happens to be in its serving batch at that moment — producing a materially different computation path, not just a tiny rounding difference, which then propagates into different logits and potentially a different argmax token even at temperature 0. This is architecturally distinct from floating-point non-associativity (which perturbs numbers within the same computation graph); MoE batch-dependent routing can select an entirely different computation graph for the same token, which is why some of the most visible "temperature-0 nondeterminism" reports against large hosted MoE models trace back to routing rather than numerical precision.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">JUNIOR</span>Q37. What does it mean for the argmax at a decoding step to be a "near-tie," and why does that specific situation matter for reproducibility?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A near-tie is a decoding step where the top two (or more) candidate logits are extremely close in value — the model is genuinely almost equally confident between two tokens. This is exactly the situation where the tiny numerical differences from floating-point non-associativity or batch-dependent routing are large enough to actually flip which token has the higher logit; a step where one token's logit is far ahead of every other candidate is essentially immune to this kind of drift, because no realistic numerical perturbation is large enough to change the ranking. Near-ties are therefore where almost all observed temperature-0 nondeterminism concentrates — most tokens in a typical response are decoded identically run after run, and the rare divergence happens specifically at these close-call steps.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">JUNIOR</span>Q38. Does setting a fixed seed parameter guarantee identical output if the underlying model version changes between two calls?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>No. A seed controls the pseudo-random elements of the sampling step itself — which specific token gets drawn when there's genuine randomness in the distribution — but it has no influence over the model's weights or the logits the model produces in the first place. If the provider silently updates the model version behind an API endpoint (a documented, common occurrence for many hosted models), the logits themselves change, and an identical seed will simply apply the same random draw mechanics to a different underlying distribution, producing different output. A seed is a reproducibility tool for a fixed model and fixed inputs, never a guarantee across model version changes.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">JUNIOR</span>Q39. What exactly does a seed parameter control in the sampling pipeline, and what does it not control?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A seed initializes the pseudo-random number generator used at the final "sample one token from the distribution" step, so that given the exact same probability distribution, the same seed will draw the same token every time — improving reproducibility for non-zero-temperature generation. It does not control, and cannot fix, the sources of nondeterminism that happen before that step: floating-point non-associativity in the forward pass, batch-composition-dependent numerical differences, or Mixture-of-Experts routing changes. A seed makes the "which random token got picked from this distribution" step reproducible; it does nothing about the distribution itself potentially being computed slightly differently run to run.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">SENIOR</span>Q40. Design a reproducibility engineering approach for a data-extraction endpoint that a compliance team is relying on for consistent behavior. What would you pin, log, and what limits would you communicate?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Pin and version everything that can independently vary: a specific model version string (never a "latest" alias), the exact sampling configuration (temperature=0, top_p, any penalties), a seed if the provider supports one, and the full resolved prompt template. Log all of these fields alongside every request and response in a structured trace, plus the provider's model-version header if one is returned, so any output difference can be traced to a specific one of these dimensions rather than debugged as an undifferentiated "it changed." Communicate to the compliance team explicitly, in writing, that temperature=0 plus a pinned model version and seed produces very low output variance in practice but is not a formally guaranteed bit-for-bit identical output on every hosted-API call, due to the floating-point and (for some models) MoE-routing nondeterminism sources covered earlier — and that if bit-for-bit reproducibility is a hard compliance requirement, self-hosting a fixed model checkpoint with a fixed batch configuration is the only way to actually eliminate those remaining sources, since even a pinned hosted-API model version doesn't control the provider's batching behavior at serving time.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">JUNIOR</span>Q41. Why should sampling parameters be logged as structured, queryable fields rather than embedded in a free-text log line?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Structured fields (a dedicated temperature column, a top_p column, and so on in your trace schema) can be filtered, grouped, and aggregated directly — you can query "show me every request in the last hour where temperature was above 0.5 on the extraction endpoint" in one line. A free-text log line burying "temp=0.9" inside a sentence requires parsing or regex just to answer the same question, and makes it far easier for a dashboard or alert to miss a misconfiguration entirely, since nothing is watching an unstructured string for a specific numeric threshold. This is a small operational detail with outsized payoff during an actual incident, when speed of querying matters most.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">JUNIOR</span>Q42. When debugging a flaky evaluation-harness failure on an LLM-backed test, what is the very first sampling-related question you should ask?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>What temperature (and top-p/top-k) is the test actually running at, and is that intentional? A surprising number of flaky-eval investigations turn out to be a test suite calling the same default-temperature client used in production rather than an explicitly pinned, low-temperature (or temperature-0) configuration meant for deterministic evaluation — in which case the "flakiness" is not a bug at all, it's the expected behavior of stochastic sampling being asserted against with an exact-match check.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">STAFF</span>Q43. Your eval suite asserts exact-match output at temperature=0 with a fixed seed, and it started failing intermittently right after a routine model version bump behind your provider's API — nothing else in your deployment changed. Walk through your root-cause process.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>First, confirm the timeline correlation precisely — pull the exact request/response traces (assuming sampling params and prompt hash were logged, per the earlier reproducibility design) from before and after the version bump, and verify the model-version identifier actually changed in those traces rather than assuming it from the deploy timing alone. Second, recognize that a model version bump is expected to change the model's learned logits — a seed and temperature=0 only make sampling deterministic given a fixed distribution, they say nothing about the distribution itself being stable across a genuinely different set of trained weights, so intermittent (not universal) failures specifically suggest the new version produces near-ties at a subset of previously-unambiguous decoding steps where the old version had a clear winner. Third, decide the actual fix based on that diagnosis: an exact-match eval assertion was always fragile against any legitimate model improvement, and the durable fix is migrating that test to a semantic or rubric-based comparison (as covered in the earlier evaluation-strategy material) rather than trying to force literal byte-for-byte stability across model versions you don't control the timing of. Along the way, this is also the moment to push for pinning a specific model version string in the test environment rather than tracking a "latest" alias, so future version bumps become an explicit, reviewed decision rather than a silent one.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">MID</span>Q44. Give concrete sampling-parameter recommendations, with brief justification, for: (a) SQL generation, (b) support-ticket classification, (c) marketing copywriting, (d) a legal-disclaimer generator.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>(a) SQL generation: temperature 0–0.1, top_p 0.9 or unused — the output must parse as valid, executable SQL, and there is no benefit to lexical variety in a query. (b) Classification: temperature 0, top_p unused or 1.0 — this is a single-correct-answer task where variance is pure noise against the true label. (c) Marketing copywriting: temperature 0.8–1.1, top_p 0.9–0.95, a modest frequency penalty to avoid repeated phrasing across variants — the entire value of the feature is generating varied, engaging phrasing options. (d) Legal-disclaimer generation: temperature 0–0.2, tight top_p — near-exact, predictable wording is a compliance requirement, and any creative deviation is a liability risk rather than a feature.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">JUNIOR</span>Q45. Why is "temperature 0.7" so commonly cited as a good default, and why is applying it universally a mistake?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>0.7 sits in a middle zone that produces text most people perceive as natural-sounding for general conversational assistant use — noticeably less robotic than temperature 0, but not so flattened that it risks incoherence. It became a widely copied tutorial and documentation default largely because it works reasonably well for exactly that one use case: open-ended chat. Applying it universally is a mistake because it was never validated against precision-sensitive tasks like structured extraction or tool-calling, where any injected randomness is pure downside, or against genuinely creative tasks, where 0.7 may actually be too conservative to produce the variety the feature is meant to provide.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. Would you configure any nonzero temperature for a code-completion IDE plugin that shows a single inline suggestion, versus one that offers three alternative completions?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>For a single inline suggestion, near-zero temperature is almost always right — the user sees exactly one completion and expects it to be the most likely-correct one, and a low-probability token injected by higher temperature is far more likely to produce a subtly wrong suggestion than a genuinely useful alternative. For a "show three alternatives" UI, a small amount of temperature (or generating the alternatives from slightly different sampling draws) can be genuinely useful, because the point of showing multiple options is precisely to expose the model's next-most-plausible candidates rather than three near-identical greedy outputs — though many production tools instead achieve meaningful diversity across alternatives more reliably via beam search or diverse decoding strategies than via cranking shared temperature, since a shared moderate temperature doesn't guarantee the three sampled outputs are usefully different from each other.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">SENIOR</span>Q47. How would you configure sampling differently for a RAG pipeline's query-rewriting step versus its final answer-synthesis step?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Query rewriting — turning a user's message into a search query or a set of retrieval queries — benefits from near-zero to low temperature, because the goal is a precise, well-formed query that maximizes retrieval recall against the actual user intent, and injected randomness here doesn't add value, it just adds variance in retrieval quality for no upside. Answer synthesis, which drafts the final natural-language response grounded in retrieved documents, can run at a moderate temperature (0.3–0.6 is a common range, lower than a pure creative-writing task because faithfulness to the retrieved context still matters), since some lexical variety in phrasing is fine as long as the underlying facts drawn from the retrieved passages remain accurate — a distinction worth stating explicitly, because RAG answer synthesis should still run meaningfully lower than free-form creative writing, since faithfulness to retrieved evidence is a correctness constraint even though phrasing isn't.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">MID</span>Q48. Why do function-calling / tool-use endpoints typically recommend near-zero temperature for the entire response, not just the arguments of the tool call itself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>In most function-calling implementations, the decision of whether to call a tool at all, which tool to call, and the arguments to pass are all generated by the same underlying decoding process in a single response — there typically isn't a separate, independently-configurable sampling pass just for the argument tokens. A higher temperature increases the chance of a wrong tool being selected, a malformed argument value, or an unnecessary tool call being triggered when none was warranted, none of which have any upside from added variety — so the recommendation to keep temperature low applies to the whole structured-decision-making response, not narrowly to the JSON payload.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">SENIOR</span>Q49. If a vendor's JSON-mode / structured-output feature constrains the decoding grammar so the model can only ever emit syntactically valid JSON, does temperature still matter in that scenario?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Yes, and this is a commonly missed distinction: grammar-constrained decoding guarantees syntactic validity (the output will always parse as JSON matching the schema), but temperature still governs which valid values get chosen for each field within that guaranteed-valid structure. A schema might require a "category" field to be a string — grammar constraints ensure you get a well-formed string, but temperature still determines whether the model reliably picks the single most probable, correct category or occasionally samples a less likely, wrong one. Structured-output mode solves the "will this parse" failure mode; it does not solve the "is this semantically correct" failure mode, which is still governed by ordinary sampling parameters on the constrained token set.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">STAFF</span>Q50. You're the platform owner for an internal LLM gateway used by dozens of product teams. Design a sampling-parameter governance strategy so a new team doesn't accidentally ship a customer-facing feature at an inappropriately high temperature.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Expose a small set of named, pre-validated sampling profiles ("precise," "balanced," "creative") as the primary interface, rather than raw temperature/top-p fields, so a team picks a profile matched to their task category instead of guessing at numeric values with no context for what's appropriate. Require every gateway request to declare a task category (extraction, classification, conversational, creative) at onboarding, and enforce server-side bounds per category — refusing or flagging, for example, a request tagged "structured-extraction" that also specifies temperature above some low ceiling, catching the exact copy-pasted-default bug class before it reaches production. Build this into the platform's review/launch checklist alongside other production-readiness gates, log the resolved profile and raw parameters on every call for observability, and periodically audit live traffic for teams whose configured profile doesn't match their actual measured output-variance behavior, since a mismatch there is a strong signal of either a misconfigured profile or a task that was miscategorized at onboarding.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">MID</span>Q51. How would you A/B test two candidate sampling configurations — say top_p 0.9 versus top_p 0.95 — for a summarization feature?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Hold every other variable fixed (prompt, model version, temperature) and route a statistically meaningful, randomly assigned split of real or representative traffic to each configuration, generating multiple outputs per input in each arm rather than just one, since a single sample per arm can't distinguish "this configuration is genuinely different" from "this is just sampling noise." Track both quality metrics (human preference ratings or an automated rubric score against a held-out reference) and stability metrics (output length distribution, repetition-loop rate, factual-consistency-against-source rate for a summarization task specifically), because a sampling change can improve perceived quality on one axis while quietly degrading faithfulness on another, and only comparing a single top-line metric would miss that.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">SENIOR</span>Q52. Why is a single thumbs-up/thumbs-down preference metric insufficient for evaluating a sampling-configuration A/B test, and what would you add?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A raw preference metric conflates several distinct effects that a sampling change can produce in opposite directions simultaneously — higher temperature might make individual outputs feel more engaging (raising thumbs-up rate) while also increasing the rate of subtle factual drift or occasional incoherent responses that a casual thumbs-up rater doesn't catch but a downstream automated fact-check or a careful reviewer would. A more complete evaluation adds: variance across repeated samples of the same input (is the configuration meaningfully less predictable, and is that predictability loss acceptable for this task), a task-specific correctness or faithfulness check where applicable, and a parse/format-validity rate for anything with structured output requirements — giving you a profile of tradeoffs rather than one collapsed number that can hide a regression behind an improvement.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">SENIOR</span>Q53. Statistically, why does detecting a sampling-configuration-driven change in output variance require multiple samples per input, not just a larger number of distinct inputs?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Variance is a property of the distribution of outputs for a given input, not a property you can estimate from a single draw — one sample per input tells you nothing about how much that particular input's output would have varied on a repeat call, only many distinct inputs generated once each. To actually measure whether configuration B produces higher output variance than configuration A, you need repeated generations of the same fixed input under each configuration, compute a variance or diversity metric within each input's repeated set, then compare those per-input variance estimates across configurations — collecting more distinct inputs (each sampled once) increases confidence about average output quality across the input space, but it is orthogonal to, and cannot substitute for, measuring per-input output variance.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">MID</span>Q54. What's the practical risk of running a sampling-parameter A/B test with too few generations per arm?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>With too few samples, ordinary sampling noise — the expected run-to-run variation any stochastic decoding strategy produces — can easily be large enough to produce an apparent difference between the two arms that has nothing to do with the actual configuration change, leading to a false-positive "this configuration is better" conclusion, or masking a real difference that a small sample happened not to surface. The fix is standard statistical practice applied to this specific context: compute a required sample size ahead of time based on the effect size you actually care about detecting, rather than running until a result "looks" different and stopping.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">STAFF</span>Q55. An A/B test shows a higher-temperature marketing-copy generator variant scores better on human preference but worse on an automated brand-guideline-compliance check. How do you reconcile this and decide what to ship?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Treat this as a genuine tradeoff to resolve deliberately, not a metric conflict to average away — investigate first whether the compliance-check regression is concentrated in specific violation types (tone drift versus outright factual claims about the product versus banned terminology), since some violation types carry far more business risk than others and the right response differs accordingly. If the regressions are low-severity, stylistic ones, a moderate temperature reduction from the tested "winning" value, re-tested, may recover most of the preference gain while pulling compliance back into an acceptable range — worth testing as a third arm rather than assuming it's strictly one-or-the-other. If the regressions include higher-severity issues (unsubstantiated claims, banned terms), ship the lower-temperature, compliant variant regardless of the preference gap, and treat the preference signal as informing prompt or format improvements pursued separately — a business decision to violate brand or legal compliance guidelines for a preference-score improvement is not a call a sampling-configuration choice should be making silently.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">MID</span>Q56. Mechanistically, how does raising temperature affect hallucination rate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Raising temperature flattens the probability distribution, which makes lower-probability tokens meaningfully more reachable at each sampling step than they would be at low temperature. Since a model's highest-probability token at a given step is, on average, more likely to be a well-grounded, learned association than a low-probability alternative, increasing how often lower-probability tokens get selected mechanically increases the rate at which the model wanders into less-supported, more speculative continuations — some of which manifest as fabricated facts, invented details, or unsupported claims. This is a probabilistic tendency, not a guarantee in either direction at the level of any single token.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. Is temperature 0 sufficient to eliminate hallucination? Justify your answer precisely.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>No. Temperature 0 only guarantees that the single highest-probability token is chosen at every step — it says nothing about whether that highest-probability token is actually correct. A model's learned distribution can assign the highest probability to a fluent, confident, but factually wrong continuation, especially on questions outside its training data's coverage or on long-tail facts it never reliably learned; greedy decoding will deterministically select that wrong answer every single time, with total consistency, which is arguably worse for detectability than a stochastic configuration that at least sometimes surfaces the correct alternative on a repeat attempt. Hallucination is fundamentally a property of what the model's distribution assigns probability to, not of how a token is chosen from that distribution — sampling strategy and hallucination are related but distinct concerns, covered further in the next chapter.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">MID</span>Q58. Can lowering temperature ever make a specific hallucination worse rather than better?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes, in the specific case where the model's single most-confident token at a step is itself the wrong or fabricated one. Lowering temperature increases the probability that exact token gets selected, effectively making that particular hallucination more consistent and more likely to reproduce on every attempt, whereas a higher temperature at least gives a correct-but-lower-probability alternative some nonzero chance of being sampled instead. This is not an argument for using high temperature to fight hallucination in general — it's a narrow, important caveat that "lower temperature = fewer hallucinations" is not a universal law, only a probabilistic tendency that depends on where the correct answer sits in the model's confidence ranking for that specific query.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. How does top-p truncation interact with hallucination risk specifically on a very flat, low-confidence distribution — a step where the model genuinely doesn't know the answer?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>On a genuinely uncertain step, the model's probability mass spreads thinly across many candidate tokens rather than concentrating on one — exactly the scenario where the top-p nucleus widens to include a large number of tokens, per the adaptive mechanism covered earlier. This means top-p offers essentially no protection against hallucination on precisely the steps where hallucination risk is highest: a wide-open nucleus on an uncertain step still leaves dozens of plausible-sounding continuations available to sample, several of which may be fabricated. This is a genuine limitation worth naming honestly — no sampling-parameter tuning alone reliably fixes hallucination on truly out-of-distribution or under-specified queries; that requires retrieval grounding, explicit uncertainty signaling in the prompt, or refusal training, which is why sampling and hallucination mitigation are treated as related but separate topics.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">MID</span>Q60. What is self-consistency (as in "self-consistency improves chain-of-thought reasoning"), and how does it use sampling?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Self-consistency generates multiple independent completions for the same prompt at a nonzero temperature (rather than a single greedy or low-temperature completion), then aggregates across them — commonly by taking the majority answer when the task has a discrete, checkable final answer, like a numeric result or a multiple-choice selection. The technique deliberately relies on the diversity that temperature provides: multiple independent reasoning paths sampled from the model's distribution will sometimes make different errors, but if the model's distribution genuinely favors the correct answer, that correct answer will tend to appear across a plurality of the independently-sampled attempts even when any single greedy attempt might have gone down a flawed reasoning path.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. Design a self-consistency / majority-voting setup for a numeric answer-extraction task, including sampling configuration and aggregation logic.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Configure a moderate, nonzero temperature (commonly in the 0.5–0.8 range — enough to produce genuinely different reasoning paths across samples, not so high that individual attempts become unreliable) and generate N independent completions of the full reasoning-plus-answer prompt for the same input, using top-p in its normal range rather than a very tight one, since you specifically want diverse candidate reasoning paths here. Parse the final numeric answer out of each of the N completions, then aggregate by exact-match majority vote across the extracted numbers (not across the full text, since two correct reasoning paths can differ in phrasing while agreeing on the final number); if no clear majority forms, fall back to either the single highest-confidence completion (by aggregate logprob, if available) or flag the input for human review rather than guessing among a near-tie, since a near-tie in a majority vote is itself a signal that the task was genuinely ambiguous or hard for this input.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. Why does self-consistency require temperature greater than 0 to provide any benefit, and what happens if you run it at temperature 0?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>At temperature 0, every one of the N "independent" generations for the same input is identical — greedy decoding is deterministic, so generating the same prompt ten times at temperature 0 produces the same completion ten times over (modulo the rare argmax-near-tie nondeterminism covered earlier). Majority voting across ten identical answers provides no additional signal beyond a single generation; the entire value proposition of self-consistency depends on genuine diversity across the N samples so that different reasoning paths can independently arrive at (or fail to arrive at) the correct answer, and that diversity requires actual randomness in the sampling process, which is exactly what nonzero temperature provides.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">STAFF</span>Q63. Self-consistency with N=10 samples costs roughly ten times the tokens of a single generation. How would you decide N, and what would you consider before reaching for self-consistency at all?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Choose N empirically against a held-out evaluation set by plotting accuracy (or your task's success metric) as a function of N and looking for the point of diminishing returns — in practice, most of the accuracy gain from self-consistency is captured within a fairly small N (often somewhere around 5–10 for many tasks), with further increases yielding progressively smaller improvements for proportionally identical cost. Before reaching for self-consistency at all, weigh cheaper alternatives against the same failure mode: a single well-tuned low-temperature generation may already be accurate enough for the task's tolerance; a single higher-quality (larger or more capable) model at greedy decoding may close the accuracy gap more cost-effectively than 10x-ing calls to a smaller model; and a structured verification or self-check step on a single generation can sometimes catch the same class of errors self-consistency is designed to average out, at a fraction of the token cost. Self-consistency is the right tool specifically when the task has a cheaply checkable final answer and the accuracy gain is worth a known, linear cost multiplier — not a default reach for "the model sometimes gets this wrong."</p>
+</div>
+
+<div class="question" id="q64"><span class="level">MID</span>Q64. Briefly, what is speculative decoding, restated in terms of a draft model and a target model?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A small, fast "draft" model proposes a short sequence of several candidate next tokens cheaply; the larger, slower "target" model — the one whose quality you actually want — then verifies all of those proposed tokens in a single forward pass instead of one token at a time. Tokens the target model agrees with are accepted immediately at no extra sequential cost; the first token it disagrees with is corrected, and the target model's own choice is used from that point forward. This exploits the fact that generating tokens one at a time is comparatively slow (memory-bandwidth-bound), while verifying several proposed tokens in parallel is nearly as cheap as verifying one, giving a latency win without changing which model's ultimate output you get.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. Explain precisely how speculative decoding preserves the target model's exact sampling distribution, rather than merely approximating it.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Speculative decoding uses a modified rejection-sampling scheme, not a simple accept/reject on the draft token's identity alone. At each proposed position, the target model's true probability for the draft-proposed token is compared against the draft model's probability for that same token: if the target's probability is at least as high as the draft's, the token is accepted outright; if the target's probability is lower, the token is accepted only with probability equal to the ratio of target-to-draft probability, and if rejected, a new token is instead sampled from a specifically constructed residual distribution — the positive part of (target distribution minus draft distribution), renormalized — rather than simply falling back to the draft model's choice or the target's greedy choice. This precise construction is what mathematically guarantees the overall output token, whichever path it came from, has exactly the same probability of being produced as if it had been sampled directly and only from the target model's own distribution — speculative decoding is a pure latency optimization with a formal correctness proof, not an approximation.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">SENIOR</span>Q66. Does speculative decoding behave differently at temperature 0 (greedy) versus temperature greater than 0, in terms of correctness?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>At temperature 0, the verification simplifies: a draft token is accepted if and only if it matches the target model's own argmax token at that position (since greedy decoding has no distribution to draw from — there's only one "correct" choice), and any mismatch triggers falling back to the target model's greedy choice. This is a simpler special case of the general rejection-sampling scheme, but it's still exactly correctness-preserving — the sequence of tokens produced is identical to what greedy decoding on the target model alone would have produced. At temperature greater than 0, the full modified-rejection-sampling mechanism described above is required to preserve the target's stochastic distribution exactly; a naive "just use the draft token if it's plausible enough" heuristic would not have this guarantee and would subtly bias the output distribution away from the target model's true distribution.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. A teammate claims "speculative decoding makes output less random, because the draft model biases proposals toward its own most likely tokens." Is this correct?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>No, and this is a common but precise misunderstanding worth correcting directly. It's true that the draft model proposes tokens it considers likely, but the rejection-sampling verification step is specifically designed to correct for exactly this bias — a token the draft model over-favors relative to the target model's true probability is accepted only with reduced probability (proportional to the target/draft probability ratio), and rejected tokens are replaced by sampling from a residual distribution constructed precisely to cancel out the draft model's over-representation. The mathematical guarantee proven for correctly-implemented speculative decoding is that the final output distribution is provably identical to sampling directly from the target model alone — the draft model's biases affect which computation path is taken to get there (and therefore latency), never the statistical properties of the final output.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">MID</span>Q68. If speculative decoding is implemented incorrectly — for instance, accepting draft tokens without the proper rejection-sampling correction — what would you observe in production output quality?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Output would systematically drift toward whatever the smaller, weaker draft model tends to favor, rather than faithfully reflecting the larger target model's actual learned distribution — since the whole point of the target model is that it's more capable, this shows up as a subtle but real quality regression: slightly more generic word choices, a higher rate of the kind of errors the smaller draft model would make on its own, or degraded performance specifically on harder inputs where the draft and target models are more likely to disagree. This is a genuinely dangerous class of bug precisely because it doesn't look like an obvious crash or malformed output — it looks like "the model got slightly worse," which is easy to misattribute to a model version change or data drift rather than an infrastructure optimization implemented without its correctness guarantee intact.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. Production bug: a data-extraction API endpoint was scaffolded by copying a "creative chatbot" code path and inherited temperature=0.9. What symptoms would you expect to see in logs and metrics, and how would you confirm the root cause?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Expect an elevated structured-output parse-failure rate (occasional malformed JSON or values that don't match the expected schema), inconsistent field values across repeated calls with identical input (a strong tell, since a genuinely deterministic extraction task shouldn't vary run to run), and possibly a subtly higher rate of subjectively "wrong" extracted values that pass parsing but are factually inconsistent with the source document — all of which might initially get triaged as a prompt-quality or model-capability issue rather than a config bug. Confirm the root cause fast and cheaply: pull the resolved sampling parameters from the request trace (assuming they were logged per production best practice) and check the temperature value directly; if logging wasn't in place, the fallback diagnostic is calling the endpoint with the identical input several times and observing whether the output varies at all — meaningful output variance on a task that should be near-deterministic is close to conclusive evidence of a sampling misconfiguration before you've read a single line of code.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">JUNIOR</span>Q70. What is the fastest, cheapest diagnostic step to confirm a suspected sampling misconfiguration during an incident, before diving into code?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Call the same endpoint with the exact same input several times in a row and compare the outputs. If the task is supposed to be near-deterministic (extraction, classification, tool-calling) and you observe meaningfully different outputs across repeated calls, that's strong, immediate evidence pointing at a sampling configuration issue — specifically a temperature or top-p set higher than intended — well before you need to read any application code, and it costs only a handful of extra API calls to check.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. How would you prevent the "copy-pasted temperature default" bug class from recurring across a codebase, beyond telling engineers to be careful?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Replace ad hoc numeric parameters at call sites with the named-profile pattern described earlier ("precise"/"balanced"/"creative" as centrally-defined, reviewed configuration beans), so there is no raw temperature value to copy-paste incorrectly in the first place — a new call site picks a profile matching its task category rather than inventing or inheriting numbers. Pair this with an automated lint or CI check that flags any call site setting sampling parameters directly rather than through the shared profile abstraction, and add the sampling-variance smoke test described elsewhere (calling a precision-sensitive endpoint multiple times and asserting low output variance) to the standard pre-merge or pre-deploy test suite for any new LLM-backed endpoint, so a misconfiguration is caught automatically rather than relying on a human reviewer noticing an out-of-place number in a diff.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">STAFF</span>Q72. You inherit a legacy service where sampling parameters are hardcoded as magic numbers scattered across 40 call sites with no logging. Design a prioritized remediation plan.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>First, add observability before changing any behavior: instrument every call site to log its resolved sampling parameters alongside prompt and output, even before refactoring anything, so you have real data on what's currently configured and can start correlating any future incidents to specific values — this is low-risk and immediately valuable on its own. Second, audit the 40 call sites against their actual task type (using that new logging plus a manual pass) to find any clear mismatches — creative-default temperatures on precision-sensitive paths, or unnecessarily rigid temperature-0 on genuinely creative features — and fix the highest-risk mismatches first, specifically anything touching structured output, financial figures, or compliance-relevant text, prioritized by business impact rather than doing all 40 uniformly. Third, consolidate the surviving, now-correct values into the shared named-profile abstraction so future call sites can't reintroduce the same scattered-magic-number problem, and retire direct parameter-setting at individual call sites going forward. Do these in this order — observe, fix the worst offenders, then consolidate — rather than attempting a single big-bang refactor of all 40 sites at once, since that approach both delays getting any real production risk visibility and creates a much larger, harder-to-review change.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">JUNIOR</span>Q73. A support-ticket classification endpoint intermittently returns an invalid category label not in the allowed set. Why does this often turn out to be a sampling issue rather than a prompt issue, and what evidence would distinguish the two?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A well-written prompt that correctly lists the allowed categories will, at temperature 0, deterministically select the model's single highest-probability valid label every time — a prompt defect (an ambiguous instruction, a missing category in the list) tends to produce a consistent, repeatable wrong answer, not an intermittent one. Intermittent invalid labels — different, inconsistent failures across repeated identical calls — point instead at nonzero temperature occasionally sampling a lower-probability token outside the intended set. The distinguishing evidence is straightforward: call the endpoint with the same failing input repeatedly; if the invalid output appears inconsistently across those repeated calls, sampling variance is the more likely cause, and checking the configured temperature is the next step before touching the prompt at all.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">SENIOR</span>Q74. How would you write an automated regression test that specifically catches "temperature was accidentally left non-zero on a deterministic endpoint" before it reaches production?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Add a CI-integrated test that calls the endpoint with a small, fixed set of representative inputs multiple times each (say, 5–10 repeats per input), and asserts that the outputs are identical (for a truly deterministic-intent endpoint) or fall within an expected low-variance bound (for a near-deterministic one), failing the build if variance exceeds that threshold. This directly tests the observable symptom of a sampling misconfiguration rather than trying to assert on the configuration value itself (which could be correctly checked separately as a simpler config-value assertion, but doesn't catch cases where the config is technically set correctly yet something else in the call chain overrides it) — testing the actual behavior is a stronger, more end-to-end guarantee that catches the bug class regardless of exactly how it was introduced.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">JUNIOR</span>Q75. What's a common request-level mistake that causes a sampling parameter to silently have no effect at all?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Setting the parameter under the wrong field name for the specific provider being called — different vendors use different casing and naming conventions (top_p versus topP, frequency_penalty versus frequencyPenalty), and an unrecognized field is often silently ignored by the API rather than raising an error, so the request just falls back to the provider's own default. A second common variant is setting an option at the wrong layer of a builder-pattern client — configuring it on a builder object that never actually gets attached to the outgoing request, or setting it at an application-wide default level that a per-call options object then unintentionally overrides. Both mistakes look identical in symptom (the parameter you set appears to have no effect) but require checking different places to find.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">MID</span>Q76. In Spring AI, if a per-call ChatOptions object explicitly sets temperature but leaves topP unset, and the ChatClient.Builder's default options have topP=0.7, what value actually gets used — and why is this worth verifying per provider?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>As noted in the Java/Spring Perspective section of this chapter, the merge behavior between builder-level defaults and per-call options is provider-specific — some integrations override entirely (the per-call options object replaces the defaults wholesale, meaning the unset topP field falls back to the model provider's own server-side default, not your configured 0.7), while others merge field-by-field (falling back to your builder-level 0.7 specifically for the unset field). This is exactly the kind of detail that looks like a minor implementation nuance but produces a real production bug if assumed incorrectly — always verify the specific Spring AI provider integration's documented merge semantics rather than assuming either behavior, and cover it with a test that asserts the actually-resolved value sent to the model, not just the value you configured.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">MID</span>Q77. Why should sampling-parameter defaults live in versioned application configuration rather than being set individually at each call site?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Versioned, centralized configuration means a single, reviewed, auditable change updates behavior everywhere it's meant to apply, with a clear git history of exactly when and why a value changed — directly supporting the reproducibility and incident-attribution goals covered throughout this chapter. Parameters scattered across individual call sites are effectively un-versioned in practice (a change to one site is easy to make without review, and there's no single place to look to answer "what is our current sampling configuration"), and they invite exactly the kind of copy-paste-the-wrong-default bug discussed earlier, since there's no shared source of truth a new call site is naturally pointed toward.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">STAFF</span>Q78. Design a sampling-parameter strategy across a multi-feature product — a chat assistant, a code generator, a structured-extraction API, and a creative-writing tool — sharing one underlying model provider. Cover configuration ownership, defaults, guardrails, and observability.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p><strong>Ownership:</strong> a shared platform/infra team owns the named-profile abstraction itself (the "precise"/"balanced"/"creative" definitions and their underlying parameter values) as reviewed, versioned configuration; individual feature teams own only the choice of which profile their feature uses, not the raw numbers, keeping the tuning expertise centralized while letting feature teams move fast on their own domain logic. <strong>Defaults:</strong> the code generator and structured-extraction API default to "precise" (temperature ≈0–0.2), the chat assistant defaults to "balanced" (temperature ≈0.6–0.8), and the creative-writing tool defaults to "creative" (temperature ≈0.9–1.2) — with any deviation from a feature's category-appropriate default requiring explicit sign-off, since deviation is where most incidents originate. <strong>Guardrails:</strong> server-side bounds enforced at the gateway layer per profile, so a code path can never accidentally request "creative"-range temperature while tagged as the extraction category, and public or semi-public APIs that accept caller-supplied parameters clamp them to safe ranges rather than passing them through unchecked. <strong>Observability:</strong> every request logs its resolved profile, raw parameters, model version, and prompt hash in a structured trace; dashboards track per-feature output-variance trends and structured-output parse-failure rates as leading indicators, with alerting on any feature's live variance diverging meaningfully from its profile's expected baseline — catching both accidental misconfiguration and a model-version change that silently altered behavior at a given, unchanged configuration.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">SENIOR</span>Q79. What server-side bounds would you enforce on a public-facing API that allows callers to pass their own temperature and top-p values, and why?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Clamp temperature to a bounded range (commonly something like 0–1.5 rather than an unbounded raw pass-through) and similarly bound top-p to a sane range like 0.1–1.0, rejecting or silently clamping out-of-range values rather than forwarding them unchecked to the model provider. This protects against a caller (malicious or simply careless) using extreme values to probe the model's behavior boundary at very high temperature — a documented, if second-order, security consideration covered in this chapter's own security section — and also protects your own cost and latency SLAs, since extreme configurations can produce excessively long, degenerate, or retry-inducing outputs that a metered public API is directly exposed to the cost of. Bounding is standard input-validation discipline applied specifically to sampling parameters: treat caller-supplied configuration as untrusted input, not as safe pass-through data.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">JUNIOR</span>Q80. Why is it good practice to expose a small, named set of sampling profiles to internal callers rather than raw numeric temperature and top-p fields?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A named profile like "precise" or "creative" carries meaning a raw number doesn't — an engineer choosing between profiles is making a task-appropriate decision informed by what each profile is documented to be tuned for, while an engineer setting temperature=0.6 directly is essentially guessing at an appropriate value with no guardrail against picking something wrong for their use case. Profiles also centralize tuning: improving the "precise" profile's exact parameters based on new evaluation data updates every caller using that profile in one change, whereas raw numeric values scattered across call sites would each need to be found and updated individually.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">JUNIOR</span>Q81. If you have no evaluation data yet and need to pick a starting sampling configuration for a general-purpose assistant feature, what would you choose and why?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Temperature around 0.6–0.8 with top-p around 0.9 is a reasonable, well-precedented starting point for open-ended conversational use — it's the range most production chat assistants converge on, balancing natural-sounding variety against a low enough risk of incoherence. Treat it explicitly as a starting hypothesis to validate, not a final answer: as soon as you have real usage data or an evaluation set, measure actual output quality and variance at this default and be willing to move it in either direction based on evidence, rather than treating "the common default" as sufficient justification on its own.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">SENIOR</span>Q82. Beyond "it feels right in manual testing," how would you actually measure whether a chosen sampling configuration for a given feature is well-tuned?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Build a held-out evaluation set representative of real usage for the feature, and measure the actual metrics that matter for that task at the candidate configuration — for a precision task, parse/format-validity rate and correctness against a labeled reference; for a creative task, a rubric-based or preference-based quality score across multiple samples per input, plus a check that output diversity across repeated generations is genuinely high rather than superficially varied phrasing around the same content. Then deliberately test at least one configuration on either side of your candidate (a lower and a higher temperature, for instance) to confirm you're not just locally comfortable with a value but actually near a real optimum for the metrics you care about — manual spot-checking is a fine sanity check to catch obviously broken configurations, but it has no statistical power to detect the kind of subtle quality or variance shifts that only show up in aggregate across many generations.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">JUNIOR</span>Q83. Why is manual, ad-hoc testing in a chat playground a poor substitute for a proper sampling-configuration evaluation, even though it's the fastest way to get a feel for a parameter?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A handful of manual tries at a given temperature samples a tiny, cherry-picked slice of the actual output distribution, and human intuition is notoriously bad at distinguishing "this configuration is genuinely better" from "I happened to get a good draw this time" without deliberately running many repeated trials and comparing them systematically. Manual testing is genuinely useful for an early sanity check — catching an obviously broken or degenerate configuration quickly — but it has no statistical grounding, and shipping a production configuration decision based only on a few playground trials is exactly the kind of gap a proper evaluation set and A/B test are designed to close.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">SENIOR</span>Q84. How does the entropy of the output distribution relate to temperature, and how could per-step entropy be used as a production signal?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Entropy measures how spread out a probability distribution is — a distribution concentrated almost entirely on one token has low entropy, while a distribution spread evenly across many tokens has high entropy, and raising temperature mechanically increases entropy by flattening the distribution (the two are directly, monotonically related for a fixed underlying logit vector). Because entropy is computable per decoding step directly from the model's own output distribution — independent of which token actually gets sampled — logging per-step entropy gives a real-time confidence signal: a response with unusually high average entropy for a task that's normally low-entropy (a classification or extraction task, say) is a strong, cheap indicator either that the specific input was genuinely ambiguous for the model, or that temperature has drifted higher than intended, both worth flagging for review without needing to inspect the generated text itself.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">MID</span>Q85. How do per-token logprobs relate to the sampling parameters used to generate them — can you recover the model's "raw" confidence from logprobs if temperature wasn't 1.0?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Not directly, unless you know exactly what stage of the pipeline the returned logprob was computed at. If a provider's logprob reflects the probability after temperature scaling (and after any top-k/top-p truncation and renormalization), the number you see is the post-transformation probability actually used for sampling, not the model's original, untouched confidence at temperature 1 — a token reported with logprob corresponding to 90% probability at temperature 0.3 might have had a meaningfully lower raw probability before that sharpening was applied. To recover a temperature-independent confidence measure, you'd need the raw logits (or logprobs explicitly computed at T=1 before any scaling), which not every API exposes.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">SENIOR</span>Q86. If an API returns logprobs computed after temperature scaling, how could that mislead you if you used those logprobs as a raw model-confidence signal?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Because low temperature mechanically sharpens the distribution, a token generated at temperature 0.2 will systematically show a higher post-scaling logprob than the exact same underlying model confidence would show at temperature 1 — comparing logprobs captured under different temperature configurations (say, across two features with different sampling profiles, or across a model version change that also changed default temperature) can create the illusion that the model became "more confident" when in fact only the temperature setting changed. Any pipeline that uses logprobs as a signal — for low-confidence-generation flagging, for instance — needs to either hold temperature constant across everything being compared, or explicitly work with pre-temperature-scaling logprobs, to avoid this confound.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">STAFF</span>Q87. Your evaluation dashboard shows a sudden, unexplained increase in output variance for a "should be near-deterministic" endpoint, but deployment history shows no prompt change, no model version change, and no sampling config change. Walk through your investigation.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Start by distrusting "no change" as fully established rather than accepting it at face value — re-verify directly against the actual resolved request traces (not just the deployment/config-change log, which can miss a change made outside the normal deploy pipeline, a provider-side silent model update behind a "latest" alias, or a dependency version bump that altered default parameter merge behavior) that temperature, top-p, model version string, and prompt are genuinely byte-identical to the pre-regression baseline. If everything genuinely is identical, consider the provider-side, non-application sources of variance covered earlier in this chapter: a silent model weight update behind an unpinned alias (check for a model-version response header, if the provider exposes one), a change in the provider's serving-side batching or hardware configuration affecting floating-point non-associativity patterns, or — for MoE-architecture models — a routing behavior change from a shift in typical concurrent traffic composition on the provider's infrastructure, none of which would appear in your own deployment history at all since they originate entirely outside your system boundary. Correlate the timing of the variance increase against the provider's own status page or changelog if one exists, and if the provider cannot confirm or rule this out, the practical fallback is treating it as an open incident with the provider while implementing your own mitigation — tightening top-p or lowering temperature further as a stopgap, or pinning to a more specific model version if an alias was in use — rather than continuing to search your own codebase for a change that the evidence increasingly suggests didn't happen there.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">MID</span>Q88. What role does the inference server or runtime (a self-hosted stack like vLLM versus a vendor-hosted API) play in whether identical sampling parameters produce identical behavior?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The sampling parameters themselves (temperature, top-p, penalties) are defined mathematically and behave identically in principle regardless of serving stack, but the surrounding implementation details that affect real-world reproducibility — batching strategy, kernel implementations, numerical precision (FP16 versus BF16 versus FP32), and whether MoE routing is batch-size-dependent — vary by runtime and can differ meaningfully between a self-hosted vLLM deployment and a vendor's hosted API, even when both claim to run "the same" model weights. This means identical sampling parameters are a necessary but not sufficient condition for identical behavior across two different serving stacks; genuinely comparing two runtimes requires controlling for these lower-level serving details too, not just the sampling configuration.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">SENIOR</span>Q89. Why might switching inference providers — identical model weights, identical temperature and top-p settings, different serving stack — change observed output diversity?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Different serving stacks make different engineering choices below the level of the sampling parameters you control — batching strategy and typical batch composition, numerical precision used for the forward pass, and the specific pseudo-random number generator and its seeding behavior for the sampling step itself — any of which can shift the practical rate of argmax near-tie flips, the exact shape of computed probability distributions at the bit level, or how a seed parameter (if used) actually resolves to a token draw. The mathematical definitions of temperature and top-p are provider-agnostic, but their exact numerical realization is not, which is a genuine reason a migration between providers — even nominally "the same model" — deserves its own re-validation pass against your evaluation set rather than assuming settings transfer with identical real-world behavior.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">JUNIOR</span>Q90. If you could tune only one sampling parameter to fix "the assistant sounds too random," which would you reach for first, and why?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Temperature, because it has the single largest, most direct, and most predictable effect on how sharply the output distribution concentrates on the model's most likely tokens, and lowering it is the most reliable single lever for reducing perceived randomness across an entire response. Top-p and top-k are worth tuning too, but their effect is more about excluding implausible outlier tokens than about controlling the overall degree of randomness among the plausible ones — temperature is the parameter most directly answering "how random should this feel," and it's the first knob worth checking before reaching for anything else.</p>
+</div>
+
+
+</div>
 
 <hr>
 

@@ -552,6 +552,522 @@ Multi-head attention itself has limited direct security surface — it is a math
 <p>Head count and head dimension are fixed architectural properties baked into a specific trained model checkpoint — they are not runtime, per-request configuration knobs exposed by any inference API, because the model's learned weights (W_Q, W_K, W_V, W_O for every head, at every layer) are specific to that architecture and would produce meaningless output if heads were arbitrarily dropped at inference time without retraining or a purpose-built pruning process. The levers actually available at the application layer are: reducing input sequence length (trimming history/context, since attention cost scales quadratically with it), choosing a smaller or GQA/MQA-based model variant suited to the task's difficulty, and batching requests efficiently at the infrastructure layer. The correct engineering response redirects the optimization effort toward those real levers rather than a non-existent API knob.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. Concretely, what is a "head" — is it a copy of the model, a copy of the layer, or something smaller?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A head is neither a copy of the whole model nor a copy of the whole layer — it is one independent instance of the scaled dot-product attention computation, with its own small Query, Key, and Value projection matrices (W_Q^h, W_K^h, W_V^h), operating on a d_k-dimensional slice rather than the full d_model. Everything outside those three projection matrices and the attention computation itself — the feed-forward sublayer, the residual connections, the layer norm, the final output projection W_O — is shared across the whole layer, not duplicated per head.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. Why must num_heads evenly divide d_model in the standard implementation?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Because d_k is computed as d_model / num_heads, and every downstream step — the per-head projection matrices, the concatenation back to d_model, and the shape of W_O — assumes d_k is a clean integer and that num_heads copies of d_k sum exactly back to d_model. If d_model were, say, 512 and num_heads were 7, d_k would be a non-integer (73.14...), which has no sensible matrix shape. Real implementations enforce this with an assertion at model-construction time rather than trying to handle uneven head sizes.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">JUNIOR</span>Q11. What is d_v, and how does it typically relate to d_k?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>d_v is the dimensionality of the Value vectors each head produces — the width of the vectors that get weighted-averaged by the attention distribution. d_k is the dimensionality used for the Query/Key similarity computation. By convention, and in the overwhelming majority of real architectures, d_k = d_v = d_model / num_heads, but nothing in the mathematics forces this; a head's Value space could in principle be a different width than its Query/Key space, since the softmax weights (computed from Q and K) and the vectors being averaged (V) are conceptually separate roles.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. What is the shape of a single head's output, before concatenation, for a batch of sequences?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>For a batch of size B, sequence length L, and head dimension d_k, a single head's output is a tensor of shape (B, L, d_k) — one d_k-dimensional vector per token, per sequence in the batch. This is smaller than the model's working width (d_model) precisely because each head only operates on its own slice; the full d_model width is only restored after all heads' outputs are concatenated together.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. Do different heads see different tokens, or the same tokens?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Every head sees exactly the same input tokens — the full sequence, with the same masking rules (causal mask, padding mask) applied identically across heads. What differs between heads is never the input data; it is only the learned projection matrices (W_Q^h, W_K^h, W_V^h) applied to that shared input. This is a common point of confusion — multi-head attention is not a way of splitting the sequence across heads, it is a way of splitting the representation dimension across heads.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">JUNIOR</span>Q14. If d_model = 256 and num_heads = 4, what is d_k?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>d_k = d_model / num_heads = 256 / 4 = 64. This is the same d_k as the 512/8 example used elsewhere in this chapter — it is a coincidence that both configurations land on 64, but it illustrates a real pattern: many production model families deliberately hold d_k close to 64 (sometimes up to 128) and grow d_model by adding proportionally more heads, rather than letting individual heads get arbitrarily wide or narrow as the model scales.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">JUNIOR</span>Q15. What's the practical difference between "num_heads" and "d_model" as two separate hyperparameters someone configuring a model would set?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>d_model sets the overall width of every token's representation as it flows through the network — it is the input/output width of every sublayer, including the multi-head attention block as a whole. num_heads does not change that overall width at all; it only decides how d_model gets subdivided internally for the attention computation (into num_heads slices of size d_k = d_model / num_heads). Two models can share the same d_model but use a different num_heads, and their total attention-block input/output shapes will be identical — only the internal granularity of the per-head computation differs.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">JUNIOR</span>Q16. True or false: each head computes its own independent softmax. Explain.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>True. Each head produces its own (seq_len × seq_len) similarity matrix from its own Q_h and K_h, and applies softmax to that matrix independently — there is no shared or merged softmax across heads at this stage. Heads' outputs are only combined later, after each head has already fully finished its own independent attention computation (similarity, scaling, softmax, weighted sum over its own V_h).</p>
+</div>
+
+<div class="question" id="q17"><span class="level">JUNIOR</span>Q17. After concatenating all heads' outputs, is the resulting vector's dimensionality always exactly d_model?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes, as long as the standard convention (d_k = d_v = d_model / num_heads) is followed: num_heads × d_v = num_heads × (d_model / num_heads) = d_model exactly. This is precisely what allows the multi-head attention block to have the same input and output width, so it can be dropped into a Transformer layer alongside residual connections and layer normalization without any extra reshaping logic beyond the concatenation itself.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">JUNIOR</span>Q18. Does the size of W_O depend on the model's d_model, and is it the same for every layer in a given model?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>W_O has shape (d_model × d_model) — its size scales directly with the model's chosen width, so a larger model automatically has a larger W_O, but every layer within one model uses a W_O of that same fixed shape (though each layer learns its own distinct values). It does not depend directly on num_heads at all, only indirectly through d_model, since num_heads × d_v is defined to equal d_model.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">JUNIOR</span>Q19. Why not just set d_k = 1 and use hundreds of heads to maximize "diversity"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A head with d_k = 1 can only compute similarity as a product of two scalars per token pair — there is no room left for the kind of multi-dimensional geometric relationship that makes dot-product similarity meaningful (comparing direction and magnitude across many dimensions). In practice, extremely small d_k degrades each head's ability to express a useful similarity function long before you would run out of heads to add, which is why every production architecture keeps d_k in a much larger, empirically chosen range (commonly 64–128) rather than pushing head count as high as possible.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">JUNIOR</span>Q20. In one sentence, what does Multi-Query Attention (MQA) change relative to standard multi-head attention?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>MQA keeps a separate, independent Query projection for every head, but replaces every head's separate Key and Value projections with a single, shared Key/Value projection used by all heads — trading some representational independence for a much smaller Key/Value cache and less memory traffic during generation.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">JUNIOR</span>Q21. In one sentence, what does Grouped-Query Attention (GQA) change relative to standard multi-head attention?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>GQA sits between full multi-head attention and MQA: query heads are divided into a smaller number of groups, and all query heads within a group share one Key/Value projection, so instead of one KV pair per head (full MHA) or one KV pair total (MQA), there are a handful of KV pairs, each shared by several query heads.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">JUNIOR</span>Q22. If a model's config file lists "num_attention_heads: 32" and "num_key_value_heads: 8," what does that tell you about its attention variant?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High (real-world config reading)</p>
+<div class="answer">
+<p>It tells you the model uses Grouped-Query Attention with 32 independent query heads sharing only 8 distinct Key/Value projections — meaning each Key/Value pair is shared by 32 / 8 = 4 query heads. If num_key_value_heads equaled num_attention_heads, that would indicate standard full multi-head attention; if num_key_value_heads were 1, that would indicate Multi-Query Attention.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">JUNIOR</span>Q23. Is the scaled dot-product attention formula itself different for head 3 compared to head 1?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>No — every head applies the exact same formula, softmax((Q_h K_h^T) / sqrt(d_k)) · V_h, with the same scaling convention. What differs between heads is never the formula; it is only the learned numerical values inside W_Q^h, W_K^h, and W_V^h, which shape what each head's Q_h, K_h, and V_h actually turn out to represent once trained.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">JUNIOR</span>Q24. Why can't you simply skip the final output projection W_O and feed the concatenated heads directly into the next sublayer?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>You technically could pass the concatenated vector forward without W_O — the shapes would still line up, since concatenation already restores d_model — but doing so would mean the layer's output is always exactly the eight (or however many) heads' outputs sitting side by side in a fixed order, with no learned way to combine or re-weight them. W_O gives the model a trainable mechanism to decide how much each head's signal should contribute to each output dimension, effectively letting different heads' information blend rather than just sit adjacent; omitting it removes real learnable capacity, not just a formality.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">JUNIOR</span>Q25. Is num_heads a property you can change at inference time for a given request, or is it fixed?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It is fixed at model-architecture and training time. num_heads determines the shapes of W_Q, W_K, W_V, and W_O for every layer, and those matrices' learned values only make sense for the specific head count they were trained with — there is no way to ask a trained model to "use fewer heads" for an individual request without retraining, distillation, or a dedicated pruning procedure.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. Walk through the exact parameter-count arithmetic for BERT-base's multi-head attention block: d_model = 768, num_heads = 12.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>First, d_k = d_model / num_heads = 768 / 12 = 64. Each head's W_Q^h, W_K^h, and W_V^h has shape (768 × 64), so one head's Q/K/V parameters total 3 × 768 × 64 = 147,456. Across all 12 heads that is 12 × 147,456 = 1,769,472 — but note this equals exactly d_model² × 3 = 768² × 3 = 1,769,472, confirming the head-count-independence property from Section 6.2. W_O has shape (768 × 768) = 589,824 parameters. Total attention-block parameters (ignoring biases) per layer: 1,769,472 + 589,824 = 2,359,296, which is exactly 4 × d_model² = 4 × 589,824 = 2,359,296 — a useful shortcut worth memorizing for quick parameter-count estimates in an interview.</p>
+<pre><code>d_model = 768, h = 12
+d_k = 768 / 12 = 64
+QKV params  = h * (d_model * d_k) * 3 = 12 * (768*64) * 3 = 1,769,472  (= d_model^2 * 3)
+W_O params  = d_model * d_model      = 768 * 768             =   589,824
+Total       =                                                  2,359,296  (= d_model^2 * 4)</code></pre>
+</div>
+
+<div class="question" id="q27"><span class="level">MID</span>Q27. For d_model = 512, compare the total parameter count of 8 heads with d_k=64 versus 16 heads with d_k=32. What's identical and what actually changes?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The total Q/K/V parameter count is identical in both cases — it equals d_model² × 3 either way, because 8 × (512×64) = 16 × (512×32) = 262,144 per projection type. W_O is also identical in both cases, at 512 × 512, since it only depends on d_model. What actually changes is the internal granularity: each of the 16 heads gets a narrower 32-dimensional space to express its similarity function in, versus 64 dimensions for the 8-head configuration, and the number of independent (seq_len × seq_len) attention-weight matrices computed per layer doubles from 8 to 16 — more numerous but each individually cheaper matmuls, with essentially the same total FLOPs.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">MID</span>Q28. Describe, at the tensor-operation level, how you'd reshape a (batch, seq_len, d_model) tensor into per-head form for batched computation, without looping over heads in Python.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High for implementation-focused interviews</p>
+<div class="answer">
+<p>You first apply one combined linear projection producing a (batch, seq_len, d_model) tensor (this single matmul implicitly computes all heads' projections at once, since the weight matrix's output columns are really num_heads × d_k concatenated together). Then you reshape that to (batch, seq_len, num_heads, d_k), and transpose the seq_len and num_heads axes to get (batch, num_heads, seq_len, d_k). In that final layout, a single batched matrix multiply across the last two dimensions computes every head's attention scores simultaneously — the num_heads axis behaves like an extra "batch" dimension as far as the matmul is concerned, so no explicit per-head Python loop is needed.</p>
+<pre><code>x: (B, L, d_model)
+Q = x @ W_Q            # (B, L, d_model)   -- one matmul, all heads at once
+Q = Q.reshape(B, L, h, d_k)      # split last dim into heads
+Q = Q.transpose(1, 2)            # (B, h, L, d_k)  -- heads become a batch-like axis
+# same for K, V
+scores = Q @ K.transpose(-2, -1) / sqrt(d_k)   # (B, h, L, L), all heads in one batched matmul</code></pre>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. What is the classic transpose bug when implementing multi-head attention from scratch, and what symptom would it produce?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The classic bug is reshaping (batch, seq_len, d_model) directly to (batch, num_heads, seq_len, d_k) by treating the flat d_model axis as if it were already ordered (num_heads, d_k) in memory and forgetting the required transpose step — or transposing the wrong pair of axes (swapping seq_len and d_k instead of seq_len and num_heads). The model will often still "run" without a shape error, because the total element count matches, but each "head" ends up mixing together dimensions that don't actually correspond to a coherent per-head slice, silently corrupting what each head sees. This tends to produce a model that trains and converges — just to noticeably worse loss/quality than a correct reference implementation — which makes it one of the more insidious bugs to catch, since nothing crashes.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">MID</span>Q30. Why do real implementations use one big W_Q of shape (d_model × d_model) plus a reshape, rather than literally storing num_heads separate (d_model × d_k) matrices?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Mathematically the two are equivalent — concatenating num_heads separate (d_model × d_k) matrices column-wise produces exactly one (d_model × d_model) matrix, and multiplying by that combined matrix computes all heads' projections in a single operation. The engineering reason to prefer the single big matrix plus reshape is GPU efficiency: one large matrix multiply is dramatically better utilized by GPU/TPU hardware than num_heads separate smaller matrix multiplies launched independently, since a single big matmul kernel amortizes memory-access overhead and launch overhead across far more useful compute per instruction.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">MID</span>Q31. Does the order in which heads are concatenated matter for the trained model's behavior?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Not in any way that affects what the model can learn — if you permuted the order of heads consistently (and permuted the corresponding rows of W_O to match), the model would be mathematically identical, just with different labels for which head is "head 3" versus "head 5." Head order only matters practically as a convention for interoperability: if you are loading a pretrained checkpoint's weights into your own implementation, you must reshape/slice W_Q, W_K, W_V, and W_O using the exact same head ordering the checkpoint was trained and saved with, or you will silently scramble which slice of W_O is meant to receive which head's output.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. Is d_k = d_model / num_heads a mathematical requirement, or a convention? Describe an architecture that breaks it, and the parameter-count consequence.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It is a convention, not a mathematical requirement — nothing about scaled dot-product attention forces d_k to relate to num_heads or d_model in any particular way. An architecture could choose, say, 8 heads with d_k = 96 each even if d_model = 512, in which case the concatenated output would be 8 × 96 = 768 dimensions, requiring either a resizing W_O (shape 768 × 512, mapping back down to d_model) or a redefinition of the layer's working width. The consequence is that total Q/K/V parameters would no longer be independent of head count — h × d_model × d_k × 3 now depends on the actually chosen d_k rather than automatically canceling out — so the "free diversity" property from Section 4.2 only holds under the conventional choice.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. With 32 query heads and 8 KV groups in a GQA configuration, how many query heads share each Key/Value pair, and what is the resulting KV-cache size relative to full MHA?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>32 / 8 = 4 query heads share each Key/Value pair. Because the Key/Value cache during autoregressive generation stores one Key and Value vector per KV head (not per query head) per token per layer, moving from 32 independent KV heads (full MHA) down to 8 shared KV groups cuts the KV-cache size to 8/32 = 1/4 of the full multi-head size, while every query head still keeps its own independent Query projection.</p>
+<pre><code>num_query_heads = 32
+num_kv_groups   = 8
+group_size      = 32 / 8 = 4   query heads per shared KV pair
+KV-cache size (GQA) / KV-cache size (full MHA) = 8 / 32 = 0.25</code></pre>
+</div>
+
+<div class="question" id="q34"><span class="level">MID</span>Q34. Rank standard multi-head attention (MHA), Grouped-Query Attention (GQA), and Multi-Query Attention (MQA) by KV-cache size for the same model, and give the general formula.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>From largest to smallest KV-cache: MHA (one KV pair per query head, so num_kv_heads = num_heads) &gt; GQA (num_kv_heads is some divisor of num_heads greater than 1) &gt; MQA (num_kv_heads = 1, the smallest possible). The general formula for relative KV-cache size compared to full MHA is num_kv_heads / num_heads — MHA is always 1.0 (no reduction), MQA is always 1/num_heads (the maximum possible reduction), and GQA lands anywhere in between depending on the chosen group count.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. If a model used irregular head sizes (say, d_v differs across heads), what would that mean for the shape of W_O?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>W_O's input dimension must equal the total width of the concatenated heads' outputs, which is simply the sum of each head's individual d_v, not num_heads × a single shared d_v. So if three heads produced outputs of width 40, 80, and 40 respectively, the concatenated vector would be 160-dimensional, and W_O would need shape (160 × d_model) rather than the clean (num_heads × d_v × d_model) formula that applies under the uniform convention. This is one concrete reason virtually every production architecture keeps head sizes uniform — it keeps every downstream shape calculation, including W_O's, simple and free of per-head bookkeeping.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">MID</span>Q36. Does adding more heads (holding d_model fixed) increase the FLOPs of the Q/K/V projection step? What does it change instead?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>No — as shown by the parameter-count arithmetic, the total Q/K/V projection FLOPs stay essentially constant as head count increases (holding d_model fixed), because each head does proportionally less work as d_k shrinks. What does increase is the number of separate small matrix multiplies for the attention-score computation (Q_h · K_h^T) and the weighted-sum step per head — more numerous, smaller matmuls instead of one large one. On real hardware this can introduce a mild practical overhead from kernel-launch and memory-access patterns even when the theoretical FLOP count is unchanged, which is part of why frameworks batch all heads into a single operation (as described in Q28) rather than looping over them individually.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">MID</span>Q37. Why is computing multi-head attention via one batched matrix multiply across all heads preferable to a Python for-loop over heads, given that the total FLOPs are the same either way?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High for implementation-focused interviews</p>
+<div class="answer">
+<p>GPUs achieve high throughput by launching a small number of large, well-utilized kernels rather than many small ones — each kernel launch carries fixed overhead, and small matrix multiplies (like a single head's Q_h · K_h^T at d_k=64) do not fully saturate a modern GPU's parallel compute units on their own. By reshaping the num_heads dimension into an effective extra batch dimension and issuing one batched matmul across all heads simultaneously, the framework lets the GPU schedule all heads' work as one large, well-parallelized operation, which is dramatically faster in wall-clock terms even though the FLOP count is mathematically identical to looping.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. What failure mode do you get if you keep increasing num_heads without increasing d_model, pushing d_k down toward very small values like 4 or 8?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Each head's Query and Key vectors live in an increasingly low-dimensional space, which limits how much genuinely distinguishing information a dot-product similarity score between two such vectors can encode — with only 4 or 8 dimensions, many token pairs will end up with similar-looking similarity scores purely by geometric coincidence, not because they are actually similar, degrading the quality of that head's attention distribution. In practice this manifests as heads that are noisier, less discriminative, and less able to specialize usefully, which is exactly why production architectures treat d_k as having a practical floor (commonly not going much below 64) rather than treating head count as a dial that can be turned up indefinitely for free.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">MID</span>Q39. Explain the "rank" intuition behind why very low d_k can hurt a head's representational power, in plain terms.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A dot-product similarity computed in a d_k-dimensional space can only capture patterns of similarity that are expressible as combinations of at most d_k independent directions — informally, the "resolution" of the similarity function is capped by how many dimensions it has to work with. At d_k = 64, a head has enough independent directions to represent many different, nuanced notions of relevance (syntactic role, distance, topical overlap, and more, in combination). At d_k = 4, the head is squeezed into representing only a handful of independent similarity patterns, which is far too little room for the kind of nuanced token relationships multi-head attention is designed to capture.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. Are the "one big W_Q matrix plus reshape" and "h separate small W_Q^h matrices" implementations mathematically equivalent?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Yes, exactly equivalent, as long as the big matrix's columns are laid out as the concatenation of each head's individual (d_model × d_k) matrix in the same order used for splitting after the matmul. Multiplying x by the big (d_model × d_model) matrix and then slicing the output into num_heads chunks of width d_k produces bit-for-bit the same result as multiplying x by each of the h separate (d_model × d_k) matrices individually — it is purely an implementation-efficiency choice (see Q30), not a different mathematical operation.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">MID</span>Q41. When loading a pretrained checkpoint's attention weights, what specifically could go wrong if you assume the wrong head_dim and reshape incorrectly?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High for practitioners</p>
+<div class="answer">
+<p>If you reshape the loaded W_Q/W_K/W_V/W_O tensors using an incorrect head_dim (say, assuming 8 heads of 64 when the checkpoint actually used 16 heads of 32), the total element count can still match, so no shape-mismatch error is raised — but each "head" you construct will actually be an arbitrary, meaningless slice mixing together fragments of what were originally two or more separate trained heads. The model will load without error and produce outputs, but they will be close to garbage, because the geometric structure the original heads' weights encode has been scrambled by the wrong split point; this is a common, hard-to-diagnose bug when porting weights between frameworks or reimplementing a published architecture from a paper without checking its exact head configuration.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">MID</span>Q42. If two heads' weight matrices were swapped at random initialization (before any training), would that meaningfully change the final trained model?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>No — because heads are not pre-assigned roles, swapping which random initialization "head 1" versus "head 5" starts from has no meaningful effect on the final trained model's behavior or quality; you would simply end up with the two heads' specializations landing under different index labels than they otherwise would have. What a head ends up specializing in is determined entirely by how gradient descent shapes its weights during training in response to the loss signal, not by anything inherent to its position or initial random values (beyond the generic effect any different random seed has on final convergence).</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. What initialization strategy is typically used for W_Q, W_K, W_V, and W_O, and does it differ meaningfully per head?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>These matrices are typically initialized the same way any other linear layer in the Transformer is — commonly a scaled random initialization (variants of Xavier/Glorot or a scheme tuned specifically for Transformer depth/width, such as the schemes used in GPT-2/GPT-3-style models) — and each head's projections are initialized independently with fresh random draws, using the same distribution and scale as every other head. There is no special per-head initialization scheme in standard practice; the only thing that differs between heads at initialization time is the specific random values drawn, not the strategy used to draw them.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">MID</span>Q44. Why do most implementations keep d_k = d_v even though the Value projection could, in principle, use a different width?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Keeping d_k = d_v is purely a convention that simplifies shape bookkeeping and keeps the concatenation-to-d_model arithmetic clean (num_heads × d_v = d_model, matching num_heads × d_k = d_model exactly). Conceptually, Q/K live in a "similarity-comparison" space while V lives in a "content-carrying" space, and there is no mathematical reason these must be the same width — a head could use a narrower d_k for cheap similarity scoring while keeping a wider d_v to carry richer content — but the original Transformer paper chose the simpler uniform convention, and it has stuck as the default across nearly all subsequent architectures because it works well in practice and avoids extra hyperparameters to tune.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">MID</span>Q45. Does the head-splitting mechanic differ at all between self-attention and encoder-decoder cross-attention?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>No — the splitting-into-heads mechanic itself (dividing d_model into num_heads slices of d_k, projecting independently per head, concatenating, and passing through W_O) is identical in both cases. The only difference is where Q, K, and V come from: in self-attention, all three are derived from the same sequence; in cross-attention, Q is derived from the decoder's sequence while K and V are derived from the encoder's output sequence. Once Q, K, and V exist, the per-head split-project-attend-concatenate-project pipeline described in Section 5 runs exactly the same way regardless of which sequence they came from.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. Trace the exact tensor shapes through a full multi-head attention pass for batch_size=32, seq_len=128, d_model=512, num_heads=8.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The full shape trace makes every step's cost and structure concrete, which is exactly the kind of walkthrough interviewers expect at the mid-to-senior level to confirm you can reason about the mechanism beyond a verbal description.</p>
+<pre><code>Input x:                         (32, 128, 512)
+After W_Q/W_K/W_V (combined):    (32, 128, 512)      each, before splitting
+Reshape to per-head:             (32, 128, 8, 64)     then transpose ->
+Per-head layout:                 (32, 8, 128, 64)     for Q, K, V
+Attention scores (Q @ K^T):      (32, 8, 128, 128)    one 128x128 matrix per head, per batch item
+After softmax:                   (32, 8, 128, 128)    unchanged shape
+Weighted V (scores @ V):         (32, 8, 128, 64)
+Transpose back + reshape:        (32, 128, 8, 64) -> (32, 128, 512)   concatenation
+After W_O:                       (32, 128, 512)      final multi-head attention output</code></pre>
+</div>
+
+<div class="question" id="q47"><span class="level">MID</span>Q47. Why is the per-head attention-score matrix always (seq_len × seq_len) regardless of num_heads, and how does total attention-score memory scale with num_heads?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Each head computes a similarity score between every pair of token positions in the sequence, so the score matrix's shape is always (seq_len × seq_len) — its size depends only on sequence length, never on d_k or num_heads, since d_k only determines the dimensionality of the vectors being compared, not the number of comparisons made. Because every head produces its own full (seq_len × seq_len) score matrix, the total memory required to hold all heads' attention scores for one layer scales linearly with num_heads (num_heads × seq_len²), which is a real and often underappreciated memory cost at long sequence lengths and high head counts, independent of the (head-count-invariant) parameter count discussed in Section 6.2.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">MID</span>Q48. Describe a common off-by-one or broadcasting bug when applying a causal mask across a batched multi-head tensor.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High for implementation interviews</p>
+<div class="answer">
+<p>A causal mask is typically built as a single (seq_len × seq_len) lower-triangular matrix and then relied upon to broadcast correctly across the batch and head dimensions of a (batch, num_heads, seq_len, seq_len) score tensor. A common bug is constructing the mask with the wrong triangular orientation (masking future-to-past instead of past-to-future, or being off by one position so a token can or cannot attend to itself when it shouldn't), or forgetting to unsqueeze the mask to the correct rank so it silently broadcasts against the wrong axis (e.g., accidentally masking across heads instead of across sequence positions). This class of bug is especially dangerous because, again, it usually does not crash — it just lets a small amount of future information leak into training, producing a model that looks like it is training normally but that will underperform or behave inconsistently between training and true autoregressive inference.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">MID</span>Q49. In some architectures, is "head_dim" ever decoupled from d_model / num_heads as an independently set configuration value?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes — several real model configurations expose head_dim as its own explicit setting rather than always deriving it as d_model / num_heads, precisely to allow head width and head count to be tuned somewhat independently (for example, to keep d_k at a hardware-friendly size like 128 even as d_model and num_heads are scaled differently across model sizes in a family). When head_dim is set explicitly and num_heads × head_dim does not exactly equal d_model, an extra reshaping projection is needed somewhere in the pipeline to reconcile the mismatch — which is exactly the "irregular head size" scenario discussed in Q35, just applied uniformly across all heads rather than per-head.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">MID</span>Q50. Why would anyone deliberately choose num_heads = 1 for a Transformer layer? What capability is lost?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>num_heads = 1 collapses multi-head attention back into the single, full-size attention mechanism from the Query/Key/Value chapter — it is a valid, if unusual, configuration, and some very small or highly resource-constrained models have used single-head attention layers to save the modest overhead of managing multiple small matrix multiplies. What is lost is exactly the core benefit of this chapter: the ability for different heads to specialize in different relationship types within the same layer — with one head, every kind of token relationship (syntactic, positional, topical) must be blended into one shared similarity geometry and one softmax distribution, reintroducing the averaging problem multi-head attention was specifically designed to avoid.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">MID</span>Q51. Is there a known heuristic relating the number of attention heads to the number of layers in a model?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>There is no rigid mathematical rule, but empirically, across published model families, head count and layer count tend to be scaled together roughly in proportion to d_model and overall model size, rather than one being fixed while the other grows unboundedly — larger models generally add both more layers and more heads (while keeping d_k relatively stable, as discussed elsewhere in this chapter), reflecting a practical scaling heuristic refined through extensive experimentation (see the Chinchilla/scaling-laws literature referenced more fully in Chapter 9) rather than a closed-form formula relating the two directly.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">MID</span>Q52. Explain how "repeat_kv" works when implementing GQA — the tensor operation needed to make grouped KV heads compatible with per-head query matmuls.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High for implementation-focused interviews</p>
+<div class="answer">
+<p>After projecting to a smaller number of KV heads (say, 8 KV heads for 32 query heads), the attention-score matmul still needs a Key/Value tensor with a head dimension matching the query tensor's 32 heads, so each of the 8 KV heads must be virtually duplicated 4 times (32 / 8) to align shapes before the batched matmul. This is implemented as a "repeat_kv" operation — expanding the KV tensor along the head axis by repeating each KV head's slice consecutively (or via a broadcasting-friendly reshape) — which does not add new learned parameters, it just replicates the same shared KV values in memory (or virtually, via broadcasting, in more memory-efficient implementations) so the underlying matmul machinery can treat GQA as a special case of the same batched per-head computation used for full MHA.</p>
+<pre><code>K_shared: (B, num_kv_heads=8,  L, d_k)
+K_expanded = repeat_kv(K_shared, group_size=4)   # -> (B, num_heads=32, L, d_k)
+scores = Q @ K_expanded.transpose(-2,-1) / sqrt(d_k)   # now shapes match, standard batched matmul</code></pre>
+</div>
+
+<div class="question" id="q53"><span class="level">MID</span>Q53. What unit tests would you write for a from-scratch multi-head attention implementation to catch shape and mechanical bugs before ever starting real training?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High for implementation-focused interviews</p>
+<div class="answer">
+<p>A solid checklist includes: (1) an output-shape test confirming input and output shapes match (batch, seq_len, d_model) for several different batch/seq_len combinations; (2) a parameter-count test confirming total Q/K/V parameters equal d_model² × 3 regardless of the num_heads value passed in, exactly matching the Section 6.2 formula; (3) a masking test confirming that, under a causal mask, changing a "future" token's value does not change an earlier token's output (a direct, automatable check for the off-by-one bug in Q48); (4) a gradient-flow test (a simple backward pass) confirming every head's projection matrices actually receive nonzero gradients, catching accidental detachment or a head that's silently disconnected from the computation graph; and (5) a numerical-equivalence test comparing your batched, reshaped implementation's output against a naive Python for-loop-over-heads reference implementation on the same fixed random weights, to catch the transpose bug from Q29 directly.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">SENIOR</span>Q54. Derive, step by step, why the total Q/K/V parameter count across all heads equals d_model² × 3, independent of the number of heads.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High at senior level</p>
+<div class="answer">
+<p>Each head's projection matrix (for Q, K, or V) has shape (d_model × d_k), so it contributes d_model × d_k parameters. There are h heads, and by convention d_k = d_model / h. Substituting: total parameters for one projection type = h × d_model × d_k = h × d_model × (d_model / h). The h in the numerator and denominator cancel exactly, leaving d_model² — a quantity with no h in it at all. Multiplying by 3 for Q, K, and V gives d_model² × 3 total, which is exactly the same total whether h is 1, 8, 16, or 64. This cancellation is the precise mathematical mechanism behind the informal "diversity for free" claim made throughout this chapter, and being able to reproduce this derivation live, on a whiteboard, is one of the highest-value things to rehearse before a senior AI engineering interview.</p>
+<pre><code>params_per_projection(h) = h * d_model * (d_model / h) = d_model^2   for all h
+total_QKV(h)             = 3 * d_model^2                             for all h  (h cancels)</code></pre>
+</div>
+
+<div class="question" id="q55"><span class="level">SENIOR</span>Q55. Cite and explain the empirical basis for "diminishing returns" as head count increases, referencing head-pruning research.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The paper "Are Sixteen Heads Really Better than One?" (Michel, Levy, and Neubig) directly probes this question by measuring how much accuracy degrades when individual heads are removed, one at a time or iteratively, from a fully trained multi-head attention model. Their finding was that a substantial fraction of heads in a typical trained model can be pruned away — in some layers, down to a single remaining head — with only modest accuracy loss, and that head importance is highly non-uniform (a few heads matter a great deal, many contribute comparatively little on their own). This is direct empirical evidence that simply adding more heads does not translate into a proportional quality gain: beyond some point, additional heads increasingly land in redundant or lightly-used territory rather than each adding a genuinely new, necessary specialization.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">SENIOR</span>Q56. Someone claims "doubling the number of heads should roughly double model quality." Refute this using the representational trade-off inherent in the design.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Doubling head count (holding d_model fixed) does not add new representational capacity in the parameter sense — as the Q54 derivation shows, total Q/K/V parameters stay exactly constant. What actually happens is existing capacity gets redistributed into narrower per-head spaces: d_k is cut in half. There is a real trade-off between "many narrow, specialized views" and "few wide, expressive views," and empirically (per Q55's pruning evidence) the marginal value of yet another narrow view diminishes once a model already has enough heads to cover the useful relationship types the training data actually rewards — beyond that point, more heads mostly means more redundant or under-utilized views, not proportionally more quality. Quality gains from architecture changes in practice come far more reliably from scaling d_model, layer count, training data, and training compute together (per empirical scaling-law findings) than from head count in isolation.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. How would you choose num_heads for a new model at a given d_model in practice? What engineering constraints, beyond pure quality, come into play?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>In practice, teams start from the empirically-validated pattern across successful model families — keep d_k in the roughly 64–128 range and choose num_heads = d_model / d_k accordingly, then validate against ablation experiments if compute budget allows (see Q80 for study design). Beyond raw quality, hardware constraints matter directly: many GPU tensor-core kernels are most efficient when d_k is a multiple of 8, 16, or another hardware-friendly boundary, so an otherwise "quality-optimal" d_k might be nudged to the nearest efficient value. Distributed-training constraints matter too — if attention heads will be sharded across GPUs via tensor parallelism, num_heads should be evenly divisible by the number of GPU shards, or some heads end up unevenly distributed, complicating both the implementation and the load balance across devices.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">SENIOR</span>Q58. Why are GQA group counts typically chosen as powers of two, and how does that interact with tensor-parallel serving?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Powers of two make evenly dividing both the query heads among groups and the groups among GPU shards straightforward — a model serving infrastructure that splits attention heads across, say, 8 GPUs for tensor parallelism needs num_kv_groups to divide cleanly across those shards (or vice versa) to avoid one GPU holding an oddly-sized, unbalanced slice of KV heads. Choosing group counts like 4, 8, or 16 keeps both the query-head-to-KV-group ratio and the KV-group-to-GPU-shard mapping simple integer divisions, avoiding the load-imbalance and implementation-complexity headaches that come from uneven splits — a purely practical, engineering-driven convention rather than a mathematical requirement of GQA itself.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. Reconcile the apparent tension between "head redundancy" findings (pruning studies) and "head specialization" findings (probing studies) — are these contradictory?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>They are not contradictory — they describe two different, coexisting facts about the same trained model. Probing/interpretability studies identify specific heads that do exhibit clean, reproducible, interpretable behavior (a coreference-like head, a positional head), demonstrating that specialization genuinely happens for at least some heads. Pruning studies, separately, show that many other heads contribute little on their own and can be removed with minimal accuracy loss. The honest synthesis is that a trained multi-head attention layer is typically over-provisioned relative to what it strictly needs: a subset of heads carry real, identifiable, necessary specialization, while a meaningful fraction of the remaining heads are redundant, lightly-used, or only marginally useful — both things are simultaneously true of the same set of heads in the same model, and conflating "some heads are interpretable" with "every head is necessary and interpretable" is precisely the overstatement Q5 in this chapter's earlier questions warns against.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">SENIOR</span>Q60. Explain precisely what approximation error is introduced when converting a pretrained MHA checkpoint to GQA via mean-pooling of KV heads ("uptraining"), rather than retraining from scratch.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Mean-pooling collapses several originally independent, differently-specialized KV heads (say, 4 heads that were each trained to produce somewhat different Key/Value geometries) into a single averaged KV projection, on the assumption that heads within the pooled group were similar enough that their average is a reasonable stand-in for each of them individually. The approximation error is exactly the degree to which those heads' original KV projections actually differed — if the grouped heads happened to have already converged toward broadly similar behavior (which pruning-study evidence in Q55/Q59 suggests is common for at least some heads), the averaging loses relatively little; if the grouped heads were meaningfully distinct in what they attended to, averaging blurs that distinction and measurably degrades quality on tasks that depended on it. This is why uptraining conversions are always followed by a short continued-training phase on real data — to let the model's remaining trainable parameters (queries, output projection, downstream layers) partially compensate for whatever information the KV-averaging step discarded, rather than shipping the naively-averaged checkpoint directly.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. Describe a scenario in which increasing num_heads (while holding d_model fixed) could actively hurt training stability, not just quality.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>As d_k shrinks with more heads, each head's Query-Key dot products are computed over fewer dimensions, which increases the variance of the raw similarity scores relative to their scale unless the sqrt(d_k) scaling and weight initialization are both correctly tuned for that smaller d_k. In practice, if an implementation naively keeps a fixed scaling factor while cranking up head count without correspondingly re-deriving sqrt(d_k) for the new, smaller per-head dimension, softmax inputs can become poorly conditioned (too sharp or too flat), leading to gradient issues — either vanishing gradients through an overly peaked softmax or unstable, noisy updates through a poorly-scaled one. This is a concrete case where "more heads" interacts badly with a detail (the scaling factor) that is easy to overlook when just bumping a hyperparameter, rather than the head-count change itself being inherently unstable in isolation.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. How does choosing num_heads interact with tensor-parallel model serving, and what constraint does that place on head count?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Tensor parallelism for attention typically shards the computation by assigning different heads (or groups of heads) to different GPUs, since each head's computation is already independent of the others until the concatenation-and-W_O step — this makes head-parallel sharding a very natural fit for multi-GPU serving. The practical constraint this creates is that num_heads should be evenly divisible by the tensor-parallel degree (the number of GPUs splitting the layer), or some GPUs end up responsible for an uneven number of heads, complicating load balancing and sometimes forcing padding or awkward remainder-handling logic. This is one of the concrete, non-quality-driven reasons production model architects often round num_heads to a "nice" number (a multiple of common GPU counts like 4, 8, or 16) rather than whatever value a pure quality-only ablation might suggest.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. Quantify the parameter and compute overhead of a hypothetical "true" multi-head design — h fully independent, full-d_model-sized attention modules — versus the canonical split-dimension design.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>In the canonical split-dimension design, total Q/K/V parameters are d_model² × 3, independent of h (Q54). In the hypothetical "true" design, each of the h heads would use full-size (d_model × d_model) projections rather than (d_model × d_k) ones, giving h × d_model² × 3 total Q/K/V parameters — a factor of h more than the canonical design. For d_model = 512 and h = 8, that is 8× the parameters (and roughly 8× the FLOPs) for the projection step alone, with no guarantee of a proportional quality improvement, which is exactly the inefficient alternative the Problem Statement (Section 3) explicitly rules out as the "trivial but wasteful" way to get multiple relationship types. This comparison is a good concrete number to have ready in an interview to show you understand why the split-dimension design was the actual innovation, not merely "running attention several times."</p>
+<pre><code>Canonical (split d_model):  QKV params = 3 * d_model^2                (independent of h)
+"True" full-size heads:     QKV params = 3 * h * d_model^2             (scales linearly with h)
+Overhead factor for h=8:    8x more parameters and roughly 8x more FLOPs, same d_model</code></pre>
+</div>
+
+<div class="question" id="q64"><span class="level">SENIOR</span>Q64. Describe a methodology for empirically measuring how many heads of a production model can be safely pruned before deployment.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A standard methodology, following the approach used in head-pruning research, is: (1) compute an importance score for every head, commonly via a gradient-based sensitivity measure — how much the loss changes when that head's contribution is masked out, estimated via the gradient of the loss with respect to a per-head gating variable; (2) rank heads by this importance score, globally across all layers rather than per-layer, since some layers tend to have more prunable heads than others; (3) iteratively remove the lowest-scoring heads in small batches, each time re-evaluating on a held-out task-relevant benchmark (not just training loss) to track the actual quality-versus-head-count curve; (4) stop pruning at the point where the quality-versus-latency/memory trade-off crosses whatever threshold the production use case requires; and (5) optionally follow pruning with a short fine-tuning phase so the remaining heads and downstream layers can partially compensate for the removed heads' lost contribution, similar in spirit to the uptraining step described for GQA conversion in Q60.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. Given a fixed FLOPs budget, is it generally better to use more heads with smaller d_k, or fewer heads with larger d_k? What does the empirical trade-off look like?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Because total Q/K/V FLOPs are essentially head-count-invariant under the canonical convention, "fixed FLOPs budget" here really means fixed d_model, and the real trade-off is qualitative rather than a raw compute trade-off: more, narrower heads buy you more independent "views" of the sequence at the cost of each view having less room to express a nuanced similarity function, while fewer, wider heads buy the opposite. Empirically, across the successful model families surveyed in this chapter, the field has converged on a middle ground — keep d_k in a moderate range (roughly 64–128) and let num_heads grow as d_model grows, rather than pushing to either extreme (a single very wide head, or an enormous number of degenerate near-1-dimensional heads). The strongest evidence for "narrow-but-not-too-narrow" being the right zone is precisely that virtually no successful, carefully-tuned production model deviates far from that empirically discovered range in either direction.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">SENIOR</span>Q66. Explain, mechanically, why MQA tends to degrade quality more than GQA relative to full MHA.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at senior level</p>
+<div class="answer">
+<p>MQA forces every single query head in the model, no matter how differently specialized, to read from the exact same Key/Value projection — the Key/Value representation becomes a single shared bottleneck that must simultaneously serve every query head's needs, which directly constrains how differentiated the heads' downstream attention behavior can actually be, since the raw material (K and V) they're all working from is identical. GQA relaxes this by giving several distinct groups their own Key/Value projections, so heads that need meaningfully different Key/Value geometry (not just a different Query) are not forced to share, only heads within the same group are — which empirically recovers most of full MHA's quality while still cutting KV-cache size substantially, explaining why GQA rather than MQA has become the more common production default when quality is a serious constraint.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. Why do very large models (e.g., 90+ heads) tend to use such high head counts? What does this reflect about how d_model and d_k scale together?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>As covered in Q65, the empirically favored d_k range (roughly 64–128) stays fairly stable across model scales rather than growing proportionally with d_model — so as a model family scales d_model up dramatically (from hundreds to many thousands), the only way to keep d_k inside that empirically favored range is to scale num_heads up correspondingly, since num_heads = d_model / d_k. A model with d_model in the 12,000+ range and d_k held near 128 mechanically requires on the order of 90+ heads simply to satisfy that ratio — the high head count is a direct, almost arithmetic, consequence of the d_k-stability pattern, not an independent design choice made for its own sake.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">SENIOR</span>Q68. Explain gradient-based head-importance scoring in more mechanical detail — what exactly is being differentiated?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>The standard technique introduces a per-head scalar gate (conceptually, a multiplier initialized to 1 that scales that head's output before concatenation) and computes the gradient of the task loss with respect to that gate, evaluated at gate = 1, on a representative batch of data. A large-magnitude gradient at that point indicates the loss is highly sensitive to that head's current contribution (removing or scaling it down would change the loss a lot), while a near-zero gradient indicates the loss barely responds to that head at all — a strong signal that the head's contribution is redundant with other heads or simply unused. This importance score is then used to rank heads for pruning (Q64), without needing to actually remove each head one at a time and re-run a full forward pass to measure the effect directly, which would be far more expensive at scale.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. Do smaller per-head dimensions change the numerical stability characteristics of the softmax computation compared to one large head, holding everything else equal?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Yes, in a specific, quantifiable way: the raw dot-product similarity score before scaling is, under common initialization assumptions, a sum of d_k independent products, so its variance scales roughly linearly with d_k. A smaller d_k therefore produces raw similarity scores with lower variance before scaling, and the sqrt(d_k) divisor is precisely calibrated to normalize that variance back to a consistent, well-behaved range regardless of d_k — which is exactly why the scaling factor must be recomputed per-head using that head's own (smaller) d_k, as noted in Section 6.3, rather than using a single global scaling constant tuned for one particular head size.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">SENIOR</span>Q70. In distributed training with head-parallel sharding, what communication is required at the concatenation-and-W_O boundary?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Up through the per-head attention computation, each GPU holding a subset of heads can compute entirely independently, with no cross-GPU communication needed, since every head's Q/K/V projections and attention computation depend only on the shared input (already available on every device) and that head's own local weights. The first point where communication becomes unavoidable is exactly at concatenation: to apply W_O to the full concatenated vector (or to compute a sharded version of W_O correctly), the different GPUs' per-head outputs must be gathered together — typically via an all-gather or a specifically structured sharded matrix multiply that avoids materializing the full concatenation on every device. This concatenation boundary is a well-known, deliberate communication point in tensor-parallel Transformer implementations (e.g., in Megatron-LM-style sharding schemes), precisely because independent per-head computation naturally maps to independent-then-synchronize distributed execution.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. Compare the head configurations of BERT-base, GPT-2, GPT-3, and a modern LLaMA-family model. What pattern do you notice in how d_k has evolved versus how num_heads has evolved?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Across this progression — BERT-base (d_model=768, 12 heads, d_k=64), GPT-2 large-ish configurations (d_model in the 1000s, head counts scaled up correspondingly), GPT-3 (d_model=12,288, 96 heads, d_k=128), and modern LLaMA-family models (d_model growing across sizes, head counts scaled to keep d_k in a similar band, often with GQA layered on top for the larger variants) — the clear pattern is that d_k has stayed remarkably stable, clustering around 64–128, across roughly three orders of magnitude of total parameter growth, while num_heads has absorbed essentially all of the growth in d_model. This is strong, multi-generation empirical evidence for the pattern discussed in Q67: the field converged early on a favored per-head dimensionality and has scaled models primarily by adding more heads (and more layers, and more parameters elsewhere) rather than by making individual heads wider.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">SENIOR</span>Q72. Under what circumstances might an architect deliberately choose unequal head dimensions, despite the convention favoring uniform d_k?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>A plausible motivation is a mixture-of-specializations design where a small number of heads are deliberately given a wider dimension to handle a relationship type believed to need more representational room (say, a long-range dependency-tracking head), while the majority of heads stay narrow and cheap for more local, simpler patterns — trading the clean, uniform parameter-counting property from Section 6.2 for a hand-designed allocation of capacity. This is uncommon in mainstream production architectures precisely because it reintroduces manual, non-learned architectural bias into a component (head specialization) that empirically works well when left to emerge purely from training, and because it complicates every downstream shape calculation (W_O sizing, concatenation, distributed sharding) for a benefit that has not been consistently demonstrated to outweigh those costs at scale.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. Positional information (e.g., rotary embeddings) is often applied per-head-dimension rather than to the full d_model vector. Why does it need to interact with the per-head split at all?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level (brief scope — full RoPE mechanics belong to Chapter 9)</p>
+<div class="answer">
+<p>Without going into the full rotary-embedding mechanics (covered in Chapter 9), the key mechanical point relevant to this chapter is simply that positional rotation schemes of this kind are applied to the Query and Key vectors after they have already been split into their per-head d_k-dimensional slices, not to the original d_model-wide vector before splitting — because the rotation is defined in terms of pairs of dimensions within a d_k-sized space, and d_k is what actually participates in the Q_h · K_h^T similarity computation each head performs. This means the positional-encoding step must be aware of, and executed at, the exact point in the pipeline where the per-head tensors already have shape (..., num_heads, d_k) — one more concrete place in the implementation where getting the head-splitting reshape order wrong (Q29) would corrupt not just the attention computation but the positional information layered on top of it.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">SENIOR</span>Q74. A from-scratch multi-head attention implementation trains without crashing but underperforms a known-good reference. Give a debugging checklist specific to the multi-head mechanics (not general training issues).</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>A focused, mechanics-specific checklist: (1) verify the reshape-then-transpose order used to split into per-head form matches the reference exactly, since a subtly wrong axis order (Q29) produces a "working but wrong" model; (2) confirm the scaling factor uses that head's own d_k, not a stale d_model-based constant left over from a single-head implementation; (3) confirm W_O is actually present and applied after concatenation, not accidentally skipped or replaced with an identity pass-through (Q24); (4) confirm the causal/padding mask is broadcast to the correct rank and orientation across the (batch, num_heads, seq_len, seq_len) score tensor (Q48); (5) confirm each head truly has independent, separately-initialized Q/K/V weights rather than accidentally sharing one set of weights across all heads (a subtle bug if projections are created in a loop without deep-copying initialization); and (6) run the numerical-equivalence unit test from Q53 against a naive per-head loop implementation to isolate whether the bug is in the batched-reshape logic specifically or elsewhere in the model.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">SENIOR</span>Q75. What does the existence of effective head pruning imply about the "effective rank" or capacity utilization of a trained multi-head attention layer?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>It implies that a trained multi-head attention layer is typically over-parameterized relative to the minimum capacity strictly needed to reproduce its trained behavior — the layer is allocated a certain number of independent heads at design time, but training does not necessarily push every one of those heads to a fully distinct, maximally-utilized specialization; some heads end up carrying genuinely necessary, non-redundant information while others converge to something closer to redundant or low-marginal-value contributions. This mirrors a broader theme in over-parameterized deep learning generally (also visible in weight pruning and low-rank approximation literature beyond attention specifically): models are commonly trained with more capacity than the task strictly requires, because that extra capacity makes optimization easier and more robust during training, even though a meaningful fraction of it can be removed after the fact with limited cost.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">SENIOR</span>Q76. Is it common, in production, for different layers of the same model to use different num_kv_heads (heterogeneous GQA configurations across depth)?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Homogeneous configurations (the same num_kv_heads at every layer) are far more common in mainstream production models, mainly for implementation simplicity — a single, uniform attention module class can be reused across every layer without per-layer configuration branching, and it keeps memory-planning and distributed-sharding logic simpler across the whole model. Heterogeneous configurations (varying group counts by depth, on the theory that different layers may have different needs for KV independence) are architecturally plausible and have been explored in research settings, but are not yet the dominant, empirically-validated production default — the additional implementation and tuning complexity has not, so far, demonstrated a large enough quality or efficiency win over the simpler uniform-GQA approach to justify widespread adoption.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">SENIOR</span>Q77. Calculate the KV-cache memory savings (in bytes) of GQA versus full MHA for a concrete configuration: 40 layers, num_heads=40, num_kv_heads=8, d_k=128, sequence length 8192, batch size 1, using 16-bit precision.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>KV-cache size for one configuration is: num_layers × num_kv_heads × seq_len × d_k × 2 (Key and Value) × bytes_per_element. For full MHA (num_kv_heads=40): 40 × 40 × 8192 × 128 × 2 × 2 bytes = 6,710,886,400 bytes ≈ 6.25 GB. For GQA (num_kv_heads=8): 40 × 8 × 8192 × 128 × 2 × 2 bytes = 1,342,177,280 bytes ≈ 1.25 GB. The savings ratio is exactly num_kv_heads_GQA / num_heads_MHA = 8/40 = 0.2, so GQA here uses only 20% of the KV-cache memory of full MHA — roughly 5 GB saved per active sequence at this length and batch size, which is precisely the kind of number that justifies GQA adoption for high-throughput, long-context serving at scale.</p>
+<pre><code>KV_cache_bytes(num_kv_heads) = num_layers * num_kv_heads * seq_len * d_k * 2 * bytes_per_elem
+MHA (kv_heads=40): 40*40*8192*128*2*2 = 6,710,886,400 bytes  (~6.25 GB)
+GQA (kv_heads=8):  40*8 *8192*128*2*2 = 1,342,177,280 bytes  (~1.25 GB)
+Savings ratio = 8/40 = 0.20  ->  GQA uses 20% of MHA's KV-cache memory</code></pre>
+</div>
+
+<div class="question" id="q78"><span class="level">SENIOR</span>Q78. Why is it W_O specifically (rather than, say, the residual connection or the layer norm) that gets fused with adjacent operations in highly optimized attention kernels?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>W_O sits at a natural fusion boundary: it is the last matrix multiply inside the attention block, immediately followed by the residual add, so a kernel that computes the concatenated heads' output, applies W_O, and immediately adds the residual in one fused operation avoids materializing an intermediate tensor to memory and reading it back — a real, measurable saving in memory bandwidth, which (as emphasized throughout this chapter) is often the actual bottleneck rather than raw compute. Fusing W_O with what comes immediately after it is a natural, low-risk optimization precisely because W_O's output feeds into exactly one subsequent, simple operation (the residual addition), unlike, say, the per-head attention computation itself, whose fusion opportunities (as in FlashAttention-style kernels) are a more involved optimization belonging more to Chapter 9's broader discussion of inference-serving techniques than to this chapter's focus on the head-splitting mechanism itself.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">STAFF</span>Q79. You are designing a new architecture from scratch and must jointly choose num_heads, d_model, and num_kv_groups under a fixed parameter and inference-latency budget. Walk through your reasoning end to end.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Start from the parameter budget to pin down d_model (the dominant driver of total parameter count across the whole model, not just attention), using published scaling-law guidance for how parameter count should relate to target quality and available training compute. Next, choose d_k from the empirically stable 64–128 band established across successful model families (Q71), rather than treating it as a free variable, and derive num_heads = d_model / d_k directly from that choice, rounding to a value divisible by your anticipated tensor-parallel degree (Q62) for clean distributed serving. For num_kv_groups, work backward from the latency/memory budget: estimate KV-cache size at your target maximum sequence length and batch size using the Q77-style formula for a few candidate group counts, and pick the smallest num_kv_groups that keeps KV-cache memory within budget while still leaving enough independent KV projections that quality (validated via a smaller-scale ablation, per Q80) does not measurably regress versus a full-MHA baseline. The staff-level discipline here is treating this as a genuinely joint optimization across quality, memory, and serving-infrastructure constraints, rather than picking num_heads first "because that's what the last model used" and treating everything else as an afterthought.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">STAFF</span>Q80. A team wants to convert an existing 32-head MHA checkpoint to 8-group GQA without retraining from scratch, to cut inference cost. Design the conversion strategy and describe how you would validate it before shipping.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The conversion strategy follows the uptraining pattern discussed in Q60: group the 32 existing Key/Value heads into 8 groups of 4, replace each group's 4 separate Key and Value projections with a single projection initialized as the mean (or another principled pooling, such as a small learned linear combination) of the 4 original projections it replaces, leaving the 32 independent Query projections and W_O untouched. Follow this with a short continued-training (uptraining) phase on a representative slice of the original training distribution, at a small fraction of the original training compute, allowing the model's remaining trainable weights to compensate for the information discarded by KV-pooling. Validation before shipping should include: a held-out quality benchmark comparable to the one used during original training (not just perplexity, since perplexity can mask task-specific regressions), a targeted evaluation on tasks known to stress long-range or fine-grained token relationships (since those are most likely to reveal KV-pooling degradation, per Q66's MQA-versus-GQA mechanism), a direct latency/memory benchmark under realistic production traffic patterns to confirm the expected KV-cache savings actually materialize end to end, and a staged rollout (canary traffic, gradual ramp) with an explicit rollback plan if production quality metrics regress beyond an agreed threshold — treating the architecture change with the same operational rigor as any other production model swap, not as a purely offline research exercise.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">STAFF</span>Q81. Debate: should head count scale linearly with d_model while holding d_k constant, or should d_k itself grow as d_model grows? What does empirical practice suggest, and what is your recommendation?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The empirical record across model families (Q71) comes down clearly on one side of this debate: successful architectures overwhelmingly hold d_k roughly constant (in the 64–128 band) and scale num_heads to absorb growth in d_model, rather than letting individual heads grow wider as models scale up. The underlying justification is the diminishing-returns argument from Q56 and Q65 combined: there is no strong empirical evidence that wider individual heads meaningfully outperform more numerous heads of stable width, but there is direct evidence (via head-pruning studies, Q55) that even the current, moderate per-head widths already produce meaningful redundancy — suggesting there is little unmet demand for even more per-head capacity that a wider d_k would satisfy. My recommendation for a new architecture would be to follow the empirically validated pattern (stable d_k, scaling num_heads) unless a specific ablation on the target domain and scale shows a concrete, measured benefit to deviating from it — architecture decisions at this level should default to well-replicated empirical precedent over first-principles intuition when the two are in tension and the precedent is this consistent across independently developed model families.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">STAFF</span>Q82. Telemetry shows a fielded MHA model's inference is memory-bandwidth-bound because of KV-cache reads. Propose and justify a migration plan toward GQA, including how you'd measure success and roll back safely.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>First, confirm the diagnosis precisely: profile inference to verify that KV-cache reads specifically (not, say, the feed-forward sublayers or a different bottleneck entirely) dominate the latency budget at the traffic's typical sequence lengths and batch sizes, since a GQA migration is a meaningful engineering investment that should be justified by measured evidence, not assumption. If confirmed, propose an uptraining-based conversion (Q80) targeting a specific num_kv_groups chosen via the Q77-style memory-savings calculation against the observed traffic's sequence-length distribution, rather than an arbitrary group count. Success should be measured on three independent axes before full rollout: (a) quality parity within an agreed tolerance on the production evaluation suite, not just aggregate benchmarks; (b) measured, not just theoretical, latency and memory improvement under realistic replayed production traffic, since real gains depend on serving-stack details beyond the raw KV-cache arithmetic; and (c) no regression on any known-sensitive task category (long-context retrieval, coreference-heavy content) that the Q66 mechanism suggests would be most exposed by reduced KV independence. Roll back safely by keeping the original MHA checkpoint fully available and routable via a traffic-splitting/canary mechanism throughout the rollout, so any of the three validation axes failing in production (not just in offline eval) triggers an immediate, low-friction revert rather than a scramble.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">STAFF</span>Q83. Design an ablation study to determine the "right" number of heads for a new model size, given that full-scale training runs to test every candidate are prohibitively expensive.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>The standard staff-level move is to exploit the fact that head-count sensitivity tends to be reasonably consistent across scale (per the empirical pattern in Q71), so the ablation is run at a smaller, cheaper model scale that still shares the target d_model-to-parameter-budget ratio and training-data mixture as closely as possible, then the resulting preference is extrapolated (with appropriate caution) to the target scale. Concretely: fix d_model at a smaller-scale proxy, sweep a handful of num_heads values that keep d_k within and slightly outside the empirically favored 64–128 band, train each variant for a fixed, modest compute budget on a representative data slice, and compare not just final loss but the loss curve's shape (to catch configurations that are still improving versus ones that have plateaued) plus a small held-out task-quality benchmark. The study design should explicitly budget for the fact that the answer might be "no meaningful difference across a wide range" — which, given the diminishing-returns evidence already discussed, is itself a useful and expected finding, since it means the team can pick a value based on secondary criteria (hardware efficiency, distributed-serving convenience) without sacrificing quality, rather than treating the sweep as having failed if it doesn't produce one clear winner.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">STAFF</span>Q84. How would you explain to a non-technical stakeholder why "just add more attention heads" is not a free quality lever, in a way that supports a resourcing decision?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>The framing that lands with a non-technical stakeholder is a staffing analogy: giving a team more specialists sounds like it should always help, but if you keep splitting the same total headcount into ever-narrower specialties, each specialist eventually has too small a slice of the problem to be individually effective, and beyond some point extra specialists mostly duplicate each other's narrow expertise rather than adding new coverage — which is measurably close to what the underlying research on this exact mechanism (head pruning) has found. The resourcing implication is that head count is not where meaningful quality improvements at this stage are likely to come from cheaply; the levers with better-established returns are overall model size, training data quality and quantity, and fine-tuning effort — so if the team is asking for compute budget, it should be directed toward those levers, with head-count tuning treated as a minor, largely-already-converged architectural knob rather than a promising place to invest additional engineering time.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">STAFF</span>Q85. A new product surface needs extremely long context (1M+ tokens) on a model currently using a fixed GQA group size. Should the attention-head configuration change, and what else would you consider first?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Before touching the attention-head configuration itself, recompute the KV-cache memory math (Q77-style) at the new target sequence length: at 1M+ tokens, even an already-reduced GQA configuration's KV-cache can become enormous simply because it scales linearly with sequence length regardless of head configuration, so the first question is whether the bottleneck at that context length is really about num_kv_groups specifically, or about sequence length itself dominating regardless of group count — in which case orthogonal levers (context compression, retrieval-augmented shortening of what actually reaches the model, sliding-window or sparse attention patterns, or offloading/paging strategies for the KV-cache) are likely to matter more than further shrinking num_kv_groups. If, after that analysis, KV-cache size at the target length still specifically warrants a smaller group count (moving further toward MQA), the decision should go through the same validation rigor as Q82 — measured quality-versus-memory trade-off testing at the actual target context length, since GQA/MQA degradation patterns are not guaranteed to be uniform across short and extremely long contexts, and a group-size choice validated only at typical, shorter lengths may not generalize safely to the new product surface's 1M+ token regime.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">MID</span>Q86. Explain why a model card that only reports "num_heads" without "num_key_value_heads" leaves you unable to determine its attention variant, and what you should ask for instead.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>num_heads alone only tells you how many independent Query projections the model has — under full MHA, GQA, and MQA alike, the query-head count could be identical (say, 32), so this single number cannot distinguish between them. What actually determines the attention variant, and therefore the KV-cache size and inference cost profile, is the separate num_key_value_heads (or equivalently, the number of KV groups) value; without it explicitly reported, you cannot compute the KV-cache savings formula from Q77 or know whether the model behaves closer to full MHA or to MQA. When evaluating a model for a long-context or high-throughput use case, this is a concrete, specific detail worth requesting directly from documentation or a config file rather than assuming from head count alone.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">MID</span>Q87. Explain how you would sketch a 4-head version of the multi-head attention data-flow diagram for d_model=256, and what each head's output width would be.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium (also assigned as a practical exercise)</p>
+<div class="answer">
+<p>With d_model=256 and num_heads=4, d_k = 256/4 = 64 — the same per-head width as the canonical 512/8 example, again illustrating that the same favored d_k value shows up across different d_model/num_heads combinations. The diagram would show the shared 256-dimensional input branching into 4 independent heads, each with its own W_Q/W_K/W_V projecting down to 64 dimensions, each running its own scaled dot-product attention with scaling factor sqrt(64), producing 4 separate 64-dimensional outputs per token, which then concatenate back to 256 dimensions (4 × 64) before passing through a (256 × 256) W_O — structurally identical to the 8-head, d_model=512 diagram in Section 7.1, just at half the width and half the head count.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">MID</span>Q88. If you wanted to add a fifth head to a model originally trained with 4 heads (all else equal), could you simply add one more head's worth of parameters without retraining, and expect it to work?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>No — adding a head changes d_k (since d_k = d_model / num_heads, and now num_heads has increased while d_model presumably stays the same, unless you also change d_model to compensate), which changes the shapes of every head's projection matrices and the input shape W_O expects after concatenation. Even if you kept d_model fixed and simply widened the concatenated output by adding a fifth (randomly-initialized) head while resizing W_O to accept the new, wider input, the four original heads' weights were trained under a specific division of representational labor that assumed only 4 heads shared d_model between them; the new head starts from scratch with no learned specialization, and W_O's resized rows connecting to it start uninitialized-in-context, meaning the combined model would need at least a substantial fine-tuning phase (not full retraining, but real continued training) before the added head contributes anything beyond noise, similar in spirit to the uptraining phase described for GQA conversions in Q60 and Q80.</p>
+</div>
+
 </div>
 
 <hr>

@@ -33,12 +33,12 @@ TRACKS = [
         ("Behavioural & HR", ["01", "02"]),
         ("Core Java", ["03", "04", "05", "06", "07", "08"]),
         ("Spring", ["09", "10", "11", "12", "13"]),
-        ("Testing", ["14"]),
+        ("Testing", ["14", "32"]),
         ("Design Patterns", ["15"]),
         ("APIs & Messaging", ["16", "17", "18"]),
         ("Architecture & Design", ["19", "20", "21"]),
         ("Database", ["22", "23"]),
-        ("DevOps & Cloud", ["24", "25", "26"]),
+        ("DevOps & Cloud", ["24", "25", "26", "31"]),
         ("Version Control & Build Tools", ["27", "28"]),
         ("Problem Solving (DSA)", ["29"]),
         ("Mock Interview", ["30"]),
@@ -64,7 +64,8 @@ TRACKS = [
         ("Enterprise AI Engineering", ["64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75"]),
         ("AI Production Projects", ["76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87"]),
         ("Advanced & Specialized Topics", ["88", "89", "90", "91", "92", "93"]),
-        ("AI Engineer Interview Question Bank", ["94", "95", "96", "97", "98", "99"]),
+        ("AI Engineer Interview Question Bank", ["94", "95", "96", "97", "98", "99", "100"]),
+        ("Problem Solving (DSA)", ["101"]),
     ]),
 ]
 
@@ -178,6 +179,8 @@ TITLES = {
         "97": "AI Agents, Tool Calling & MCP Interview Questions",
         "98": "Spring AI & Production AI Engineering Interview Questions",
         "99": "LLMOps, Fine-Tuning & Safety Interview Questions",
+        "100": "AI Engineer Behavioural & Career Interview Questions",
+        "101": "Data Structures & Algorithms for AI/ML Engineers",
     },
     "java": {
         "01": "Introduction & HR",
@@ -210,6 +213,8 @@ TITLES = {
         "28": "Build Tools (Maven & Gradle)",
         "29": "Data Structures & Algorithms",
         "30": "Mock Interview — 1000 Questions",
+        "31": "CI/CD Pipelines (Jenkins, GitHub Actions & GitLab CI)",
+        "32": "Integration & Contract Testing (Testcontainers & Pact)",
     },
     "react": {
         "01": "Introduction & HR",
@@ -246,7 +251,7 @@ TITLES = {
 }
 
 def find_file(folder, num):
-    # num-width-agnostic, though every track currently fits in 2 digits (<=99 chapters)
+    # num-width-agnostic (java/react are <=99 chapters; ai-engineering has crossed into 3 digits)
     matches = glob.glob(os.path.join(ROOT, folder, num + "-*.html"))
     matches = [m for m in matches if os.path.basename(m)[:len(num)] == num]
     if not matches:

@@ -612,6 +612,533 @@ Observability data is, itself, a security and privacy surface that is easy to ov
 <p>Pre-production test suites can only exercise inputs someone anticipated writing a test for, but the real distribution of user inputs to an LLM-backed feature is unbounded — so testing alone is necessarily incomplete for this class of system. Observability, especially the quality/evaluation telemetry pillar, functions as continuous testing against the real, live input distribution: it catches regressions and failure modes a static test suite never imagined, feeds real production failures back into the test suite (turning "surprises in production" into "regression tests going forward"), and gives you the evidence needed to know whether a prompt or model change actually improved things rather than just feeling like it did. A staff engineer treats testing and observability as one continuous feedback loop, not two separate disciplines owned by two separate teams.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. What is a Micrometer <code>Observation</code>, and what does <code>Observation.NOOP</code> mean for performance when no handlers are registered?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>An <code>Observation</code> is Micrometer's unified representation of "one unit of work worth observing" — it carries a name, a context of key-values, a start/stop lifecycle, and notifies every registered <code>ObservationHandler</code> on start, stop, and error. When an <code>ObservationRegistry</code> has no handlers registered (for example, Actuator and Micrometer Tracing are not on the classpath), Micrometer returns <code>Observation.NOOP</code> — a no-op implementation whose start/stop calls do essentially nothing. This means Spring AI's instrumentation call sites are always present in the code, but cost almost nothing when observability isn't configured, which is why enabling full tracing and metrics later requires no code changes at all.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. What is an <code>ObservationRegistry</code>, and how does a Spring AI <code>ChatClient</code> obtain one?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The <code>ObservationRegistry</code> is the central object that holds the configured set of <code>ObservationHandler</code>s and observation-level configuration (predicates, filters, conventions). Spring Boot auto-configures one automatically once Actuator plus a Micrometer registry/tracing bridge are on the classpath, and registers it as a bean. Spring AI's autoconfiguration picks up that bean and wires it into the <code>ChatClient</code> and <code>ChatModel</code> implementations without any explicit developer action — you get instrumentation "for free" the moment the dependencies are present, and a no-op registry otherwise.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">MID</span>Q11. How does the Observation API differ from the older AOP-based <code>@Timed</code> annotation approach to metrics?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>@Timed</code> is a single-purpose annotation that only produces a Micrometer <code>Timer</code> metric around a method call, using Spring AOP proxying. The Observation API is a unified abstraction that simultaneously drives metrics, traces, and any other registered handler (custom logging, alerting hooks) from one instrumentation call site, and it works at arbitrary granularity inside a method — not just "around this whole method" — which is exactly what Spring AI needs to create nested spans for retrieval, the model call, and each tool invocation within a single <code>ChatClient.call()</code> invocation.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">MID</span>Q12. Name the two <code>ObservationHandler</code> implementations that turn a Spring AI Observation into a trace and into metrics, respectively, and explain how both fire from the same instrumentation.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><code>TracingObservationHandler</code> converts the Observation into a span, attaches it to the current trace context, and exports it (via Micrometer Tracing's OTel bridge) to a tracing backend. <code>MeterObservationHandler</code> converts the same Observation's duration and key-values into Micrometer <code>Timer</code>/<code>Counter</code> instruments, exported to a metrics backend like Prometheus. Because both handlers are registered on the same <code>ObservationRegistry</code> and are notified from the same <code>observation.start()</code>/<code>stop()</code> lifecycle call, Spring AI code never has to call "log this," "trace this," and "meter this" separately — one instrumented call site feeds every pillar.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. What is an <code>Observation.Context</code>, and how does it relate to low- and high-cardinality key-values?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The <code>Observation.Context</code> is the mutable data container attached to an Observation for its lifetime — it holds the request/response objects being observed plus two separate collections of key-values: low-cardinality (bounded, safe to become metric tags — model name, provider, operation type) and high-cardinality (unbounded, safe only for trace spans and logs — prompt text, completion text). <code>ObservationConvention</code> implementations read from the context to populate these two collections, and <code>MeterObservationHandler</code> deliberately only reads the low-cardinality set when building metric tags, which is the actual mechanism enforcing the cardinality discipline described elsewhere in this chapter.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">MID</span>Q14. How would you add a custom low-cardinality tag — say, <code>feature.name</code> — to every <code>ChatClient</code> observation without editing every call site?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Implement a custom <code>ChatClientObservationConvention</code> (typically by extending <code>DefaultChatClientObservationConvention</code>) that overrides <code>getLowCardinalityKeyValues()</code> to append your tag — reading it from a value stored in the request context, a thread-local, or a request-scoped bean — then register it either as a bean that Spring AI's autoconfiguration picks up, or explicitly via <code>ChatClient.Builder.defaultRequest(...)</code> combined with an <code>ObservationRegistryCustomizer</code>. Because the convention is applied uniformly by the framework at every call, you get the tag on every trace and every metric without touching individual service methods.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">MID</span>Q15. If Micrometer Tracing and Actuator are not on the classpath, does a Spring AI application fail to start, or does anything else break?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Nothing breaks. Spring AI's Observation calls are always present, but with no handlers registered the <code>ObservationRegistry</code> falls back to <code>Observation.NOOP</code> (Q9), so the calls execute as near-zero-cost pass-throughs. The application starts and functions identically from a business-logic perspective — you simply get no traces, no metrics, and none of the token/cost visibility described in this chapter, which is precisely why "we'll add observability later" is a viable but risky deferral: it costs nothing to enable early, and costs you blind production debugging to skip.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">JUNIOR</span>Q16. What's the difference between <code>ChatClientObservationConvention</code> and <code>ChatModelObservationConvention</code>, and why does Spring AI need both?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><code>ChatClientObservationConvention</code> governs the outer span/metric for a whole <code>ChatClient</code> call, including the Advisor chain (retrieval, memory, logging). <code>ChatModelObservationConvention</code> governs the inner span/metric for the actual model invocation only. They're separate because one <code>ChatClient</code> call can trigger more than one underlying model call — most obviously during a tool-calling loop — so the framework needs an outer span representing "the whole logical request" and one inner span per actual model round trip, which is what lets a trace waterfall show two <code>chat.model</code> spans nested under one <code>chat.client</code> span.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">MID</span>Q17. Why does a tool-calling loop that makes two sequential model calls produce two separate <code>chat.model</code> spans rather than one longer one?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Because each round trip to the model is a distinct, separately-timed unit of work with its own token usage, its own latency, and potentially its own outcome (one call might error while the retry succeeds). Collapsing them into a single span would hide exactly the information a debugging engineer needs — for instance, whether the first call's latency was dominated by the model deciding to invoke a tool versus the second call's latency being dominated by synthesizing a final answer from the tool's result. Keeping them separate, nested under the outer <code>chat.client</code> span, preserves that attribution.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">MID</span>Q18. Explain <code>gen_ai.system</code>, <code>gen_ai.request.model</code>, and <code>gen_ai.response.model</code> — why do you need both a request and a response model attribute?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p><code>gen_ai.system</code> identifies the provider (e.g. <code>openai</code>, <code>anthropic</code>). <code>gen_ai.request.model</code> is the model identifier your code asked for; <code>gen_ai.response.model</code> is the model identifier the provider actually reports having used. These can legitimately differ — providers sometimes route a stable alias to a different underlying model version behind the scenes — and capturing both is the only way to detect that kind of silent drift, since your own deployment history won't show any change corresponding to a quality or latency shift caused by the provider's routing decision.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">MID</span>Q19. What should you know about the stability of the OpenTelemetry GenAI semantic conventions before building dashboards on top of the raw <code>gen_ai.*</code> attribute names?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>As of this writing, the GenAI semantic conventions are still marked experimental/evolving within OpenTelemetry — attribute names, especially around prompt/completion content capture and tool-calling attributes, have changed shape as the spec matures. Building dashboards and alerts directly against raw attribute names without an abstraction layer means a spec revision (or a Spring AI version bump that follows it) can silently break your queries. A defensive pattern is to normalize onto your own stable internal metric/attribute names at the dashboard layer, or pin your OTel/Spring AI versions deliberately and review the changelog before bumping.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">MID</span>Q20. Why are prompt tokens and completion (generation) tokens tracked as separate numbers rather than one combined "tokens used" figure?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Most providers price input and output tokens differently — output tokens are typically several times more expensive per token than input tokens — so a combined total is useless for cost calculation. The two numbers also behave differently operationally: prompt tokens grow with context size (retrieved documents, conversation history, system prompt), while completion tokens grow with how verbose the model chooses to be, which is a signal of its own (a sudden jump in completion tokens with the same prompt size often indicates a prompt regression or a model behavior change worth investigating on its own).</p>
+</div>
+
+<div class="question" id="q21"><span class="level">MID</span>Q21. What operational discipline is required to keep a token-to-cost pricing table accurate over time?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Provider pricing changes independently of your deploys, and different models from the same provider are priced differently, so the per-token price table your cost dashboard multiplies against must be versioned and updated out-of-band from application releases — typically as external configuration (a small database table or config service) rather than a hard-coded constant, keyed by <code>gen_ai.system</code> plus <code>gen_ai.response.model</code>. Treat stale pricing data as a silent-but-real bug class: your dashboard will keep producing numbers, they'll just be quietly wrong.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">SENIOR</span>Q22. Design cost attribution for a multi-tenant SaaS product where several customer organizations share the same Spring AI service.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Attach a low-cardinality <code>tenant.tier</code> (e.g. free/pro/enterprise, a handful of values) as a metric tag for aggregate per-tier cost dashboards, but keep the actual high-cardinality <code>tenant.id</code> off metrics entirely — put it on trace spans and on a separate, purpose-built cost-ledger event stream (a Kafka topic or dedicated table written from a custom <code>ObservationHandler</code>) that is not a Prometheus time series. Aggregate per-tenant cost asynchronously from that ledger, not from the metrics backend, so you get exact per-tenant billing data without ever creating one Prometheus series per tenant.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Mention that this ledger doubles as the enforcement point for per-tenant budget caps — a scheduled job or streaming aggregation can compare running spend against a tenant's plan limit and raise an alert or throttle before the tenant's bill becomes a support incident.</div>
+
+<div class="question" id="q23"><span class="level">MID</span>Q23. Are embedding model calls observed the same way chat model calls are in Spring AI?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes — Spring AI applies the same Observation-based pattern to <code>EmbeddingModel</code> calls via an <code>EmbeddingModelObservationConvention</code>, producing spans and metrics tagged with the embedding model name, provider, and dimensionality, with token usage captured the same way as chat calls. This matters because embedding calls happen on every RAG ingestion and every retrieval query, often at far higher volume than chat calls, so their aggregate cost and latency deserve the same dashboard treatment rather than being an invisible line item hidden inside a "retrieval" span.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. What does a <code>VectorStoreObservationConvention</code> typically tag a retrieval span with, and why are those specific tags chosen?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Typically the vector store implementation name (e.g. <code>pgvector</code>, <code>pinecone</code>), the collection/index name, and the requested <code>top_k</code> — all low-cardinality and directly useful for answering "is retrieval slow because of this specific index" or "did we change top_k and did that change latency or answer quality." The actual query embedding vector and the retrieved document IDs/content are deliberately kept off the low-cardinality tag set for the same cardinality reason prompts are — they belong in a trace's detailed payload or a log, not a metric label.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">SENIOR</span>Q25. Walk through the full span hierarchy you would design for a production RAG-plus-tool-calling pipeline, naming each span and its key tags.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Root: <code>http.server.request</code> (path, status). Child: <code>chat.client</code> (feature name, prompt version). Its children, in call order: <code>advisor.retrieval-augmentation</code> (vector store, top_k, doc count returned), <code>advisor.chat-memory</code> (conversation id — kept off metrics), one or more <code>chat.model</code> spans (provider, request/response model, input/output tokens) — more than one if the model requests tools — and, sibling to those, one <code>tool.call</code> span per tool invocation (tool name, success/failure, latency). This mirrors exactly the waterfall structure shown earlier in this chapter, and each span's low-cardinality tags roll up into per-stage latency and error-rate metrics without needing a second instrumentation pass.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Add that you'd also give the outer <code>chat.client</code> span a derived attribute for total token count and estimated cost at close time, computed by summing the child <code>chat.model</code> spans — this lets a single trace answer "what did this exact request cost" without a separate query.</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. What is an <code>ObservationFilter</code>, and what's a concrete use case for one in an AI observability pipeline?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>An <code>ObservationFilter</code> is a hook that can inspect and mutate an <code>Observation.Context</code> before it's handed to handlers — every registered filter runs on every observation. A concrete use case is PII redaction: a filter that scans the high-cardinality prompt/completion key-values for patterns like email addresses, account numbers, or credit-card-shaped strings and replaces them with a redaction marker before the context ever reaches <code>TracingObservationHandler</code>, guaranteeing raw sensitive content never leaves the process boundary even if a downstream Collector-level redaction step is misconfigured.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">SENIOR</span>Q27. Should PII redaction for LLM telemetry happen in application-level <code>ObservationFilter</code>s, at the OpenTelemetry Collector, or both — what are the tradeoffs?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Collector-level redaction centralizes policy — one processor configuration enforced consistently across every service, easy to audit and update without redeploying application code — but it means raw content briefly exists in the exporter and the network hop to the Collector, and it requires every team to trust the same shared processor. Application-level <code>ObservationFilter</code> redaction guarantees content never leaves the process at all, which matters for the strictest compliance regimes, but is easy to implement inconsistently across a dozen teams. The pragmatic answer is defense in depth: filter obviously sensitive patterns (structured PII you can regex reliably) at the application layer as a backstop, and rely on the Collector for the primary, centrally-governed policy, since content that isn't obviously structured PII (free-text customer complaints, say) is easier to catch with a shared, tunable Collector processor than a hundred bespoke regexes scattered across services.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">MID</span>Q28. What is an <code>ObservationPredicate</code>, and when would you use one to suppress observation entirely rather than filter its content?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>An <code>ObservationPredicate</code> decides, before an Observation even starts, whether it should be observed at all — returning false makes it a no-op for that call. A typical use is suppressing observation of internal health-check or warm-up calls to a <code>ChatModel</code> (some teams issue a lightweight "ping" completion to keep a connection pool warm) so they don't pollute latency percentiles and cost dashboards with synthetic traffic that isn't representative of real user requests.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">SENIOR</span>Q29. Production cost jumped 5x overnight with no corresponding traffic increase. Walk through how you'd diagnose this using the telemetry described in this chapter.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Start at the cost-per-feature dashboard (built from token metrics tagged by feature and model, Section 6.2) to isolate which feature's cost rose, ruling out a platform-wide issue if only one feature spiked. Check whether average completion tokens per request rose for that feature — a common cause is a prompt or retrieval change that now stuffs far more context into every call, or a model that started generating longer, more verbose completions after a provider-side update (check <code>gen_ai.response.model</code> for a silent version change). If completion tokens per request look flat, check the trace waterfall for evidence of a tool-calling loop firing more model round trips per request than before — a runaway agent loop multiplies cost by request count of model calls, not by tokens per call, and would be invisible in a per-call token metric alone but obvious in a "model calls per trace" count.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Note that this is exactly why "model calls per outer chat.client span" is worth tracking as its own metric, not just total tokens — it's the single fastest signal for catching an agent loop before it becomes a five-figure bill.</div>
+
+<div class="question" id="q30"><span class="level">MID</span>Q30. What is <code>TestObservationRegistry</code>, and why would you write a test against your own observability instrumentation rather than trusting it works?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>TestObservationRegistry</code> is Micrometer's in-memory test double for an <code>ObservationRegistry</code> that lets a test assert exactly which observations were started, what key-values they carried, and whether they completed successfully or with an error — without standing up a real tracing or metrics backend. You'd write such a test because instrumentation is code, and code silently regresses: a refactor that accidentally drops a custom <code>ChatClientObservationConvention</code> from the builder chain, or removes a tag, produces no compile error and no functional test failure, only a quietly worse production dashboard weeks later — asserting on the observation itself catches that class of regression before it ships.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">SENIOR</span>Q31. Why does streaming fundamentally complicate both span-duration measurement and the reporting of token usage?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The Observation's span can only close once the stream is fully drained, because final response metadata — including the completion token count — is typically only available after the last chunk arrives (some providers include a usage payload only on the terminal chunk). This means span duration measures "time to fully consume the stream," not the perceived latency a chat UI actually delivers to a user, which is dominated by time-to-first-token. It also means any dashboard slicing "latency" for streaming versus non-streaming endpoints together is comparing two different things unless you separately instrument TTFT, since a fast-to-first-token but slow-to-finish stream will look identical to a genuinely slow non-streaming call in the aggregate span-duration metric alone.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. Concretely, how would you instrument time-to-first-token separately from total Observation span duration?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Record a timestamp when the stream subscription is established (or the request is sent) and a second timestamp the moment the first chunk arrives in your <code>Flux&lt;ChatResponse&gt;</code> subscriber, then emit the delta as a custom Micrometer <code>Timer</code> — a separate meter from the framework's own span-duration timer, tagged the same way (model, feature) so it can sit alongside it on a dashboard. This has to be custom instrumentation because the standard <code>ChatModelObservationConvention</code> only knows the observation's start and stop boundaries, not an intermediate "first chunk received" event.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">SENIOR</span>Q33. Compare head-based and tail-based trace sampling, and explain specifically why an OpenTelemetry Collector is usually required to implement tail-based sampling well.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Head-based sampling decides whether to keep a trace at the moment it starts, before its outcome is known — cheap and simple, but by definition it samples uniformly at random and cannot preferentially keep the errored or slow traces you most want to debug. Tail-based sampling defers the keep/drop decision until the trace is complete, so it can check "did this error, did it exceed a latency threshold" and keep those with much higher probability than routine successful traffic. Implementing tail-based sampling requires buffering every span of a trace somewhere until the whole trace finishes, which single application instances generally can't do reliably for traces that fan out across services — this is exactly the job an OpenTelemetry Collector (or a dedicated sampling processor tier) is built for: it aggregates spans centrally, applies the tail-based policy once the trace is complete, and only then forwards the decision to your backend.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Point out the storage math: if 1% of requests error and you tail-sample to keep 100% of errors plus 5% of successes, you retain far fewer total traces than a flat 10% head sample while guaranteeing you never lose the trace for an incident you'll actually need to investigate.</div>
+
+<div class="question" id="q34"><span class="level">MID</span>Q34. What's the difference between trace context propagation and baggage propagation, and when would you use baggage in a Spring AI pipeline?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Trace context propagation (the W3C <code>traceparent</code> header) carries only the trace ID and current span ID needed to assemble the span tree. Baggage is a separate, general-purpose key-value mechanism that also propagates across the same hops but carries arbitrary business context you want available anywhere downstream — for example, a <code>tenant.tier</code> or <code>experiment.variant</code> value set once at the entry point and automatically available to a low-cardinality tagging convention deep inside a tool call in another service, without threading it through every method signature by hand.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">SENIOR</span>Q35. A user reports a wrong answer, but there's no exception anywhere in the logs. Using only traces and metrics — no re-running the request — how do you reconstruct what went wrong?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Locate the specific trace (via trace ID if you have log-trace correlation via MDC, or by timestamp/user tag on the trace itself). Walk the span waterfall: check the retrieval span's tags and, if captured, the retrieved document set — a common root cause is retrieval returning stale or irrelevant documents, which a fast, error-free retrieval span won't reveal unless you look at what it actually returned. Check the <code>chat.model</code> span's captured prompt (if high-cardinality capture is enabled for this trace) to see exactly what context the model was given, and compare <code>gen_ai.response.model</code> against what you expect — a silent provider-side model swap is a frequent, otherwise-invisible cause of a quality regression with no error signal at all.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Mention that this is the strongest practical argument for capturing full prompt/completion content on at least a sampled fraction of traffic — without it, this exact investigation dead-ends at "the trace shows it was fast and error-free," which answers nothing about why the answer was wrong.</div>
+
+<div class="question" id="q36"><span class="level">SENIOR</span>Q36. How specifically does observability let you catch a provider silently changing the model behind a stable alias, and what would you alert on?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Track <code>gen_ai.response.model</code> as a metric dimension (it's low-cardinality — a handful of concrete model versions) alongside your requested <code>gen_ai.request.model</code> alias, and alert on a change in the distribution of response-model values for a given request-model alias over a short window — for example, if 100% of responses for alias <code>gpt-4o</code> were reporting one specific dated snapshot last week and a new snapshot value starts appearing this week, that's a provider-side rollout worth knowing about proactively, before a user-facing quality complaint forces you to investigate reactively.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">MID</span>Q37. Why is it risky to tag a metric with a tool call's arguments (e.g. <code>tool.args</code>), even though tool names themselves are usually safe low-cardinality tags?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The tool <em>name</em> is drawn from a small, fixed set defined by your application (low cardinality, safe for metrics), but the tool's <em>arguments</em> are model-generated free text or structured values that vary per call and can be effectively unbounded — a search-tool query argument or an order-ID argument behaves exactly like a user prompt for cardinality purposes. The same rule that keeps prompt text off metrics applies here: tool name goes on the metric tag, tool arguments go only on the trace span's detailed attributes or a log.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">SENIOR</span>Q38. How would you integrate Resilience4j circuit-breaker and retry metrics with your Spring AI Observation-based telemetry so a trace shows the full retry story?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Resilience4j already publishes its own Micrometer metrics (circuit breaker state, retry attempt counts) onto the same <code>MeterRegistry</code> Spring AI's <code>MeterObservationHandler</code> writes to, so both show up side by side in the same Prometheus/Grafana instance without extra wiring. For trace-level visibility, wrap the retry-decorated model call so each retry attempt creates its own child span (or an event on the parent <code>chat.model</code> span) tagged with an attempt number — otherwise a trace shows only the final successful call's duration and hides that it took three attempts and a circuit-breaker half-open probe to get there, which is exactly the kind of degraded-but-not-failed behavior worth surfacing.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">MID</span>Q39. A structured-output call (using Spring AI's structured output converter) fails to parse the model's JSON but the call itself doesn't throw an exception the caller notices. How do you make this failure mode visible in telemetry?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Wrap the parsing step itself in its own small Observation, or at minimum increment a dedicated Micrometer counter (e.g. <code>gen_ai.structured_output.parse_failure</code>, tagged by model and feature) whenever the converter has to fall back, repair, or the parse otherwise doesn't cleanly succeed on the first attempt — since a caught-and-repaired parse failure is functionally a quality signal even though it never surfaces as an exception to calling code. Without this, "did structured output ever fail to parse" is invisible in both logs (no exception) and standard error-rate metrics (no HTTP error), which is exactly the "plausible but subtly wrong" failure mode this chapter's Section 4.2 describes.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">SENIOR</span>Q40. Design tracing and alerting for a service that routes requests to a primary model and falls back to a secondary model on failure.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Give the routing decision its own low-cardinality tag (<code>gen_ai.route</code> = primary/fallback) on the outer span and on the resulting metrics, so latency, cost, and error-rate dashboards can be sliced by route — a fallback model is often slower, cheaper or more expensive, or lower quality, and conflating the two routes hides that. Alert specifically on fallback-route volume as a rate metric: a sudden spike in fallback usage is itself an incident signal (the primary provider is degraded) even if overall error rate looks fine because the fallback is successfully absorbing the failures — without a route tag, that entire incident is invisible to a dashboard that only tracks aggregate success rate.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">MID</span>Q41. What are exemplars, and how do they help you go from "this Prometheus metric spiked" to "here's the exact trace that caused it"?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>An exemplar is a sampled trace ID attached to a specific metric data point (typically on a histogram bucket) at the moment it was recorded, supported by Prometheus's native histogram/exemplar storage and surfaced in Grafana as a clickable point on a latency or error graph. Practically, this means when you're staring at a p99 latency spike on a dashboard, you can click directly into one of the actual traces that contributed to that data point instead of separately searching your tracing backend by timestamp and hoping you find the right request — it closes the gap between "the aggregate metric" and "the individual trace" pillars.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">SENIOR</span>Q42. What concrete alerting thresholds would you set up for a production RAG agent, and why those specific signals?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Cost-rate alert (spend per minute/hour exceeding a rolling baseline by some multiple) catches runaway loops and prompt regressions fastest, since cost reacts before most other signals. Latency p95/p99 alert (not mean, per Section 6.1) catches degraded provider or tool performance. Error-rate alert on both the model call and each tool call separately, since a healthy overall error rate can hide one consistently-failing tool. Token-count anomaly alert (completion tokens per request deviating sharply from a rolling baseline) catches verbosity regressions before they show up purely as cost. And a fallback-route or retry-rate alert (Q40/Q38) catches upstream provider degradation that hasn't yet become a hard failure. Each of these is chosen because it fires meaningfully earlier than "users are complaining," which is the failure mode a good alerting design is trying to avoid.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. Describe the mechanics of correlating a log line with a specific trace via MDC.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>An <code>ObservationHandler</code> (or, more commonly, Micrometer Tracing's built-in log correlation support) copies the current trace ID and span ID from the active tracing context into SLF4J's MDC (Mapped Diagnostic Context) at the start of each request/span, so every log statement emitted during that scope automatically includes those IDs if your log pattern references them (e.g. <code>%X{traceId}</code> in a Logback pattern). This is what makes "click a trace in Zipkin, then pivot straight to the matching application log lines in your log aggregator" possible — both are keyed by the same ID without any manual correlation logic in your business code.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">SENIOR</span>Q44. What does a classical APM dashboard (request count, latency, error rate) get right for an AI feature, and what does it fundamentally miss?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It gets infrastructure health right — an AI feature is still an HTTP endpoint backed by a service, and knowing its request volume, latency distribution, and hard-error rate is necessary and directly reusable, which is exactly why Spring AI plugs into the same Micrometer/Actuator stack rather than building a parallel one (Section 9). What it fundamentally misses is everything this chapter's fourth pillar covers: per-request cost as a first-class, highly variable number; correctness, since a 200 OK response can still be a wrong answer; and non-determinism, since the same request can legitimately behave differently on repeat calls, which breaks the implicit APM assumption that a given endpoint's behavior is stable enough that "it's erroring more than usual" is the main thing worth watching for.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">SENIOR</span>Q45. Design telemetry specifically aimed at catching and limiting an agent that can loop indefinitely, repeatedly calling tools without converging on an answer.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Track "model calls per outer <code>chat.client</code> span" and "tool calls per outer span" as histograms, not just counts — a healthy distribution clusters around a small number (often 1–3), and a request landing far out on that histogram's tail is a strong runaway-loop signal worth alerting on directly, independent of whether it eventually terminates or hits a hard iteration cap. Enforce a hard maximum tool-call-round cap in code (a circuit breaker on the agent loop itself, not just on individual tool calls) and tag any request that hits that cap with a distinct <code>agent.loop_capped=true</code> low-cardinality attribute, so you can measure how often the safety net actually fires — a nonzero, growing rate of capped requests is itself an early warning that something in the prompt or tool design is encouraging non-convergent behavior, even before any single incident is expensive enough to notice from cost alone.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Tie this back to Q29's cost-spike scenario — a "model calls per trace" histogram is the metric that turns that reactive, after-the-fact investigation into a proactive alert that fires before the bill does.</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. If the underlying HTTP client to the model provider silently retries a request under the hood, how do you make that retry visible rather than have it hide inside one span's duration?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A retry that happens entirely inside the HTTP client layer, below Spring AI's own Observation, will indeed just inflate the outer span's duration with no separate attribution unless you add instrumentation at that layer too — either by configuring the HTTP client's own interceptor to emit a child span per attempt, or by exposing a retry-count attribute on the final response that gets attached to the <code>chat.model</code> span as a custom key-value. Without this, a request that "took 4 seconds because of two silent retries" looks identical in a trace to "took 4 seconds because the model was genuinely slow once" — two very different operational stories that call for different fixes.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">SENIOR</span>Q47. Explain the architecture and reasoning for running quality/evaluation telemetry as an asynchronous, sampled pipeline rather than inline with the user-facing request.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>An LLM-as-judge evaluation is itself a model call, so running it synchronously before responding to the user doubles the request's latency and cost for every single request — a cost that scales with production traffic rather than with how much evaluation signal you actually need. Instead, sample a fraction of production traces (weighted toward flagged or unusual traces via the same tail-based logic used for tracing) into a queue or event stream, score them asynchronously against a separate evaluation service, and write the resulting quality score back as a metric tagged by model/prompt version — decoupled from the request's critical path entirely, at the cost of the evaluation signal lagging real time by however long the async pipeline takes to catch up.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">MID</span>Q48. What criteria would you use to decide what fraction of production traffic gets full prompt/completion content capture versus metrics-only visibility?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Weigh storage/compliance cost against debugging value: 100% capture gives you the ability to fully reconstruct any past request but multiplies storage cost and expands your PII exposure surface to every request rather than a subset (Section 12/13). A common pragmatic split is metrics-only for 100% of traffic (cheap, low risk), full-content capture for a random sample (a few percent, enough to catch systemic issues and feed the async eval pipeline), and full-content capture forced to 100% for any request that errors or that a user explicitly flags with feedback — mirroring the tail-based sampling logic used for latency in Q33, applied to content capture instead.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">SENIOR</span>Q49. What does "right to be forgotten" (GDPR-style deletion requests) imply for a trace store that has been capturing user prompts?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>If prompt/completion content in your traces can contain personal data, then a deletion request obligates you to be able to find and purge that specific user's captured content from the trace/log store, not just from your primary application database — which most tracing backends were not originally designed to support efficiently, since they're optimized for time-ordered ingestion and retrieval, not per-user deletion. Practically, this pushes teams toward either tagging traces with a user/session identifier specifically to make targeted deletion possible, aggressively short retention windows for full-content traces (Section 12 already recommends a few weeks) so the problem shrinks on its own, or routing anything containing personal data to a separate store with proper data-subject-request tooling rather than the general-purpose tracing backend.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">MID</span>Q50. What specific responsibilities does the OpenTelemetry Collector take on in a Spring AI observability pipeline, beyond simply forwarding data?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Batching (aggregating many small span/metric exports into fewer, larger network calls to reduce overhead — Section 12), PII redaction as a centrally-governed processor (Q27), tail-based sampling decisions that require seeing a complete trace (Q33), protocol translation (accepting OTLP and re-exporting in a backend-specific format if needed), and fan-out to multiple destinations simultaneously — a trace can go to both a general tracing backend like Jaeger and a specialized LLM evaluation platform like Langfuse from the same Collector pipeline, without your application code knowing or caring how many downstream consumers exist.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. Two prompt versions are running as a canary. How would you structure tags and dashboards to compare their cost and quality fairly?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Attach a <code>prompt.version</code> low-cardinality tag (a handful of values — v13, v14) to every relevant span and metric at the point the prompt is constructed, so it flows through to token/cost metrics, latency, and — critically — the async quality-evaluation score, all sliceable by that one dimension. Compare cost-per-request, latency, and quality score side by side, filtered to the same time window and, ideally, the same traffic segment (random assignment, not "v14 only ran during off-peak hours," which would confound the comparison) — the same rigor you'd apply to any other A/B test, just with cost and an LLM-judge quality score as additional metrics beyond the usual conversion/engagement numbers.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">MID</span>Q52. Give the intuition for why p99 latency, not mean latency, is the number a staff engineer asks for first when investigating an LLM-backed feature.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Mean latency is pulled toward the bulk of fast, ordinary requests and can look perfectly healthy even while a meaningful minority of requests — often the ones involving a tool call, a longer generation, or provider-side queuing — take several times longer. p99 latency specifically answers "how bad is the worst 1% of experience," which is usually where user complaints originate, since a fast average with a bad tail means most users are fine but a nontrivial number are having a genuinely poor experience that the average is actively hiding from whoever only looks at that one summary number.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">SENIOR</span>Q53. The retrieval span shows consistently fast latency, but answer quality has degraded over the past week according to your eval pipeline. What would you check?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Fast retrieval says nothing about relevance — check whether the documents actually being retrieved (visible in traces with content capture enabled, or in retrieval-specific logging) have drifted, which can happen if the underlying corpus changed (new documents pushed the old, correct ones further down similarity rankings), if the embedding model was silently updated by the provider, or if a re-indexing job introduced stale or duplicate entries. Also check <code>gen_ai.response.model</code> for a silent model swap (Q36) independent of retrieval entirely, since degraded generation quality with unchanged retrieval quality points at the model call itself rather than the RAG pipeline's retrieval stage.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">STAFF</span>Q54. As the staff engineer responsible for observability governance across a dozen teams building Spring AI features, how do you prevent <code>gen_ai.*</code> attribute schema drift between teams?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Publish and version an internal schema — effectively a thin org-specific extension of the OpenTelemetry GenAI semantic conventions covering exactly which custom low-cardinality tags (feature name, prompt version, tenant tier) are standard and what values they may take — as a shared library artifact (a small Spring Boot starter providing a pre-built <code>ObservationRegistryCustomizer</code>) rather than a wiki page teams are expected to remember to follow. Enforce it with a lightweight contract test each service runs in CI, using <code>TestObservationRegistry</code> (Q30), asserting the expected tags are present on a sample call — schema drift caught in CI before merge is categorically cheaper than schema drift discovered when someone's cross-team dashboard silently stops working.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Add that you'd own this the same way a platform team owns a shared logging format — as a small piece of internal infrastructure with an explicit owner, a changelog, and a deprecation policy, not as an informal convention that erodes the moment the person who set it up moves teams.</div>
+
+<div class="question" id="q55"><span class="level">SENIOR</span>Q55. Explain mechanically how a single <code>Observation</code>'s start/stop lifecycle becomes an aggregated Micrometer <code>Timer</code> with percentile output, across potentially millions of requests.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Each Observation's <code>stop()</code> call hands its duration and low-cardinality key-values to <code>MeterObservationHandler</code>, which looks up (or creates, on first occurrence of a given tag combination) a <code>Timer</code> instrument in the <code>MeterRegistry</code> keyed by the observation's name plus that exact set of tag values, then records the duration into it. The <code>Timer</code> itself maintains a bounded-memory histogram (not every raw sample) that a Prometheus-backed registry can later expose as pre-computed percentile buckets on scrape, which is how thousands of individual, ephemeral Observations become one stable, queryable p95/p99 time series per tag combination without unbounded memory growth.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">STAFF</span>Q56. You need to build a cost dashboard for product managers, not engineers. What would you deliberately simplify away from the engineering-facing telemetry?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Drop per-model, per-provider technical dimensions (<code>gen_ai.system</code>, request vs. response model) in favor of business-meaningful dimensions — feature name, customer tier, time period — and present cost as dollars-per-day-per-feature and cost-per-active-user rather than tokens or Prometheus rate expressions. Surface trend and anomaly ("cost is up 40% week over week for Feature X") rather than raw time series, since a PM's actionable question is "should we be worried and about what," not "what's the exact shape of the p99 curve." The underlying data source is identical to the engineering dashboard — same token/cost metrics from Section 6.2 — only the aggregation and presentation layer changes for the audience.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. How would you detect retrieval or embedding drift over time purely from observability signals, without a labeled evaluation dataset?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Track proxy signals that correlate with retrieval quality even without ground truth: the distribution of similarity scores returned by the vector store (a downward drift in typical top-1 similarity score for the same query mix suggests the corpus or embeddings have drifted relative to what users are asking), the rate at which the RAG pipeline falls back to a "no relevant documents found" path, and downstream completion-token counts (a model padding out answers with hedging or generic content is a mild signal that retrieved context stopped being useful). None of these prove a quality regression on their own, but a sustained trend across several of them together is a strong enough signal to trigger a manual quality audit or an eval-pipeline run targeted at that feature specifically.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">STAFF</span>Q58. Your organization is migrating from one model provider to another. What must your observability layer preserve so historical dashboards and alerts remain meaningful across the migration?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Because Spring AI normalizes token usage, latency, and error handling behind provider-agnostic abstractions (<code>ChatModel</code>, <code>Usage</code>, <code>ChatResponseMetadata</code> — Section 9), the metric and span shapes themselves don't need to change; what does need explicit handling is the <code>gen_ai.system</code>/<code>gen_ai.request.model</code> tag values changing, which will make Prometheus treat old-provider and new-provider traffic as genuinely distinct time series (correctly so, since they are different systems). Run both providers side by side behind the route tag from Q40 during the migration window so cost and quality dashboards can compare them directly, and update the pricing table (Q21) for the new provider before cutover, not after — a stale pricing table during a migration is a near-guaranteed source of a confusing "cost dashboard looks wrong" incident in week one.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. Describe the second-order security risk of a prompt-injection payload being captured verbatim in your telemetry and later rendered in an internal trace-viewing dashboard.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>If an attacker's injected prompt content contains something like an HTML/script payload and your trace viewer renders captured prompt/completion text without escaping it, you've turned your own observability tooling into a stored-XSS vector — an engineer innocently viewing a trace to debug an unrelated issue could have that payload execute in their authenticated session against your internal tools. The fix is to treat any user- or model-influenced content flowing into your telemetry pipeline as untrusted input at the rendering layer, the same discipline you'd apply to displaying it anywhere else — HTML-escape by default in the trace viewer, and don't assume "it's just internal engineering tooling" exempts it from the same input-handling rules as user-facing surfaces.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">MID</span>Q60. What is the W3C <code>traceparent</code> header, and why does its propagation matter specifically when a tool call goes out to an MCP server running as a separate process or service?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p><code>traceparent</code> is the standardized HTTP header carrying the current trace ID, parent span ID, and sampling flags across a network hop, defined by the W3C Trace Context specification and implemented automatically by Micrometer Tracing/OpenTelemetry for common Spring HTTP clients. Without it being propagated to an MCP server invoked as a tool call, that server's own spans (if it's instrumented) would start a brand-new, disconnected trace instead of appearing as a child of the calling request — breaking exactly the kind of end-to-end waterfall view (Section 7.1) that makes a multi-hop agent pipeline debuggable as one story rather than several unrelated fragments you have to manually stitch together by timestamp.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. Design the span and metric strategy for a request where a tool call itself invokes another Spring AI-backed service, which makes its own model call.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>As long as trace context propagates across that hop (Q60), the downstream service's own <code>chat.client</code>/<code>chat.model</code> spans appear as children of the <code>tool.call</code> span in the calling service's trace automatically — no special cross-service coordination code is needed beyond ensuring both services are configured with the same tracing backend/exporter target. The one thing worth deliberately designing is cost and token attribution: decide whether the downstream service's token usage should roll up into the calling feature's cost dashboard (usually yes, since from a product perspective it's one logical request) or be attributed separately to the downstream service's own budget — this is a tagging and aggregation-query decision, not an instrumentation one, since the raw span data supports either view.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">STAFF</span>Q62. You're asked to build a cost-governance system that can actually cap spend per team, not just report it after the fact. Describe the telemetry-driven guardrails you'd put in place.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Reporting-after-the-fact (dashboards, alerts) is necessary but insufficient for a hard cap — you need an enforcement point that can act before the spend happens. Stream token/cost events (from the same <code>Usage</code> metadata already captured per request) into a fast aggregation store (a sliding-window counter per team, e.g. Redis-backed) that a request-time check can query cheaply before allowing a call to proceed; when a team's rolling spend crosses a threshold, degrade gracefully rather than hard-failing — route to a cheaper model, shorten context, or queue non-urgent requests — and always emit a distinct low-cardinality <code>budget.action=throttled</code> tag when this fires, so the throttling itself shows up on the same dashboards and doesn't look like an unexplained latency or error-rate anomaly to whoever's on call.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Emphasize the design principle: enforcement has to be near-real-time and request-scoped (a counter check), while the rich, high-cardinality cost analysis (per-user, per-feature breakdowns) stays in the slower, asynchronous metrics/dashboard pipeline — trying to make the dashboard pipeline itself the enforcement mechanism is both too slow and, per Section 4.4, structurally the wrong place to put a request-blocking decision.</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. Given a fixed monthly storage budget for full-content trace capture, how would you reason mathematically about the right sampling rate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Estimate average captured-trace size (prompt + completion text, span metadata) and multiply by expected daily request volume to get storage-per-day at 100% capture; divide your budget's storage-per-day allowance by that figure to get a baseline sampling rate <em>r</em>. Then don't apply <em>r</em> uniformly (Q33) — reserve a portion of the budget for guaranteed 100% capture of errors and tail-latency requests (typically a small fraction of total volume but disproportionately valuable), and apply a lower random rate to the remaining "boring" successful traffic so the blended average storage cost still lands within budget while concentrating capture where debugging value is highest.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">MID</span>Q64. Why is it important that metrics count 100% of requests even when traces are sampled at, say, 10%?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Metrics are cheap to store precisely because they're pre-aggregated — a Timer or Counter's memory footprint doesn't grow with request volume, only with the number of distinct tag combinations — so there's no real cost argument for sampling them. If you sampled metrics the same way you sample traces, your error-rate and latency-percentile numbers would themselves become statistically noisy estimates rather than exact counts, undermining the one pillar you specifically rely on for "is something wrong right now" alerting. Decoupling the two lets you sample traces aggressively for storage reasons while keeping the alerting-critical metrics exact.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. A tool's failure rate metric spiked for six hours yesterday but no alert fired. How would you run this as a postmortem on your alerting design itself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Check whether an alert rule existed for that specific metric at all — per-tool failure rate is easy to omit if alerting was only ever set up on the aggregate model-call error rate, which a single failing tool among several can dilute below any reasonable threshold. If a rule existed, check its threshold and window: a rate-based alert with too long an averaging window can smooth over a real six-hour spike, and a percentage-based threshold set relative to low baseline traffic can require an implausibly large absolute failure count to fire. The fix is almost always adding (or lowering the granularity of) alert rules per meaningful dimension — per tool, not just per model — which is the same lesson as Q42's design principle, learned the expensive way instead of proactively.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">STAFF</span>Q66. Design an internal shared library/starter that standardizes <code>ObservationConvention</code> customizations across a dozen Spring AI microservices, rather than asking every team to configure it themselves.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Package a Spring Boot autoconfiguration module that ships a default <code>ChatClientObservationConvention</code>/<code>ChatModelObservationConvention</code> pair pre-wired with the org's standard low-cardinality tags (feature name resolved from a required application property, prompt version resolved from a convention on <code>PromptTemplate</code> metadata, tenant tier from a request-scoped bean interface each service must implement), plus a pre-built <code>ObservationFilter</code> for baseline PII redaction and a <code>TestObservationRegistry</code>-based contract test teams can drop into their own CI. Ship it as a versioned internal artifact with its own changelog and deprecation policy (Q54), and make it the default dependency new services pull in rather than an opt-in — the goal is that a team building their fifth Spring AI service in the org gets correct, consistent observability by depending on one starter, not by re-reading this chapter and reimplementing it from scratch.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Note the organizational tradeoff explicitly: this trades some per-team flexibility for consistency, and the right way to handle a team with a genuinely unusual need is an documented extension point in the starter (a way to add extra tags without forking the convention), not an exception that lets them opt out of the shared schema entirely.</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. How does having rich AI-specific observability change your incident-response runbook compared to a typical REST API outage?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A typical REST outage runbook starts with "is it erroring or is it slow" and follows a fairly linear path through infrastructure layers. An AI feature incident runbook needs an earlier branch: "is it erroring/slow, or is it succeeding but producing bad output" — and the second path requires pulling in trace content, token/cost trends, and the async quality-eval score trend rather than infrastructure metrics alone, since none of those would flag a quality-only incident. A mature runbook explicitly lists both branches and the specific dashboards/queries for each, rather than assuming the on-call engineer will think to check quality telemetry only after infrastructure metrics come back clean — under incident pressure, people default to the runbook they're handed, not the one they'd ideally improvise.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">MID</span>Q68. What does the <code>gen_ai.operation.name</code> attribute capture, and why is it a useful low-cardinality tag even in a service that only does chat completions today?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It captures the kind of GenAI operation being observed — chat, embeddings, image generation, and so on — as a small, fixed-vocabulary tag. Even a service that only performs chat completions today benefits from tagging it explicitly rather than assuming context, because the moment that service adds an embedding call (for a new RAG feature, say) or a moderation call, your existing dashboards keep working correctly by operation type instead of silently mixing two different kinds of calls into one undifferentiated "requests" metric that no longer means what it used to.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. Argue both sides: capturing full completion content on 100% of production traffic versus only a sampled fraction.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>For 100%: no debugging investigation ever dead-ends at "we didn't happen to capture that one" (the exact gap that made Q35's investigation hard), and your async eval pipeline gets a complete, unbiased population to sample from rather than a sample-of-a-sample. Against 100%: storage cost scales linearly and can become the single largest line item in your observability spend at real traffic volume, every captured request is additional PII/compliance surface area (Section 13, Q49) regardless of whether it ever gets looked at, and most of that captured content is never actually queried, since the majority of requests are unremarkable. The pragmatic resolution most teams land on is the tiered approach from Q48 — sampled by default, forced to 100% specifically for error and flagged traffic — which captures nearly all the debugging value at a fraction of the storage and compliance cost of blanket full capture.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">STAFF</span>Q70. Without a labeled ground-truth evaluation dataset, design a weak-signal alerting system that could plausibly catch a silent quality regression using only telemetry you already collect for other reasons.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Combine several independently-weak proxy signals into one composite alert rather than trusting any single one: a sustained rise in refusal-pattern rate (detected with a cheap heuristic classifier over captured completions, not a full LLM judge), a sustained shift in completion-length distribution (much shorter or much longer than the rolling baseline, both of which correlate with degraded behavior in practice), a rise in structured-output parse-repair rate (Q39), and a rise in follow-up-question rate in multi-turn conversations (a proxy for "the first answer didn't satisfy the user"). None of these alone proves a quality regression, but two or three moving in the same direction at once, on the same model/prompt version, is a strong enough correlated signal to trigger a targeted, synchronous eval-pipeline run rather than waiting for the next scheduled async evaluation cycle to catch it.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Frame this explicitly as buying time, not replacing evaluation methodology — the composite alert's job is to shorten detection latency between "something degraded" and "someone starts investigating," while the actual root-cause diagnosis still depends on the deeper evaluation and testing disciplines covered in this series' dedicated chapters.</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. How would you track the cost and context-window pressure of a growing multi-turn conversation across a single session, using the chat-memory advisor's span?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Tag the <code>advisor.chat-memory</code> span (or a custom metric alongside it) with the cumulative prompt token count for that conversation turn — since chat memory means each new turn's prompt includes prior conversation history, prompt tokens grow monotonically within a session even if the user's new message is short. Aggregate this as a per-session metric (keeping the actual session ID off the low-cardinality metric tags, per Section 4.4, and instead bucketing by a coarse "turn number" or "context utilization percentage" range) to catch sessions approaching context-window limits before they hit a hard truncation or error, and to see cost-per-session growing in a way that a per-request-only view would never surface, since no single turn in a long conversation looks expensive on its own.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">MID</span>Q72. Token usage metrics are missing entirely for a subset of requests in production. What would you check first?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>First, whether those requests use a custom or less-common <code>ChatModel</code> implementation that doesn't fully populate <code>Usage</code> metadata on its <code>ChatResponseMetadata</code> — not every provider integration reports every field identically, and a partial implementation can silently return null/zero usage rather than throwing. Second, whether the affected requests are specifically streaming calls (Q31) that errored or were cancelled mid-stream before the terminal chunk carrying usage data ever arrived — a client disconnect partway through a stream is a legitimate reason for missing usage data. Cross-checking the affected subset against <code>gen_ai.system</code>/<code>gen_ai.operation.name</code> tags usually narrows it to one of these two causes quickly.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. You've written a custom Advisor for domain-specific request rewriting. How do you give it its own span in the trace waterfall, consistent with the framework's built-in advisors?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Wrap the advisor's core logic in an explicit <code>Observation</code> — obtain the current <code>ObservationRegistry</code> (injected as a bean), call <code>Observation.createNotStarted("advisor.my-custom-name", registry)</code>, populate low-cardinality key-values relevant to what the advisor does, and run the advisor's logic inside <code>observation.observe(...)</code> (or the manual start/stop/scope API for more control). Because this runs while the outer <code>chat.client</code> Observation is still open, Micrometer's context propagation automatically nests your new span as a child of it, so it appears in the waterfall exactly like <code>advisor.retrieval-augmentation</code> does, with no special registration beyond using the same registry.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">STAFF</span>Q74. Should a Spring AI-based organization build in-house LLM observability tooling or adopt a specialized platform like Langfuse or LangSmith? What factors would drive that decision?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Building in-house makes sense when the organization already has significant Prometheus/Grafana/OTel investment and platform expertise, since Spring AI's instrumentation plugs into that stack for free (Section 9) — the marginal work is mostly dashboards, alerting rules, and the async eval pipeline, not new plumbing. Adopting a specialized platform makes sense when the priority is fast time-to-value on LLM-specific UX (prompt playgrounds, built-in eval scoring UIs, dataset curation for regression testing) that would otherwise be significant in-house product-engineering effort, or when the team lacks existing observability platform ownership entirely. A common and often correct middle path is both: keep infrastructure-level metrics and traces in the existing Micrometer/OTel stack (Section 8's architecture diagram already shows this split), and route a sampled subset of traces specifically to a specialized LLM eval platform for the workflows — prompt iteration, dataset-based regression testing — that general-purpose observability tooling doesn't do well.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">SENIOR</span>Q75. Why is context-window utilization (tokens used relative to the model's maximum context) worth tracking as its own observability signal, separate from raw token counts?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Raw prompt token counts are only meaningful relative to the model's actual context limit — 8,000 tokens is trivial for a 128k-context model but critical for a 8k-context one — so a utilization percentage, computed by dividing observed prompt tokens by the known context limit for <code>gen_ai.response.model</code>, is what actually predicts risk of truncation, degraded long-context recall (a well-documented phenomenon where models attend less reliably to content in the middle of a very long context), or an outright context-length error. Tracking this as a distinct metric, especially for chat-memory-heavy multi-turn features (Q71), gives you an early warning well before requests start hitting hard context-length failures in production.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">SENIOR</span>Q76. How would you attach a reliable <code>prompt.version</code> tag without scattering version-string literals across dozens of call sites in the codebase?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Centralize prompt version as metadata on the <code>PromptTemplate</code> or prompt-construction component itself — for example, a small wrapper that loads prompt templates from versioned resource files (or a prompt-management service) and exposes the resolved version alongside the rendered template — then have your custom <code>ChatClientObservationConvention</code> read that version off the request context rather than requiring every call site to manually set a tag. This keeps prompt versioning a property of the prompt-authoring layer, where it naturally belongs and where a change to it is a one-line diff, rather than a manually-maintained string duplicated at every place a prompt happens to be used.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">MID</span>Q77. What's the difference between a Micrometer <code>Timer</code> and a <code>DistributionSummary</code>, and which applies to latency versus token counts?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A <code>Timer</code> is specifically for measuring durations — it records elapsed time and exposes count, total time, and percentile/histogram data over that time dimension. A <code>DistributionSummary</code> is the general-purpose equivalent for any other numeric quantity you want the same percentile/histogram treatment for — token counts per request being the canonical example in this domain, since "what's the p95 completion-token count" is exactly as useful a question as "what's the p95 latency," but token count isn't a duration, so it uses <code>DistributionSummary</code> rather than <code>Timer</code>.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">SENIOR</span>Q78. How would a runaway tool-calling loop reveal itself in span nesting depth and count metrics, distinct from how it would show up in cost metrics alone?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Cost metrics show the loop only in aggregate, after the fact, as an elevated total spend that requires investigation to attribute (Q29). The trace itself, if you can find one while the incident is live, shows it immediately and unambiguously: an abnormally long, flat sequence of alternating <code>chat.model</code> and <code>tool.call</code> spans under one outer <code>chat.client</code> span, often visibly failing to converge (the same tool called repeatedly with similar arguments). A "model calls per trace" or "tool calls per trace" histogram (Q45) is what turns this from something you'd only notice by opening one specific trace into something an alert can catch across all traffic automatically, since the histogram's tail lights up the moment loop behavior starts happening at any meaningful rate.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">STAFF</span>Q79. Design a multi-region observability rollup where different regions must sample or redact differently for regulatory compliance reasons.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Run a regional OpenTelemetry Collector tier per data-residency zone, each configured with region-specific redaction/retention processors (Q27) enforcing that region's requirements — an EU region collector, for instance, might apply stricter redaction and shorter retention on full-content capture than a region without equivalent constraints. Export fully redacted, aggregate-only metrics (never raw content) to a global rollup tier for org-wide dashboards, while keeping any full-content trace data region-local and never forwarded cross-region — this way the org still gets a single global view of cost, latency, and error trends, without any regional compliance boundary being violated by content that should never have left its region of origin in the first place.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">SENIOR</span>Q80. How would you validate that your Observation-based instrumentation itself isn't introducing a memory or backpressure problem under sustained streaming load?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Load-test the streaming path specifically (not just non-streaming calls) while monitoring JVM heap and the exporter's own internal queue/buffer metrics — a Collector-bound exporter that batches spans before sending (Section 12) can build an unbounded backlog if export throughput falls behind span-creation rate during a sustained high-concurrency streaming spike, since each open stream keeps its Observation's context alive for the stream's full duration rather than the brief lifetime of a typical request. Confirm the exporter has bounded queue size and a defined backpressure/drop policy (most OTel exporters do, but defaults vary), and treat "instrumentation-induced OOM under load" as a real, testable failure mode rather than an assumption that observability overhead is always negligible.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">MID</span>Q81. What does tagging by "operation type" (chat, embedding, image generation, moderation) buy you once a single service runs several kinds of model calls?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It keeps aggregate dashboards meaningful as the service's capability grows — without an operation-type tag, "average latency" or "total tokens" silently becomes a blend of fundamentally different workloads (a millisecond-scale moderation check averaged in with a multi-second chat completion), which distorts every derived percentile and cost figure. With the tag, you can slice cleanly: chat latency stays comparable to chat latency, embedding cost stays comparable to embedding cost, and adding a new operation type to the service in the future doesn't quietly corrupt an existing dashboard that was implicitly built assuming only one kind of call existed.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">SENIOR</span>Q82. p99 latency looks fine today, but p50 has crept up gradually over several weeks. How do you investigate a slow drift rather than a sudden spike?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A gradual p50 rise with a stable p99 suggests the typical-case request got slower, not that a new tail of pathological requests appeared — check for changes that would affect every request roughly equally: a growing average conversation/context length across the user base (Q75, gradually pushing more tokens into every prompt), a retrieval corpus that's grown larger without a corresponding index optimization, or a provider-side change to typical response verbosity. Because this is a trend rather than an incident, the right tool is a longer-window dashboard (weeks, not the usual hours) sliced by the same dimensions used elsewhere in this chapter — model version, feature, prompt version — to find which slice's median actually moved versus which stayed flat, narrowing the causal search before it becomes a guessing exercise.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">STAFF</span>Q83. Build the business case for investing engineering time in AI-specific observability tooling. What ROI would you present to leadership?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Frame it in terms leadership already budgets around: cost containment (a runaway-loop or prompt-regression detector, Q29/Q45, that catches a cost anomaly in minutes instead of at month-end billing reconciliation, is a directly quantifiable savings), incident time-to-resolution (a trace waterfall that turns a multi-hour blind debugging session into a five-minute root-cause lookup, Section 1), and risk reduction (catching a silent quality regression, Q70, before it becomes a customer-facing incident or a compliance issue, versus discovering it from a support ticket volume spike). The honest caveat worth including: the instrumentation itself is largely already free (Spring AI's Observation support requires no extra work beyond dependencies already needed for standard Actuator observability) — the actual investment being requested is in dashboards, alerting rules, and the async evaluation pipeline built on top of it, which is a much smaller ask than "build an AI observability platform from scratch" and should be presented as such.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">SENIOR</span>Q84. Your agent architecture queues requests for async, batched processing rather than handling them synchronously within one HTTP request. How do you preserve trace correlation across that async boundary?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The automatic thread-local/reactor-context trace propagation that works within one synchronous or reactive request (Section 4.3) does not survive a message being placed on a queue and picked up by a separate worker process later — you have to propagate the trace context explicitly, by serializing the current trace ID (and, if relevant, baggage) into the queued message's headers/metadata at enqueue time, then re-hydrating an Observation context from those headers when the worker picks the message up, so the worker's spans attach as children of the original request's trace instead of starting a disconnected new one. Most messaging integrations Spring supports (Kafka, RabbitMQ) have existing Micrometer Tracing instrumentation that does exactly this automatically if it's on the classpath and configured — but it's worth explicitly verifying for a custom queue implementation rather than assuming it's handled.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">MID</span>Q85. How does an Actuator health/readiness check differ in purpose from the metrics/traces covered throughout this chapter?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A health/readiness endpoint answers a binary, present-tense question — "can this instance currently serve traffic" — typically used by an orchestrator (Kubernetes, a load balancer) to make routing and restart decisions, and it should be cheap and fast to evaluate. The metrics and traces this chapter covers answer a much richer, trend-and-detail-oriented question — "how has this system behaved over time and why did this specific request behave the way it did" — aimed at humans investigating, not machines making a pass/fail routing decision. A model provider being slow or expensive doesn't necessarily mean your service should fail its readiness check and get pulled from rotation, which is exactly why these are deliberately separate concerns with separate endpoints rather than one conflated signal.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">SENIOR</span>Q86. Without a full evaluation pipeline in place yet, what lightweight "hallucination proxy" signals could you instrument and alert on today?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>For a RAG feature specifically, a cheap and fairly reliable proxy is tracking how often the model's completion appears to introduce claims not traceable to the retrieved context — approximated cheaply (without a full LLM judge) by checking for named entities or numbers in the completion that don't appear anywhere in the retrieved documents passed into that same call, tagged and counted as a rate metric. Other proxies worth combining, echoing Q70's composite approach: unusually high confidence language ("definitely," "certainly") co-occurring with a low retrieval-similarity score for the same request, and a rising rate of user-initiated follow-up corrections in multi-turn conversations. None of these is a rigorous hallucination detector, but as an early, always-on warning layer sitting ahead of a proper evaluation pipeline, a rising trend on any of them is a legitimate trigger to prioritize building that pipeline sooner.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">STAFF</span>Q87. Who should own the observability attribute schema across an organization with many teams building Spring AI features, and what does that ownership concretely involve?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>A platform/infrastructure team, not any individual product team, should own the shared schema — the same way a platform team typically owns the organization's logging format or its base Docker images — because the schema's value comes specifically from being consistent across teams, and no single product team is incentivized to maintain that consistency for everyone else's benefit. Concretely, ownership means: publishing and versioning the schema definition, shipping the enforcement tooling (the shared starter from Q66 and the CI contract test), reviewing and approving proposed extensions when a team has a genuinely new need, and running the deprecation process when the underlying OpenTelemetry GenAI conventions themselves change (Q19/Q93) so individual teams aren't each independently tracking upstream spec churn.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">SENIOR</span>Q88. Frame the tradeoff between 100% trace capture and sampling in terms of the cost of a missed catastrophic failure versus the cost of over-collection.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Over-collection's cost is continuous and certain — storage, compliance surface, and export overhead scale with every request you fully capture, whether or not you ever look at it (Q69). Under-sampling's cost is discrete and probabilistic — it only materializes on the rare occasion a genuinely catastrophic request happens to fall outside your sample and you need exactly that trace to understand an incident. The resolution isn't choosing one extreme; it's making the sampling policy itself risk-aware rather than uniformly random, which is precisely what tail-based sampling (Q33) achieves — by keeping 100% of errors and anomalies (where catastrophic failures overwhelmingly live) while sampling down the "boring" traffic, you get close to the debugging value of 100% capture at a small fraction of its storage cost, converting a binary tradeoff into a much better Pareto point.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">MID</span>Q89. How would you write a test that regression-proofs your observability instrumentation itself, so a refactor can't silently drop a tag or a span?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Using <code>TestObservationRegistry</code> (Q30), register it in place of the real registry for a test-scoped <code>ChatClient</code>, make a call against a mocked or stubbed model response, and assert against the registry's recorded observations — that an observation with the expected name was started and stopped successfully, and that it carries the specific low-cardinality key-values (feature name, prompt version) your custom convention is supposed to attach. Run this as an ordinary part of your test suite so a future refactor that accidentally drops the custom <code>ObservationConvention</code> registration, or changes a tag's key/value, fails CI the same way a functional regression would — rather than only being discovered when a downstream dashboard quietly stops populating in production.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">SENIOR</span>Q90. Where in the Advisor chain's execution order does the <code>chat.client</code> Observation actually open and close, relative to individual advisors mutating the request and response?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The outer <code>chat.client</code> Observation wraps the entire advisor chain invocation — it opens before the first advisor runs and closes after the last advisor has finished processing the (possibly model-augmented) response, meaning it captures the full end-to-end latency including every advisor's own work, not just the model call itself. Individual advisors that want their own visibility into just their slice of that time (retrieval, memory lookup) need to open their own child Observation inside their own logic, exactly as described in Q73 — the framework doesn't automatically give every advisor its own span for free, only the ones Spring AI ships with (retrieval augmentation, chat memory) do, because those specific advisors were explicitly instrumented by the framework authors.</p>
+</div>
+
+<div class="question" id="q91"><span class="level">STAFF</span>Q91. Design a single-pane-of-glass dashboard architecture for engineering leadership covering cost, latency, quality, and reliability across many AI features built by different teams on Spring AI.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The foundation has to be the standardized schema from Q54/Q87 — without every team's feature emitting the same <code>feature.name</code>, <code>prompt.version</code>, cost, and quality-score dimensions consistently, a cross-feature rollup dashboard is either impossible or misleading. Structure the dashboard itself in tiers: a top-level view aggregating cost, p95 latency, error rate, and quality score to one row per feature (echoing the PM-facing simplification from Q56, but for an engineering leadership audience that also wants the technical dimensions available), with drill-down from any row into that feature's own detailed dashboards (the trace waterfalls, per-model breakdowns, and alerting this chapter builds throughout). Feed it from the same underlying Micrometer/OTel pipeline every team already exports to (Section 8), not a separate reporting pipeline requiring teams to double-instrument — and pair it with a lightweight weekly automated digest (biggest cost movers, quality-score regressions, new fallback-route activity) so leadership gets the signal without needing to actively query the dashboard themselves.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Emphasize that this whole design only works because Spring AI observability was built on Micrometer/Actuator from day one (Section 9) — a leadership rollup spanning a dozen teams' worth of independently-built AI features is a governance and schema problem, not a new instrumentation problem, precisely because the underlying plumbing was already unified.</div>
+
+<div class="question" id="q92"><span class="level">SENIOR</span>Q92. Why might your trace-sampling rate and your log-sampling rate legitimately differ for the same AI feature?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Traces and logs have different storage economics and different consumption patterns — a trace is a structured, queryable unit naturally suited to statistical sampling because a dashboard aggregating "10% of traces" still produces a valid, if noisier, percentile estimate (Q64), whereas logs are often consulted for a specific known request (via trace-ID correlation, Q43) rather than aggregated statistically, so sampling them can mean the specific log line an engineer needs for a specific incident simply doesn't exist. A common pattern is sampling traces more aggressively than logs, or keeping logs at a coarser granularity (structured summary lines) at 100% while only full-content, high-detail logs are sampled — the right rates are a genuinely separate decision per pillar, not one number applied uniformly across both.</p>
+</div>
+
+<div class="question" id="q93"><span class="level">STAFF</span>Q93. The OpenTelemetry GenAI semantic conventions are still evolving. How do you future-proof your instrumentation layer against attribute names changing underneath you?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Don't let dashboards, alerting rules, and downstream consumers query raw <code>gen_ai.*</code> attribute names directly at scale — introduce a thin normalization layer (a Collector processor, or your own <code>ObservationConvention</code> wrapper) that maps whatever the current upstream spec calls a field onto your organization's own stable internal attribute names, so a spec revision, or a Spring AI version bump that follows it, requires updating one mapping layer rather than hunting down every dashboard and alert query across every team that happened to reference the old raw name directly. Pin Spring AI and OTel dependency versions deliberately, review the GenAI conventions changelog before bumping either, and treat this exactly like any other unstable external API dependency — because, at this point in the ecosystem's maturity, that's precisely what it is.</p>
+</div>
+
+<div class="question" id="q94"><span class="level">STAFF</span>Q94. Zooming out: why is observability, more than any other topic in this volume, the discipline that determines whether an AI feature is actually safe to leave running unattended in production?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Every other chapter in this volume — retrieval, advisors, tool calling, MCP — adds capability, and capability without visibility is precisely what makes a system dangerous to operate unattended: a more capable agent that can retrieve documents, call tools, and chain multiple model calls together has more ways to fail expensively, silently, and non-reproducibly than a simple single-call chatbot, exactly because non-determinism and plausible-but-wrong output mean the traditional safety net of "it'll throw an exception if something's wrong" doesn't apply (Section 3). Observability is what converts that expanded capability back into something a human can trust running without direct supervision — cost guardrails that catch a runaway loop before it becomes a five-figure bill (Q29, Q45, Q62), trace waterfalls that turn an opaque bad-answer report into a five-minute root-cause investigation (Q35), and quality telemetry that catches a silent regression before a customer does (Q70, Q86). A team that ships tool-calling agents without this instrumentation hasn't avoided the failure modes this chapter describes; they've simply chosen not to be able to see them until a customer, or an invoice, tells them.</p>
+</div>
+
 </div>
 
 <hr>
