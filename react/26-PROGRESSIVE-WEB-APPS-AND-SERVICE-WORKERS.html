@@ -1201,5 +1201,3349 @@ Treating this as a rare edge case rather than the default outcome of the two mos
 
 <hr>
 
+<h1 id="h9">SECTION 6 - SERVICE WORKER LIFECYCLE DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q15">
+Q15. What exactly triggers a "new" service worker registration, and how does the browser decide two versions of sw.js differ?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The browser re-fetches the registered script byte-for-byte and does a straight comparison against the version it already has installed. If the bytes are identical, nothing happens at all - no <code>install</code> event fires, no new worker enters the lifecycle. If even a single byte differs (a changed comment, a reordered import, whitespace from a different build), it is treated as a genuinely new version and the full install/waiting/activate dance begins.
+</p>
+
+<p>
+This check runs on every navigation to a page in scope (throttled to roughly once every 24 hours if the site is visited constantly), on an explicit <code>registration.update()</code> call, and immediately before dispatching a <code>push</code> or <code>sync</code> event. Critically, the top-level SW script itself is exempt from normal HTTP caching for this fetch - browsers ignore <code>Cache-Control</code> headers on it since this exact staleness bug was common in the wild. Scripts pulled in via <code>importScripts()</code>, however, are <em>not</em> automatically exempt and can be served stale from HTTP cache unless you cache-bust them (Workbox-generated files include a hash in the precache manifest for exactly this reason).
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming a deploy alone forces an update check. If a user never navigates and the tab stays open for days, the 24-hour background check is the only thing keeping them from running arbitrarily old code - which is one more argument for calling <code>registration.update()</code> proactively (e.g. on window focus) rather than relying purely on the browser's default cadence.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q16">
+Q16. How do you communicate with a waiting service worker, given that <code>navigator.serviceWorker.controller</code> only points at the active one?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>navigator.serviceWorker.controller</code> is always the currently <em>active</em> worker - the one actually serving fetches - never the one sitting in <code>waiting</code>. To talk to a waiting worker (most commonly to tell it "the user clicked update, skip waiting now") you go through the registration object directly: <code>registration.waiting.postMessage(...)</code>. Symmetrically, the worker listens for a <code>message</code> event on <code>self</code> and can call <code>self.skipWaiting()</code> in response, which is the safe, user-initiated version of the pattern shown in Q8.
+</p>
+
+<p>
+For a true request/response conversation rather than one-way fire-and-forget messages, wrap the message in a <code>MessageChannel</code>: the page creates the channel, sends one port to the worker along with the message, and the worker replies on that port directly, letting the page <code>await</code> a specific answer instead of listening on a shared, ambiguous global message stream.
+</p>
+
+</div>
+
+<pre>
+// Page: ask the waiting worker to skip waiting, and wait for its ack
+function activateUpdate(registration) {
+  return new Promise((resolve) =&gt; {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () =&gt; resolve();
+    registration.waiting.postMessage({ type: "SKIP_WAITING" }, [channel.port2]);
+  });
+}
+
+// sw.js
+self.addEventListener("message", (event) =&gt; {
+  if (event.data?.type === "SKIP_WAITING") {
+    self.skipWaiting();
+    event.ports[0]?.postMessage({ type: "ACK" });
+  }
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the <code>controller</code>-vs-<code>registration.waiting</code> distinction unprompted is a strong signal - it's a real bug people hit ("why doesn't <code>navigator.serviceWorker.controller.postMessage</code> reach my new worker") that only makes sense once you understand controller always tracks the active worker.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q17">
+Q17. What happens to an in-flight <code>fetch</code> event if the browser terminates the service worker mid-request?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Service workers are aggressively spun down when idle (commonly after roughly 30 seconds with no pending work, though the exact figure is implementation-defined and browsers tune it) to save memory - there's no guaranteed persistent process. The platform's answer to "won't that kill work in progress" is the <b>extendable events</b> contract: as long as a handler passes its promise to <code>event.respondWith()</code> (fetch) or <code>event.waitUntil()</code> (install/activate/sync/push), the browser guarantees it will not terminate the worker until that specific promise settles, however long it takes.
+</p>
+
+<p>
+The danger is anything that happens <em>outside</em> that contract - a stray <code>setTimeout</code>, a "fire and forget" <code>fetch()</code> call not passed to <code>waitUntil</code>, a variable you intended to persist in module-level worker memory between events. None of that is protected; the worker can be killed the instant the current extendable event's promise resolves, and a freshly woken worker starts from a completely clean global scope with no memory of prior events. This is why service worker code must treat every event as though the worker had never run before - no relying on module-level caches surviving between fetches.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Caching a value in a plain JS variable at the top of the SW file "to avoid recomputing it every fetch," and being surprised when it resets randomly. Anything that must survive across worker restarts belongs in IndexedDB or Cache Storage, not in module state - the worker's lifetime is per-event, not per-session.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q18">
+Q18. What happens if <code>cache.addAll()</code> fails during <code>install</code> - say, one asset in the list 404s?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>cache.addAll()</code> is all-or-nothing by design: it fetches every URL, and if <em>any single one</em> fails (a 404, a network error, even a valid-but-non-200 response) the entire call rejects, nothing gets written to the cache, and that rejection propagates up through your <code>waitUntil()</code> promise. The browser then considers install itself to have failed and discards the new worker entirely - the old worker (or no worker, on a first visit) keeps running unaffected. This is actually the safe failure mode: you never end up with a half-populated app shell silently missing a critical file.
+</p>
+
+<p>
+The practical risk is a single typo or a renamed asset in a hand-maintained precache list silently blocking every future deploy from ever installing, with no user-facing error - which is exactly the class of bug Workbox's build-time-generated manifest (Q5) eliminates, since the list is derived from what the build actually produced rather than typed by hand. If you must hand-roll it, log failures explicitly rather than trusting a silent promise rejection to surface itself.
+</p>
+
+</div>
+
+<pre>
+self.addEventListener("install", (event) =&gt; {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(async (cache) =&gt; {
+      const results = await Promise.allSettled(
+        APP_SHELL.map((url) =&gt; fetch(url).then((res) =&gt; {
+          if (!res.ok) throw new Error(`Bad response for ${url}: ${res.status}`);
+          return cache.put(url, res);
+        }))
+      );
+      const failed = results.filter((r) =&gt; r.status === "rejected");
+      if (failed.length) console.error("SW install: failed to precache", failed);
+      // Decide deliberately whether a partial shell is acceptable or should still fail install.
+    })
+  );
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Framing this as "fail loudly at install time rather than silently at runtime" is the senior answer - a broken precache list should block a bad deploy from ever taking over, not ship a service worker that 404s on some asset the first time a real user needs it.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q19">
+Q19. Why do service workers have no DOM access, no synchronous XHR, and no <code>localStorage</code> - and what does that force architecturally?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A service worker runs in <code>ServiceWorkerGlobalScope</code>, a worker context with no <code>window</code> or <code>document</code> - it can outlive every page that registered it, run with no page open at all (a push event can wake it with zero tabs open), and potentially control multiple tabs simultaneously, so there is no single "the DOM" it could even mean. Synchronous XHR and <code>localStorage</code> are banned for a sharper reason: both are blocking APIs, and a service worker that blocks is a service worker that can't service any other in-flight request on the same event loop - unacceptable for something sitting in the network path of every fetch.
+</p>
+
+<p>
+Architecturally this forces a clean separation: the service worker becomes a pure, async, DOM-free network-and-cache layer, and anything that needs the DOM, a synchronous read, or user-facing state lives in the page and talks to the worker only via <code>postMessage</code>/<code>MessageChannel</code>, or via the worker enumerating open pages with <code>self.clients.matchAll()</code>. Storage inside the worker is limited to fully async options - Cache API and IndexedDB - which is also exactly what you want given the worker can be torn down between any two operations (Q17).
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The strongest framing: these aren't arbitrary restrictions, they're the platform enforcing that a service worker can never become a single point of janky, blocking failure sitting between every page and the network. Connecting the restriction to the "can run with zero tabs open" reality (why there's no DOM to speak of) shows real understanding, not memorized trivia.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q20">
+Q20. What is the "orphaned tab" problem, and how do you detect or mitigate it?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Because a new worker waits until every tab controlled by the old one closes (Q3), a single tab a user never closes - a pinned tab, a background tab left open for weeks, a kiosk display - can keep an old service worker version "stuck" indefinitely, blocking every subsequent deploy's worker from ever activating for that user, even though newer workers keep successfully installing and piling up in the waiting state behind it.
+</p>
+
+<p>
+Detection is mostly about instrumentation: track, per client, how long a worker has been in <code>waiting</code> and alert if it crosses a threshold (a day, a week) that's unusual for your update cadence. Mitigation options trade user experience against currency: show an increasingly insistent "please refresh" banner the longer the wait drags on, set an internal policy of calling <code>skipWaiting()</code> automatically once a version has been waiting past some threshold (accepting the small risk of an active tab getting new logic mid-session), or - the middle ground many production apps land on - only auto-skip-waiting for non-breaking patch releases and always prompt for anything that changes the API contract between client and server.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating this as purely theoretical. Any product with power users who keep dozens of tabs open for days (dashboards, admin panels, always-on internal tools) will hit this in practice, and "just call skipWaiting always" trades this problem for the mid-session-version-mismatch problem from Q8 - there is no fix that isn't a trade-off, and naming that trade-off is the interview-winning move.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q21">
+Q21. What's the difference between <code>self.clients.matchAll()</code> and <code>self.clients.claim()</code>, and when would you reach for <code>matchAll</code> in real code?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+They solve different problems entirely, and confusing them is a common tell. <code>clients.claim()</code> is about <em>control</em> - called once, inside <code>activate</code>, it makes the newly active worker take over already-open tabs immediately instead of waiting for their next navigation. <code>clients.matchAll()</code> is about <em>enumeration and communication</em> - it returns a promise resolving to every open window/tab the worker currently controls (or, with <code>{ includeUncontrolled: true }</code>, every client in scope regardless of control), so you can loop over them and <code>postMessage</code> each one.
+</p>
+
+<p>
+The most common production use of <code>matchAll</code> is exactly the "new version available" banner from Q8: once <code>activate</code> finishes, broadcast a message to every open client so each tab can independently decide whether to show a refresh prompt, rather than each page having to poll the registration's state on its own.
+</p>
+
+</div>
+
+<pre>
+self.addEventListener("activate", (event) =&gt; {
+  event.waitUntil(
+    (async () =&gt; {
+      // ...cache cleanup from Q8...
+      const allClients = await self.clients.matchAll({ type: "window" });
+      allClients.forEach((client) =&gt;
+        client.postMessage({ type: "SW_UPDATED", version: CACHE_VERSION })
+      );
+    })()
+  );
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The one-line distinction to lead with: "claim takes control, matchAll takes attendance." Following it with the update-banner use case shows you've actually wired these two APIs together in a real feature, not just memorized their signatures.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q22">
+Q22. How would you test service worker lifecycle logic - install/activate handlers - without a real browser?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Faithfully mocking <code>self</code>, <code>caches</code>, and <code>clients</code> in a Node/jsdom environment is possible but brittle and low-value - jsdom doesn't implement the service worker global scope at all, and hand-rolled mocks of the Cache API tend to drift from real browser semantics (especially around opaque responses and partial failures). The pragmatic split most teams land on: extract every piece of <em>decision logic</em> - "should this URL be cache-first or network-first," "is this response cacheable" - into small, pure, dependency-free functions that live outside the event-listener boilerplate, and unit test those directly with plain Jest/Vitest, no service worker APIs involved at all.
+</p>
+
+<p>
+For the actual lifecycle wiring - does install really populate the cache, does activate really purge old ones, does the whole thing really produce a 200 offline - that's tested with real browser automation (Playwright has first-class support for registering a service worker, waiting for it to activate, going offline via <code>page.context().setOffline(true)</code>, and asserting on the resulting network behavior) rather than mocked. Treat the SW file itself as a thin integration layer over logic you've already unit tested in isolation.
+</p>
+
+</div>
+
+<pre>
+// sw-logic.js - pure, testable, no service worker globals
+export function pickStrategy(url) {
+  if (url.pathname.startsWith("/api/")) return "network-first";
+  if (/\.(js|css|woff2?)$/.test(url.pathname)) return "cache-first";
+  return "stale-while-revalidate";
+}
+
+// sw-logic.test.js - plain Jest, zero SW mocking required
+test("routes API calls to network-first", () =&gt; {
+  expect(pickStrategy(new URL("https://x.com/api/orders"))).toBe("network-first");
+});
+
+// e2e.spec.ts - Playwright, the real thing
+test("shell renders offline after first visit", async ({ page, context }) =&gt; {
+  await page.goto("/");
+  await page.waitForFunction(() =&gt; navigator.serviceWorker.controller !== null);
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.locator("#app-shell")).toBeVisible();
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the split explicitly - pure decision logic gets fast unit tests, actual browser behavior gets real Playwright automation - shows you understand why mocking <code>self.caches</code> by hand is a trap most teams eventually regret, rather than proposing it as the default approach.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h10">SECTION 7 - CACHING STRATEGIES DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q23">
+Q23. How do you implement network-first with a timeout, falling back to cache if the network is too slow rather than only if it fails outright?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Plain network-first only falls back to cache when the network request actually <em>rejects</em> - but a request that's technically "in flight" on a bad connection for 15 seconds is, from the user's perspective, just as broken as one that failed outright. The fix is racing the network fetch against a timer with <code>Promise.race()</code>: if the timer wins, serve from cache immediately (and let the slow network response, if it eventually arrives, still update the cache for next time); if the network wins, serve it and cache it as usual.
+</p>
+
+<p>
+Workbox implements exactly this as a built-in option (<code>networkTimeoutSeconds</code> on <code>NetworkFirst</code>), which is the reason to prefer it over hand-rolling: the hand-rolled version below is correct but doesn't handle every edge case Workbox's does, like ensuring the late network response doesn't throw an unhandled rejection after the race has already resolved.
+</p>
+
+</div>
+
+<pre>
+async function networkFirstWithTimeout(request, cacheName, timeoutMs = 3000) {
+  const cache = await caches.open(cacheName);
+  const networkPromise = fetch(request).then((res) =&gt; {
+    if (res.ok) cache.put(request, res.clone());
+    return res;
+  });
+  const timeoutPromise = new Promise((resolve) =&gt;
+    setTimeout(() =&gt; resolve(undefined), timeoutMs)
+  );
+  const winner = await Promise.race([networkPromise, timeoutPromise]);
+  if (winner) return winner;
+  const cached = await cache.match(request);
+  return cached || networkPromise; // no cache either - just wait it out
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Volunteering that Workbox's <code>networkTimeoutSeconds</code> already implements this is the strongest answer - it shows you know the pattern well enough to also know you shouldn't hand-roll it in production, only in an interview whiteboard.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q24">
+Q24. What is an "opaque" response, and why is caching one blindly dangerous?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A request made in <code>no-cors</code> mode to a cross-origin server - which is what <code>&lt;img&gt;</code>, <code>&lt;script&gt;</code>, and similar tags issue by default, and what a service worker's fetch handler receives verbatim - returns an "opaque" response: the browser deliberately hides its status code, headers, and body from JavaScript as a security measure, so a script on your origin can't probe a response it shouldn't be able to read. From the Cache API's point of view, an opaque response looks exactly like a successful one (<code>response.type === "opaque"</code>, but <code>response.status</code> reads as <code>0</code> and is unusable for your own status checks).
+</p>
+
+<p>
+The danger: if that cross-origin request actually failed - a 404, a 500, a CDN outage - your code has no way to tell, because the real status is hidden. A naive cache-first handler will happily cache and forever replay that failed response as if it were the real asset. The mitigation is either avoiding <code>no-cors</code> for anything you cache (request in <code>cors</code> mode if the origin supports CORS, so you get a real, inspectable response) or accepting the risk deliberately and pairing it with a size/count limit so a bad opaque entry doesn't live forever.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Caching every image request indiscriminately, including ones served cross-origin without CORS headers, and being unable to explain why a broken hotlinked image is being served from cache forever. This is one of the more subtle production PWA bugs precisely because nothing in the console flags it as an error.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q25">
+Q25. How does Workbox's <code>CacheableResponsePlugin</code> prevent you from caching error responses?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+By default, a naive cache-first or cache-then-network implementation will cache whatever <code>fetch()</code> resolves to, including a 404 or 500 - a fetch only rejects on a true network failure, not on an HTTP error status, so "the promise resolved" is not the same thing as "the response is good." <code>CacheableResponsePlugin</code> is a Workbox strategy plugin that inserts an explicit gate before anything gets written to the cache: you configure a set of acceptable status codes (by default <code>[0, 200]</code>, where <code>0</code> deliberately allows opaque responses through since they can't be inspected) and it skips the <code>cache.put()</code> entirely for anything that doesn't match.
+</p>
+
+</div>
+
+<pre>
+import { registerRoute } from "workbox-routing";
+import { CacheFirst } from "workbox-strategies";
+import { CacheableResponsePlugin } from "workbox-cacheable-response";
+
+registerRoute(
+  ({ request }) =&gt; request.destination === "image",
+  new CacheFirst({
+    cacheName: "images",
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }), // reject 404s/500s from being cached
+    ],
+  })
+);
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Connecting this directly to Q24's opaque-response problem shows a full mental model: <code>statuses: [0, 200]</code> is explicitly allowing opaque responses through despite the risk, which is a deliberate, named trade-off Workbox makes rather than an oversight - and you should be able to say so.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q26">
+Q26. How is Cache Storage partitioned per origin, and why can't one site read another's cache?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Cache Storage, like every other client-side storage API (IndexedDB, localStorage, cookies to a lesser extent), is scoped strictly to the origin (scheme + host + port) that created it - <code>caches.open("app-shell")</code> called from <code>https://a.com</code> and the identically-named call from <code>https://b.com</code> reference two entirely separate storage buckets with no cross-visibility whatsoever, enforced by the browser at the storage-partition level, not by any convention your code follows. This is a straightforward extension of the same-origin policy and exists for the obvious reason: without it, any site could read or poison another site's cached responses.
+</p>
+
+<p>
+The practical corollary worth knowing: a service worker's <em>scope</em> (Q11) further partitions things <em>within</em> an origin by path, but that's a separate, additional restriction layered on top of the origin boundary, not a replacement for it - two different paths on the same origin can still read each other's Cache Storage entries by name if their respective service workers choose to, since Cache Storage itself isn't scope-restricted, only the service worker's ability to intercept requests is.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Conflating "scope" (which controls which requests a service worker can intercept) with cache isolation (which is enforced at the origin level and has nothing to do with service worker scope at all). They're solving different problems and it's a common mix-up under interview pressure.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q27">
+Q27. How would you design caching for a paginated API list endpoint where individual entries can be invalidated?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The Cache API stores whole request/response pairs keyed by URL, which is a poor match for "invalidate one entry inside a list response" - you'd have to re-fetch and re-cache the entire page just to reflect one changed item. The practical pattern splits responsibilities: cache the raw list <em>responses</em> in the Cache API keyed by their exact request URL (page number, filters, sort - all part of the cache key naturally, since they're part of the URL), for fast repeat-navigation, but treat that cache as disposable and short-lived (a stale-while-revalidate with a short max age) rather than authoritative.
+</p>
+
+<p>
+For the "one entry changed, don't invalidate the whole page" requirement, the API cache alone isn't the right tool - that's what IndexedDB-backed normalized storage is for (Q56-Q58): store individual entities by ID in one object store, and have the UI compose list views from that normalized data plus a separately cached "which IDs are on which page" mapping, so an update to one entity is reflected everywhere it's rendered without touching the raw list response cache at all.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior insight: the Cache API is a request/response replay cache, not a database, and reaching for entity-level invalidation inside it is fighting the tool. Recognizing when to escalate from "cache the HTTP response" to "normalize the data in IndexedDB" is exactly the judgment call this question is probing for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q28">
+Q28. What is "cache-then-network," and how does it differ from stale-while-revalidate?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Both strategies show the user cached content immediately while checking the network in the background, but they differ in who's in control of the "update." Stale-while-revalidate is entirely a service-worker-level concern: the SW serves the cache, kicks off a background fetch, and silently updates the cache for the <em>next</em> request - the current page never learns the fresh data even arrived. Cache-then-network is a page-level pattern (popularized by Jake Archibald) where the page itself issues two requests - one to the cache, one to the network - renders the cache result the instant it resolves, and then re-renders again if and when the network result comes back different, so the <em>current</em> view updates live rather than only the next visit benefiting.
+</p>
+
+<p>
+In practice, cache-then-network needs your fetch layer or a library like TanStack Query to support "resolve with cache immediately, then patch in the fresher result" as a first-class idea, whereas stale-while-revalidate needs nothing from the page at all - it's invisible to application code. Choose cache-then-network when the current view genuinely benefits from updating live (a chat thread, a live dashboard); stale-while-revalidate is the simpler default for everything else.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Using the two terms interchangeably. They look similar on a diagram but live at different layers of the stack, and a candidate who can't separate "service worker updates the cache for later" from "page re-renders live when fresher data lands" is missing a real distinction interviewers use to gauge depth.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q29">
+Q29. How do you cap a growing cache's size, both hand-rolled and with Workbox?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+An unbounded runtime cache - images, API responses, anything cached as users browse rather than precached once - grows forever by default, since nothing ever removes an entry unless you tell it to. Left unmanaged, this eventually runs into the browser's storage quota (typically some percentage of free disk, enforced per-origin) and the browser starts evicting your cache entries itself, non-deterministically, which is worse than controlling it yourself.
+</p>
+
+<p>
+Hand-rolled: track insertion order (or age) yourself, most simply via a "the Nth-oldest key gets deleted whenever you add a new one past the limit" LRU-ish loop. With Workbox, this is a one-line <code>ExpirationPlugin</code> config supporting both <code>maxEntries</code> (a hard count cap, oldest evicted first) and <code>maxAgeSeconds</code> (evict anything older than a TTL) together.
+</p>
+
+</div>
+
+<pre>
+// Hand-rolled: cap a cache at N entries, oldest-first
+async function trimCache(cacheName, maxEntries) {
+  const cache = await caches.open(cacheName);
+  const keys = await cache.keys();
+  if (keys.length &gt; maxEntries) {
+    await cache.delete(keys[0]); // Cache Storage preserves insertion order
+    await trimCache(cacheName, maxEntries); // recurse until under the cap
+  }
+}
+
+// Workbox: the same policy, declaratively
+import { ExpirationPlugin } from "workbox-expiration";
+new ExpirationPlugin({ maxEntries: 50, maxAgeSeconds: 7 * 24 * 60 * 60 });
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Mentioning that the browser will start silently evicting your cache under storage pressure if you don't manage size yourself reframes this from "nice to have" to "you will hit this in production eventually" - and naming <code>ExpirationPlugin</code>'s dual count+age cap shows you know the real tool, not just the concept.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q30">
+Q30. How do you decide a caching strategy for a GraphQL endpoint, where every request is a POST to the same URL?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Every strategy discussed so far implicitly assumes the request <em>URL</em> is a meaningful cache key - which is exactly what breaks with GraphQL, since every query and mutation is typically a <code>POST</code> to the same <code>/graphql</code> endpoint, and the Cache API only keys on the request (URL + method by default, body is ignored). A cache-first or network-first strategy applied naively to <code>/graphql</code> either caches nothing useful (every distinct query looks identical to the cache) or, worse, serves one query's cached response for a completely different query.
+</p>
+
+<p>
+The fix is constructing a cache key manually from the meaningful parts of the request - typically the operation name plus a stable serialization of the variables - and using <code>cache.put(new Request(customKey), response)</code> / <code>cache.match(customKey)</code> instead of the raw request object. In practice, most teams skip hand-rolling this in the service worker at all and instead lean on the GraphQL client's own cache (Apollo's normalized cache, or persisting Apollo/urql's cache to IndexedDB) since it already understands query shape and variables natively - reserving the service worker for what it's actually good at: precached static assets and simple GET-based REST fallbacks.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Recognizing that this is fundamentally a "wrong tool" situation - the service worker's request-URL-keyed cache model doesn't map cleanly onto POST-based GraphQL - and that the correct answer is usually "let the GraphQL client's own cache handle this, persisted to IndexedDB" rather than forcing a Cache API solution, is exactly the kind of judgment senior interviewers are listening for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h11">SECTION 8 - WEB APP MANIFEST DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q31">
+Q31. Beyond "manifest + service worker + HTTPS," what are the exact installability criteria Chromium checks today?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Chromium's actual checklist is more specific than the folk version most people quote. It requires: the manifest is reachable and parses as valid JSON with, at minimum, <code>name</code> or <code>short_name</code>, <code>icons</code> including a 192px and a 512px entry, and a <code>start_url</code> that resolves; a registered service worker with a <code>fetch</code> event handler that produces a real response (historically this meant "responds while offline," relaxed over time but still checked in spirit); the site served over HTTPS (or localhost); and, for the automatic install prompt specifically (as opposed to a manual "Install app" menu entry, which has looser requirements), some minimum user engagement with the site - Chrome doesn't disclose the exact heuristic, but it's understood to require more than a single page load.
+</p>
+
+<p>
+A subtlety worth naming: meeting the criteria makes the browser <em>capable</em> of offering install, it doesn't guarantee a <code>beforeinstallprompt</code> event fires automatically - Chrome has, over versions, moved toward requiring more deliberate user engagement before surfacing the automatic prompt, specifically to cut down on low-quality "please install me" popups appearing on first visit.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reciting only "manifest + service worker + HTTPS" and stopping there. Naming the icon-size specifics, the engagement heuristic, and that the automatic prompt and the manual install affordance have different bars is what separates "read the MDN page once" from "actually debugged why the prompt wasn't firing."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q32">
+Q32. Explain maskable icons in depth - what's the "safe zone," and why do non-maskable icons get clipped?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Android's adaptive icon system lets the OS (or a custom launcher/theme) apply any mask shape it wants to a home-screen icon - circle, squircle, teardrop, rounded square - which means your icon's actual visible silhouette is decided at runtime by the device, not by you. A regular icon designed edge-to-edge (a square logo filling the full 512x512 canvas) gets its corners and edges cropped away arbitrarily depending on the mask, which is why square icons with important content near the edges look broken on many Android phones.
+</p>
+
+<p>
+A maskable icon, declared with <code>"purpose": "maskable"</code> in the manifest's icon entry, tells the OS "this icon is designed to be safely cropped to any shape" - which only works if you actually designed it that way, keeping all meaningful content inside the safe zone: a centered circle covering roughly 80% of the icon's width/height (a widely used rule of thumb is a 40% radius from center on a 512px icon, leaving roughly 10% padding on each edge as sacrificial background that different masks may or may not show). Tools like Maskable.io let you preview your icon under several real mask shapes before shipping it.
+</p>
+
+</div>
+
+<pre>
+{
+  "icons": [
+    { "src": "/icons/icon-any.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the ~80%-safe-zone rule of thumb and a real tool (Maskable.io) shows this was actually implemented, not just read about - a common gap is shipping one icon marked <code>"any maskable"</code> that was never actually designed with a safe zone, which looks fine on iOS and gets clipped everywhere it's masked on Android.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q33">
+Q33. What's the difference between <code>display: standalone</code>, <code>minimal-ui</code>, <code>fullscreen</code>, and the newer <code>display_override</code>?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+These control how much browser UI survives once the app is launched as installed. <code>browser</code> is just a normal tab. <code>standalone</code> hides the address bar and browser chrome but keeps the OS status bar and a minimal system back/close affordance - the most common choice, since it reads as "app-like" without losing basic navigation cues. <code>minimal-ui</code> is a middle ground (a thin back/forward/reload bar remains) that most mobile browsers actually just treat as <code>standalone</code> in practice - it's rarely worth targeting deliberately. <code>fullscreen</code> hides everything, including the OS status bar, which is appropriate for games or media apps but disorienting for a typical content app since there's no visible way back to the OS without a gesture.
+</p>
+
+<p>
+<code>display_override</code> is a newer array field that lets you request more specific modes - <code>window-controls-overlay</code> (draw your own UI into the title bar area on desktop, common for productivity PWAs that want a native-window feel) being the most notable - with the browser trying each value in order and falling back to the plain <code>display</code> field if none are supported. It exists because <code>display</code> alone couldn't express these newer, more specific modes without breaking older browsers that don't understand them.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reaching for <code>fullscreen</code> on a typical content app "to look more native." Without a deliberate in-app way back to normal browser UI, hiding the status bar entirely just makes the app feel like it's trapped - <code>standalone</code> is almost always the right default.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q34">
+Q34. How do <code>scope</code> and <code>start_url</code> interact, and what happens if <code>start_url</code> falls outside <code>scope</code>?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>scope</code> defines the set of URLs the browser considers "inside" the installed app - any navigation within scope stays in the standalone app window, while a link that navigates outside scope typically pops out into a regular browser tab (the exact behavior is display-mode and browser dependent, but the intent is consistent). <code>start_url</code> is simply what opens when the app is launched from the home screen icon.
+</p>
+
+<p>
+The manifest spec requires <code>start_url</code> to be within <code>scope</code> (scope defaults to the manifest's own directory if unset, and browsers will reject or auto-correct a manifest where <code>start_url</code> doesn't fall under it). Practically this matters most when <code>start_url</code> includes query params for analytics attribution (<code>/?source=pwa</code>) - that's still "within scope" as long as scope is the path prefix, not an exact string match, so query strings never break the containment check.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Setting <code>scope</code> to a narrow subpath (say, <code>/app/</code>) while leaving <code>start_url</code> pointing at the site root <code>/</code>. Browsers will either reject the manifest outright or silently widen the effective scope to include <code>start_url</code>, producing behavior that doesn't match what you intended - always keep the two consistent deliberately.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q35">
+Q35. What are manifest <code>shortcuts</code>, and how do they work?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>shortcuts</code> is a manifest array that lets an installed PWA expose jump-list-style actions directly from the OS icon - right-click on desktop, long-press on Android - the same way native apps show "New email," "New event," etc. Each entry names a label, a URL to open, and optionally its own icon; the OS renders these without your app needing to be running at all.
+</p>
+
+</div>
+
+<pre>
+{
+  "shortcuts": [
+    {
+      "name": "New order",
+      "short_name": "New order",
+      "url": "/orders/new?source=shortcut",
+      "icons": [{ "src": "/icons/new-order.png", "sizes": "96x96" }]
+    },
+    {
+      "name": "Search",
+      "url": "/search",
+      "icons": [{ "src": "/icons/search.png", "sizes": "96x96" }]
+    }
+  ]
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+This is a small, low-frequency feature, but naming a concrete use case (jumping straight to "create new X" from the icon, skipping the app's normal landing page) shows practical familiarity rather than reciting a spec field nobody's actually used.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q36">
+Q36. How does <code>share_target</code> let a PWA receive shared content from other apps?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Normally, sharing is one-directional from your PWA outward (via the Web Share API, <code>navigator.share()</code>). <code>share_target</code> in the manifest registers your installed PWA as a <em>destination</code> in the OS share sheet, so a user in a photo app, browser, or another app can choose your PWA as the target when sharing text, a URL, or files - the OS then navigates to (or POSTs to) the URL you declared, with the shared content attached as query params or a multipart form body.
+</p>
+
+</div>
+
+<pre>
+{
+  "share_target": {
+    "action": "/share-handler",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [{ "name": "media", "accept": ["image/*"] }]
+    }
+  }
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Forgetting that the receiving URL (<code>/share-handler</code>) must actually be handled - typically by a service worker's fetch handler that intercepts the POST, stores or forwards the payload, then redirects to a normal in-app URL, since a bare server-rendered response isn't how most SPAs want to handle this.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q37">
+Q37. How does iOS Safari's manifest support differ from Android Chrome's, and what fallbacks do you still need?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+iOS Safari has historically implemented a meaningfully smaller subset of the manifest spec, and while support has improved over recent iOS versions, a defensive PWA still ships the older Apple-specific meta tags alongside the manifest rather than trusting it alone. Practically: <code>apple-touch-icon</code> link tags are still the most reliable way to guarantee a home-screen icon on iOS (some iOS versions ignore the manifest's <code>icons</code> array for the actual home-screen image), <code>apple-mobile-web-app-capable</code> and <code>apple-mobile-web-app-status-bar-style</code> control standalone-mode and status-bar appearance the way <code>display</code> and <code>theme_color</code> do elsewhere, and <code>apple-mobile-web-app-title</code> sets the home-screen label independently of <code>short_name</code>.
+</p>
+
+<p>
+There is also no <code>beforeinstallprompt</code> event on iOS at all - install is entirely manual, via the Share sheet's "Add to Home Screen," which means any "Install app" button UX pattern (Q2) needs an iOS-specific fallback that shows instructions instead of triggering a prompt, since there is no programmatic install trigger to call.
+</p>
+
+</div>
+
+<pre>
+&lt;link rel="manifest" href="/manifest.json"&gt;
+&lt;link rel="apple-touch-icon" href="/icons/icon-180.png"&gt;
+&lt;meta name="apple-mobile-web-app-capable" content="yes"&gt;
+&lt;meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"&gt;
+&lt;meta name="apple-mobile-web-app-title" content="Acme"&gt;
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming that iOS has no <code>beforeinstallprompt</code> equivalent, so your custom "Install" UI needs a detect-iOS-and-show-instructions branch instead of silently doing nothing, is the detail that shows you've actually shipped this to iOS users, not just Android/desktop Chrome.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q38">
+Q38. The manifest is a static JSON file fetched once - how do you theme it for light/dark mode dynamically?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+You can't truly change a live manifest's <code>theme_color</code>/<code>background_color</code> per system theme after install - the manifest is read at install time and its splash-screen/theme values are effectively baked in for that installation. The two practical workarounds address different parts of the problem. First, the in-browser (non-installed) address-bar theming can respond to live theme changes via a separate, dynamic mechanism: multiple <code>&lt;meta name="theme-color"&gt;</code> tags with <code>media</code> attributes matching <code>prefers-color-scheme</code>, which the browser re-evaluates live and which is independent of the manifest entirely.
+</p>
+
+<p>
+Second, for the actually-installed splash screen and OS chrome, since the manifest's colors are fixed at install time, most production PWAs simply pick a neutral, theme-agnostic <code>background_color</code>/<code>theme_color</code> (often close to the app's brand color rather than pure white or pure black) that reads acceptably in both modes, and let the in-app UI do the real light/dark theming once it's actually rendered - accepting that the split-second splash screen won't perfectly match a system-dark-mode user's expectation.
+</p>
+
+</div>
+
+<pre>
+&lt;meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"&gt;
+&lt;meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)"&gt;
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Trying to solve this by regenerating and re-fetching <code>manifest.json</code> dynamically based on system theme. Browsers cache manifest data at install time and largely don't re-read it live for an already-installed app, so this approach quietly does nothing for existing installs - the dynamic <code>meta[name=theme-color]</code> trick only helps the in-browser, not-yet-installed experience.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h12">SECTION 9 - PUSH NOTIFICATIONS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q39">
+Q39. Walk through the complete push notification flow end to end, from subscribe to display.
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Five actors are involved, and naming all of them precisely is what separates a strong answer: your page, the browser's push service (run by the browser vendor - Google/Mozilla/Apple, not by you), your backend, the service worker, and the OS notification tray. First, the page asks the user for notification permission and, once granted, calls <code>registration.pushManager.subscribe()</code> with your VAPID public key; the browser talks to its push service and returns a subscription object containing an endpoint URL unique to that browser/device/user and a pair of encryption keys. Second, your page sends that subscription object to your backend, which stores it against the logged-in user.
+</p>
+
+<p>
+Third - potentially days or weeks later, and even with zero tabs open - your server, using a library like <code>web-push</code>, encrypts a payload with the subscription's keys and POSTs it to the subscription's endpoint, signing the request with your VAPID private key so the push service can verify it's really you. Fourth, the browser vendor's push service delivers that message to the specific browser instance, which wakes the service worker (even if it was fully unloaded) and fires a <code>push</code> event. Fifth, the service worker's handler calls <code>self.registration.showNotification()</code>, which is the only way to actually put something in the OS notification tray from a worker with no page open.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The detail that impresses: your server never talks to the browser directly - it talks to the browser vendor's push infrastructure, which is why push works with the site fully closed. Missing this and describing push as "the site sends a notification" is the most common shallow-answer tell.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q40">
+Q40. What are VAPID keys, and why did they replace the older sender-ID model?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+VAPID (Voluntary Application Server Identification) is a public/private key pair your server generates once and keeps for the life of the app. The public key is handed to <code>pushManager.subscribe()</code> so the browser's push service knows which application server is allowed to send to a given subscription; the private key signs every push request your server sends, letting the push service verify authenticity without you needing a vendor-specific account or API key per browser (Chrome, Firefox, etc. each used to require their own proprietary sender credentials - Chrome's old model required a Firebase/GCM sender ID tied to a Google account).
+</p>
+
+<p>
+The practical benefit: one VAPID key pair works across every browser that implements the standard Push API, so you generate it once, store the private half securely on your server, and never touch vendor-specific push consoles again - a meaningful simplification over the pre-VAPID era.
+</p>
+
+</div>
+
+<pre>
+// One-time key generation (e.g. via the web-push npm package)
+// npx web-push generate-vapid-keys
+
+// Subscribing from the page
+async function subscribe(registration) {
+  return registration.pushManager.subscribe({
+    userVisibleOnly: true, // required: every push must show a visible notification
+    applicationServerKey: VAPID_PUBLIC_KEY, // base64url-encoded
+  });
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Forgetting <code>userVisibleOnly: true</code> - Chrome requires it and will reject the subscription without it, since "silent push with no visible notification" was deemed a spam/tracking risk and is disallowed by policy on most platforms.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q41">
+Q41. How do you handle a push subscription expiring or changing?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A subscription can become invalid for several reasons: the user cleared site data, the browser rotated the underlying push endpoint for privacy reasons, or - most commonly in practice - your server sent a push and got back a 404/410 from the push service, meaning that endpoint is dead. There's also a <code>pushsubscriptionchange</code> event some browsers fire on the service worker when a subscription is proactively renewed by the browser itself, which you should handle by immediately re-subscribing and sending the new subscription object to your backend.
+</p>
+
+<p>
+The other half of the fix lives server-side: treat a 404/410 response from the push service as a signal to delete that stored subscription for the user rather than retrying it forever, since retrying a dead endpoint just wastes cycles and, at volume, can get your server flagged by the push service.
+</p>
+
+</div>
+
+<pre>
+self.addEventListener("pushsubscriptionchange", (event) =&gt; {
+  event.waitUntil(
+    self.registration.pushManager
+      .subscribe({ userVisibleOnly: true, applicationServerKey: VAPID_PUBLIC_KEY })
+      .then((sub) =&gt; fetch("/api/push/resubscribe", {
+        method: "POST",
+        body: JSON.stringify(sub),
+        headers: { "Content-Type": "application/json" },
+      }))
+  );
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming that a 404/410 from the push service means "stop sending to this endpoint, delete the row" rather than "retry with backoff" shows you understand push subscriptions have a real, finite lifetime you have to actively clean up, not treat as permanent once stored.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q42">
+Q42. What's the payload size limit for a push message, and how do you handle richer notification content?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The push payload itself is deliberately small - the spec caps encrypted payloads at 4KB, intended for a title, a short body, and small pieces of routing metadata, not for images or long content. If you need a richer notification (an image thumbnail, a longer body fetched at display time), the standard pattern is to send a minimal payload containing just enough to identify what happened (an ID, a type), and have the service worker's <code>push</code> handler make its own network request to fetch the fuller content before calling <code>showNotification()</code> - all still wrapped in <code>event.waitUntil()</code> so the worker isn't torn down mid-fetch.
+</p>
+
+</div>
+
+<pre>
+self.addEventListener("push", (event) =&gt; {
+  const { notificationId } = event.data.json(); // tiny payload: just an ID
+  event.waitUntil(
+    fetch(`/api/notifications/${notificationId}`)
+      .then((res) =&gt; res.json())
+      .then((full) =&gt;
+        self.registration.showNotification(full.title, {
+          body: full.body,
+          image: full.imageUrl, // richer content fetched on demand
+          icon: "/icons/icon-192.png",
+        })
+      )
+  );
+});
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Trying to cram a full rich payload - images, long text - directly into the encrypted push message and hitting the 4KB ceiling in production. Fetch-on-display is the standard workaround, and it also has the side benefit of always showing fresh content even if the push itself was delayed.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q43">
+Q43. How do you design notification permission UX to avoid users permanently denying it?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Once a user denies the browser's native notification permission prompt, most browsers will never show that prompt again for your origin - there's no programmatic way to re-ask, only a manual path through browser site settings that almost no user will ever find. This makes the <em>timing and framing</em> of the first (and only realistic) ask critical, unlike most permissions where a retry is cheap.
+</p>
+
+<p>
+The established best practice is a two-step ask: first show your <em>own</em> UI - a banner, a modal, an inline prompt - explaining specifically what the user gets ("get notified when your order ships") and asking them to opt in there; only call the real <code>Notification.requestPermission()</code> after they've clicked "yes" on your own prompt. This filters out users who would reflexively dismiss a permission dialog they don't understand yet, and means a "no" on your own UI costs you nothing (you can ask again later), while the one-shot browser prompt is only spent on users who've already indicated real interest.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The concrete, memorable framing: "you get infinite chances to ask your own UI, but effectively one chance to trigger the real browser prompt - spend it deliberately." This is one of the most commonly cited PWA UX best practices and interviewers listen for it explicitly.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q44">
+Q44. How do you target push notifications to specific users or segments from the backend?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Targeting is entirely a backend data-modeling concern - the Push API itself has no concept of "segments," only individual subscription endpoints. The standard shape: a <code>push_subscriptions</code> table/collection storing one row per subscription object (endpoint + keys), foreign-keyed to a user ID, with the understanding that one user can have multiple active subscriptions (one per browser/device they've enabled notifications on). Sending "to a user" means fetching all their subscription rows and sending the same payload to each endpoint; sending "to a segment" means running whatever query defines that segment (users who abandoned a cart, users in a region) and fanning out sends across all matching users' subscriptions, typically via a queue/worker so a large segment doesn't block a web request.
+</p>
+
+</div>
+
+<pre>
+async function notifyUser(userId, payload) {
+  const subs = await db.pushSubscriptions.findAllByUser(userId);
+  await Promise.allSettled(
+    subs.map((sub) =&gt;
+      webpush.sendNotification(sub, JSON.stringify(payload)).catch((err) =&gt; {
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          return db.pushSubscriptions.delete(sub.id); // dead endpoint, per Q41
+        }
+        throw err;
+      })
+    )
+  );
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Storing only one subscription per user and overwriting it on every new device/browser. A user with a phone and a laptop both opted in should get notified on both - modeling it as one-to-many from the start avoids a painful migration later.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q45">
+Q45. What happens if the service worker's <code>push</code> handler throws, or never calls <code>showNotification</code>?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Because <code>userVisibleOnly: true</code> is required at subscribe time (Q40), Chrome and other Chromium browsers actively enforce that promise at runtime: if a <code>push</code> event's handler resolves without having called <code>showNotification()</code> at least once, the browser shows its own generic fallback notification (something like "This site has been updated in the background") on your behalf, specifically to prevent silent, invisible push being used for tracking. Repeatedly failing to show a real notification can also affect the site's standing with the browser's push/notification quality heuristics over time.
+</p>
+
+<p>
+If the handler throws an unhandled error before ever calling <code>showNotification</code>, the same fallback-notification behavior applies - the browser doesn't distinguish "you chose not to show one" from "your code crashed," it just enforces the visible-notification contract either way. This is a strong argument for wrapping push handler logic in a try/catch that guarantees a fallback notification of your own design, so an error at least surfaces a message you control rather than the browser's generic one.
+</p>
+
+</div>
+
+<pre>
+self.addEventListener("push", (event) =&gt; {
+  event.waitUntil(
+    handlePush(event).catch(() =&gt;
+      self.registration.showNotification("Update available", { body: "Open the app to see what's new." })
+    )
+  );
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming that this enforcement exists specifically to prevent silent tracking-style push, and that a crashing handler is treated identically to a handler that deliberately shows nothing, demonstrates you understand the policy reasoning, not just the API surface.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q46">
+Q46. How do you test push notifications locally without a real push service round trip?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The full round trip (backend → real push service → device) is slow and awkward to iterate on, so most of the actual notification-display logic is tested by skipping straight to the part that matters: the service worker's <code>push</code> event handler. Chrome DevTools' Application → Service Workers panel has a "Push" button that dispatches a synthetic <code>push</code> event directly at your worker with a payload you type in, with no real backend or push service involved at all - this is the fastest loop for iterating on notification content/actions/click handling.
+</p>
+
+<p>
+For testing the server-side send path (VAPID signing, payload encryption, handling 404/410 responses) without spamming a real device, the <code>web-push</code> library works against any real subscription object you generate once in a throwaway browser tab and paste into a test script - there's no sandbox/mock push service, so this part is usually tested against the real infrastructure but with a disposable test subscription rather than production user data.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Not realizing DevTools can synthesize a <code>push</code> event directly and instead standing up a full backend-to-device round trip for every iteration on notification copy or click behavior - a needlessly slow feedback loop for something DevTools solves in one click.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h13">SECTION 10 - BACKGROUND SYNC &amp; PERIODIC BACKGROUND SYNC</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q47">
+Q47. How does one-off Background Sync actually decide that "connectivity has returned"?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+When a page calls <code>registration.sync.register("tag")</code>, the browser records that a sync is pending for that tag and takes over deciding when to fire it - your code doesn't control the timing directly. The browser combines its own network-state signals (the OS reporting an active connection, successful low-level connectivity probes) with heuristics about whether firing now is actually likely to succeed, rather than naively trusting <code>navigator.onLine</code> alone (which, as covered in Q6, is not a reliable success signal on its own). Once the browser's heuristic decides connectivity is probably real, it dispatches a <code>sync</code> event on the service worker, and your handler is responsible for actually retrying the queued work and resolving (or rejecting, which tells the browser to try again later with backoff) the promise passed to <code>event.waitUntil()</code>.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The key nuance: your code registers <em>intent</em>, the browser owns the <em>scheduling decision</em>. This is deliberately different from a simple <code>window.addEventListener("online", retry)</code> approach, which fires immediately on a flaky signal and doesn't survive the tab being closed - Background Sync is designed to work even with zero tabs open.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q48">
+Q48. What is Periodic Background Sync, and why is its support even narrower than one-off Background Sync?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+One-off Background Sync fires once, tied to a specific failed action waiting to be retried. Periodic Background Sync is a different, heavier-weight API intended for apps that want to refresh content in the background on a recurring interval (a news app pre-fetching the next batch of articles, a weather app updating its cache) even while closed - registered with a minimum interval, though the browser decides the actual cadence based on engagement, battery, and network conditions, and can skip cycles freely.
+</p>
+
+<p>
+Support is meaningfully narrower than one-off sync: it's Chromium-only, and further gated behind the PWA actually being <em>installed</em> plus meeting an engagement heuristic (Chrome specifically requires a "high site engagement score," intended to prevent every random tab from registering background wake-ups). Safari and Firefox implement neither one-off nor periodic sync as of this writing, so any reliance on either needs a full fallback path, not just a lesser one.
+</p>
+
+</div>
+
+<pre>
+// Registering (only after checking support and permission)
+async function registerPeriodicSync(registration) {
+  const status = await navigator.permissions.query({ name: "periodic-background-sync" });
+  if (status.state === "granted") {
+    await registration.periodicSync.register("refresh-feed", { minInterval: 24 * 60 * 60 * 1000 });
+  }
+}
+
+self.addEventListener("periodicsync", (event) =&gt; {
+  if (event.tag === "refresh-feed") event.waitUntil(refreshFeedCache());
+});
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Confusing the two APIs' purposes - reaching for Periodic Background Sync to retry a single failed POST (that's one-off sync's job), or reaching for one-off sync to "keep content fresh in the background" (that's periodic sync's job, and one-off sync gives no such recurring guarantee).
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q49">
+Q49. How do you build a fallback for Background Sync on browsers where the API doesn't exist at all?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Feature-detect first (<code>"sync" in registration</code>), and when it's unavailable, replicate the essential behavior at the application layer instead of the platform layer: persist failed requests to IndexedDB yourself, and retry them from multiple triggers you <em>can</em> rely on cross-browser - the <code>online</code> window event firing (best-effort, not authoritative per Q6, but useful as a hint to try), the app regaining focus/visibility, and a periodic in-page timer while the app happens to be open. The key mental shift: without native Background Sync, you lose the "retry even with the tab fully closed" guarantee - the fallback can only retry while the page is at least loaded somewhere, which is a real capability gap, not just a syntax difference, and should be communicated honestly rather than papered over.
+</p>
+</div>
+
+<pre>
+const hasBackgroundSync = "SyncManager" in window;
+
+async function queueFailedRequest(request) {
+  await db.put("outbox", { url: request.url, body: await request.text(), createdAt: Date.now() });
+  if (hasBackgroundSync) {
+    const registration = await navigator.serviceWorker.ready;
+    await registration.sync.register("flush-outbox");
+  }
+  // Fallback path: retry opportunistically while the app happens to be open.
+  window.addEventListener("online", flushOutbox, { once: true });
+  document.addEventListener("visibilitychange", () =&gt; {
+    if (document.visibilityState === "visible") flushOutbox();
+  });
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Being upfront that the fallback is strictly weaker - it cannot retry with the app fully closed the way native Background Sync can on Chromium - shows honest technical judgment rather than implying the fallback is an equivalent substitute.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q50">
+Q50. How would you design a sync queue that preserves ordering - e.g., a "create" must apply before its later "update"?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Background Sync (and any hand-rolled fallback) gives you "eventually retried," not "retried in order" for free - if you queue several independent mutations and let them fire in parallel, a later update can race ahead of the create it depends on and fail against a resource that doesn't exist yet server-side. The fix is modeling the queue as an ordered log, not a bag of independent jobs: store each entry with a monotonically increasing sequence number (an auto-incrementing IndexedDB key works well) and a reference to what it logically depends on, then process strictly sequentially - awaiting each request's real success before dequeuing and starting the next - rather than firing them all with <code>Promise.all</code>.
+</p>
+
+<p>
+For truly related operations (an update to an entity that doesn't exist yet locally either), an even simpler pattern is coalescing: rather than queuing "create" then "update" as two network operations, merge them into a single queued "create-with-final-state" entry while offline, so there's only ever one request to replay and no ordering problem to solve at all.
+</p>
+
+</div>
+
+<pre>
+async function flushOutboxInOrder() {
+  const entries = await db.getAllSorted("outbox", "sequence");
+  for (const entry of entries) {
+    try {
+      await fetch(entry.url, { method: entry.method, body: entry.body });
+      await db.delete("outbox", entry.id); // only dequeue on confirmed success
+    } catch {
+      break; // stop here - do NOT skip ahead and risk out-of-order application
+    }
+  }
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming coalescing ("merge create+update into one request while still offline") as an alternative to strict sequential replay shows you'd rather design the ordering problem away entirely than build careful-but-fragile sequencing logic to survive it.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q51">
+Q51. What battery/data-usage constraints do browsers impose on background sync, and why?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Because both one-off and periodic sync can wake a service worker with zero user-visible activity, browsers deliberately throttle them to prevent PWAs from becoming a battery/data drain competing with native apps that go through the OS's own background-task budgeting. Concretely: periodic sync respects the requested <code>minInterval</code> only as a floor, not a guarantee - the browser can and will skip cycles under low battery, metered/cellular connections, or low site-engagement conditions; one-off sync retries with an increasing backoff if your handler's promise rejects, rather than hammering the network immediately and repeatedly.
+</p>
+
+<p>
+The practical implication for design: never build a feature that assumes background sync fires promptly or on a strict schedule - treat every guarantee as "eventually, probably, if conditions are favorable," and make sure the product experience degrades gracefully (an in-app "last synced X ago" indicator) rather than assuming near-real-time background delivery.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Designing a feature around Periodic Background Sync's <code>minInterval</code> as if it were a cron schedule. It's a lower bound the browser is free to exceed arbitrarily based on conditions you don't control or observe - treat it as a hint, not a contract.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q52">
+Q52. How do you avoid duplicate submissions if a queued sync retries a request that actually succeeded server-side, but the client never got the response?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is a classic at-least-once-delivery problem and it's common in offline sync: the request reaches the server and is processed, but the response is lost (connection drops right after), so the client's queue still thinks it failed and retries - now you risk two orders, two payments, two identical records. The standard fix is <b>idempotency keys</b>: the client generates a unique ID for the logical operation once, at the moment it's first queued (not on every retry), and sends it as a header or field on every attempt; the server persists which idempotency keys it has already processed and, on seeing a repeat, returns the original result instead of re-executing the mutation.
+</p>
+
+<p>
+This has to be designed on both ends - a client-only fix (deduping in the queue) can't protect against the server having already applied the first attempt, and a server-only fix requires the client to actually send a stable key rather than generating a fresh one on every retry, which defeats the whole point.
+</p>
+
+</div>
+
+<pre>
+// Client: generate the key ONCE, when the entry is first queued
+async function queueOrder(payload) {
+  const idempotencyKey = crypto.randomUUID();
+  await db.put("outbox", { payload, idempotencyKey, createdAt: Date.now() });
+}
+
+// Every retry reuses the SAME key
+await fetch("/api/orders", {
+  method: "POST",
+  headers: { "Idempotency-Key": entry.idempotencyKey },
+  body: JSON.stringify(entry.payload),
+});
+
+// Server: check-and-store before executing the mutation
+if (await db.idempotencyKeys.exists(key)) {
+  return db.idempotencyKeys.getStoredResponse(key); // replay, don't re-execute
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+This question quietly tests whether a candidate understands "at-least-once delivery" as a general distributed-systems concept, not a PWA-specific quirk - background sync just happens to be a very common place frontend engineers first encounter it.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q53">
+Q53. How does Periodic Background Sync's permission model differ from the regular Notification permission prompt?
+</div>
+
+<p class="roi">
+ROI: ★★☆☆☆
+Frequency: Low-Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Notification permission is an explicit, user-facing prompt - the browser shows a dialog, the user clicks allow/block, and the result is a durable, queryable permission state. Periodic Background Sync has no equivalent visible prompt at all; instead, access is gated silently behind the browser's own site-engagement scoring (how much the user actually interacts with the installed PWA over time) combined with the app being installed in the first place. There's no user-facing "allow periodic sync?" dialog to design UX around, and no way to explicitly request it beyond calling <code>register()</code> and checking whether <code>navigator.permissions.query({ name: "periodic-background-sync" })</code> reports <code>"granted"</code> - which the browser decides unilaterally based on usage signals you can't directly observe or influence beyond generally driving engagement.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Designing a permission-request UX flow for Periodic Background Sync the way you would for notifications. There is no dialog to trigger - the right move is simply checking the permission query result and silently falling back to on-demand refresh if it isn't granted, since there's nothing for the user to click either way.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q54">
+Q54. How would you monitor background sync success/failure rates in production, given it happens with no open tab?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Standard page-load-based analytics is useless here by definition - the whole point of background sync is that it can run with nothing rendered. The service worker itself has to be the source of telemetry: inside the <code>sync</code> event handler, after attempting the queued work, send a lightweight beacon (a simple <code>fetch()</code> POST to an analytics endpoint, or <code>navigator.sendBeacon</code> if called from a page context) reporting success/failure/retry-count for that sync attempt, wrapped in the same <code>waitUntil()</code> as the retry logic so it isn't dropped if the worker gets torn down right after.
+</p>
+
+<p>
+On the backend, this becomes an ordinary metrics problem once the events land: track sync success rate, average retry count before success, and how often entries exceed <code>maxRetentionTime</code> and get silently dropped (Q7's <code>BackgroundSyncPlugin</code> config) - that last number specifically tells you whether your offline queue is actually recovering, or quietly losing user data past the retention window.
+</p>
+
+</div>
+
+<pre>
+self.addEventListener("sync", (event) =&gt; {
+  if (event.tag !== "flush-outbox") return;
+  event.waitUntil(
+    flushOutboxInOrder()
+      .then(() =&gt; reportSyncMetric("success"))
+      .catch((err) =&gt; reportSyncMetric("failure", err).then(() =&gt; Promise.reject(err)))
+  );
+});
+
+function reportSyncMetric(status, err) {
+  return fetch("/api/metrics/sync", {
+    method: "POST",
+    body: JSON.stringify({ status, message: err?.message, ts: Date.now() }),
+  }).catch(() =&gt; {}); // never let telemetry failure mask the real sync result
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming "how often does an entry exceed max retention and get silently dropped" as the metric that actually matters shows you understand the failure mode that's invisible without instrumentation - a queue that quietly drops data past a retention window looks identical to a healthy one until someone measures it.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h14">SECTION 11 - OFFLINE-FIRST ARCHITECTURE PATTERNS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q55">
+Q55. What does "offline-first" mean architecturally, as distinct from merely "offline-tolerant"?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Offline-tolerant means the network is the primary source of truth and offline is a degraded fallback state you patch over with caching - the app works online-first and merely "survives" a dropped connection, often with a visibly worse experience. Offline-first inverts the assumption: every read and write goes through a local store (IndexedDB, in practice) first, the UI always renders from that local store regardless of connectivity, and syncing with the server is a background concern layered on top rather than the thing the UI directly waits on. The user never sees a fundamentally different app depending on whether the network happens to be up.
+</p>
+
+<p>
+This is a genuinely different architecture, not just "add a service worker": writes are optimistic against the local store immediately, a sync engine reconciles the local store with the server asynchronously (Q56-Q57), and the UI subscribes to the local store's changes rather than to network responses directly. It's substantially more engineering effort than offline-tolerant caching, and is usually only justified for apps where working with zero or flaky connectivity is a core requirement (field service tools, note-taking, anything targeting users on unreliable networks) rather than a nice-to-have.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The crisp distinction to lead with: "offline-tolerant treats the network as truth and offline as an exception to paper over; offline-first treats the local store as truth and the network as a background sync target." Naming the added engineering cost explicitly, and that it's only worth it for apps where offline is a core requirement, shows judgment rather than reflexive enthusiasm for the pattern.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q56">
+Q56. How do you design a local-first write path - optimistic UI, IndexedDB write, queued sync, reconciliation?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The write path has four stages that all have to happen in the right order for the pattern to actually deliver its promise. First, the UI updates immediately and optimistically from the user's action, without waiting on anything network-related. Second, that same change is written to IndexedDB synchronously with the UI update (so a page refresh a millisecond later still shows the change) and tagged as "pending sync." Third, the change is enqueued for background delivery to the server - using Background Sync where available, a manual retry loop otherwise (Q49). Fourth, once the server confirms, the local record's "pending" flag clears; if the server instead rejects it (a validation error, a conflict), the reconciliation step decides whether to roll back the optimistic UI change, show an error, or attempt an automatic merge (Q57).
+</p>
+
+</div>
+
+<pre>
+async function createNoteOfflineFirst(note) {
+  const localId = crypto.randomUUID();
+  const record = { ...note, id: localId, status: "pending", createdAt: Date.now() };
+
+  await db.put("notes", record);      // 1+2: local store is truth immediately
+  renderNoteOptimistically(record);   // UI never waits on network
+
+  queueSync({ type: "create-note", localId, payload: note }); // 3: background delivery
+
+  return record;
+}
+
+async function onSyncConfirmed(localId, serverRecord) {
+  await db.put("notes", { ...serverRecord, status: "synced" }); // 4: reconcile
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Explicitly separating "the UI update" from "the durable local write" from "the network sync" as three distinct steps - rather than one blended operation - is what distinguishes a real offline-first design from a hand-wavy description of one.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q57">
+Q57. What conflict-resolution strategies exist when a queued offline write conflicts with a server-side change made in the meantime?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Several strategies exist along a spectrum of simplicity versus correctness. <b>Last-write-wins</b> is the simplest - whichever write has the later timestamp overwrites the other unconditionally - and it's acceptable for low-stakes data (a UI preference, a draft note) but silently discards real work when two genuinely different edits collide. <b>Field-level merge</b> improves on this by diffing which specific fields each side actually changed and merging non-overlapping changes automatically, only surfacing a real conflict when both sides touched the <em>same</em> field. <b>Manual/user-mediated merge</b> punts the decision to the user when an automatic merge isn't safe - showing both versions and asking them to pick or combine, the way Git presents a merge conflict.
+</p>
+
+<p>
+<b>CRDTs</b> (Conflict-free Replicated Data Types) are the most sophisticated option: data structures specifically designed so that concurrent edits from multiple sources can always be merged automatically and deterministically without a central authority resolving anything - text CRDTs power real-time collaborative editors, and counter/set CRDTs handle collaborative counting or tagging. They're powerful but add real complexity and are usually only worth adopting when true concurrent multi-writer editing (not just "one device was briefly offline") is a core product requirement.
+</p>
+
+</div>
+
+<table border="1">
+<tr><th>Strategy</th><th>Complexity</th><th>Best for</th></tr>
+<tr><td>Last-write-wins</td><td>Low</td><td>Low-stakes, rarely-conflicting data</td></tr>
+<tr><td>Field-level merge</td><td>Medium</td><td>Structured records edited by one user at a time</td></tr>
+<tr><td>Manual merge</td><td>Medium</td><td>High-stakes edits where silent loss is unacceptable</td></tr>
+<tr><td>CRDTs</td><td>High</td><td>True concurrent multi-user editing (collaborative docs)</td></tr>
+</table>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reaching for CRDTs by default because they sound impressive. For the common offline-first case - one user, one device, briefly disconnected - last-write-wins or field-level merge is almost always sufficient and far simpler to reason about; CRDTs earn their complexity only under genuine concurrent multi-writer conditions.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q58">
+Q58. How do you structure IndexedDB object stores and indexes to support a sync queue with retry and ordering?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A practical schema separates domain data from sync bookkeeping rather than mixing "pending" flags scattered across every entity table. One store per entity type (<code>notes</code>, <code>orders</code>) holds the actual domain records, each with a lightweight <code>syncStatus</code> field (<code>"synced" | "pending" | "error"</code>). A separate <code>outbox</code> store holds one row per queued mutation - not per entity - with an auto-incrementing key (which IndexedDB naturally sorts by insertion order, giving you the ordering guarantee from Q50 for free), a reference to which entity/operation it represents, retry count, and last-attempted timestamp. An index on <code>syncStatus</code> in the entity stores lets the UI cheaply query "show me everything still pending" for a sync indicator (Q59) without scanning the outbox.
+</p>
+
+</div>
+
+<pre>
+const db = await openDB("app-db", 1, {
+  upgrade(db) {
+    const notes = db.createObjectStore("notes", { keyPath: "id" });
+    notes.createIndex("by-syncStatus", "syncStatus");
+
+    const outbox = db.createObjectStore("outbox", { keyPath: "seq", autoIncrement: true });
+    outbox.createIndex("by-entity", "entityId");
+  },
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Separating "domain data" from "sync bookkeeping" into different stores, rather than bolting sync metadata onto every entity ad hoc, is the schema decision that keeps a sync engine maintainable as more entity types get added later.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q59">
+Q59. How do you communicate offline/sync state to the user without being silent or annoying?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Two failure modes to avoid at opposite ends: total silence (the user has no idea their edit hasn't actually reached the server yet, and closes the laptop assuming it's saved) and noise (a toast or spinner interrupting every single sync event, which trains users to ignore all of them, including the ones that matter). The middle ground most offline-first apps converge on is a small, persistent, low-key status indicator - a subtle "syncing…" / "all changes saved" / "N changes waiting to sync" element, usually near the top of the UI, that's always present but never modal or blocking.
+</p>
+
+<p>
+For failures specifically (Q62), the bar for interrupting the user should be higher than for a normal pending-sync state - a change that's queued and simply hasn't gone out yet doesn't need an alert, but a change the server has actively rejected (a validation error, a real conflict) does need to surface somewhere the user will actually see it, since silently dropping a rejected edit is worse than any amount of "annoying" notification.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating "pending, will sync eventually" and "failed, needs the user's attention" as the same UI state. Conflating them either buries real failures in routine sync noise, or trains users to panic at completely normal offline behavior.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q60">
+Q60. How would you version your IndexedDB schema and migrate data across app updates?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>indexedDB.open(name, version)</code> takes an explicit integer version number, and opening with a higher version than what's currently stored fires an <code>upgrade</code> callback (in the <code>idb</code> wrapper) with both the old and new version numbers, inside a special versionchange transaction where you're allowed to create/delete object stores and indexes and to read/write existing data to reshape it. Migrations should be written as a sequence of incremental steps gated by <code>oldVersion</code>, each one handling exactly one version bump, rather than one big "if newest version, do everything" block - that keeps a user upgrading from version 1 straight to version 4 running steps 1→2, 2→3, and 3→4 in order, correctly, rather than skipping intermediate transformations.
+</p>
+
+</div>
+
+<pre>
+const db = await openDB("app-db", 4, {
+  upgrade(db, oldVersion) {
+    if (oldVersion &lt; 2) {
+      db.createObjectStore("notes", { keyPath: "id" });
+    }
+    if (oldVersion &lt; 3) {
+      db.transaction.objectStore("notes").createIndex("by-syncStatus", "syncStatus");
+    }
+    if (oldVersion &lt; 4) {
+      // Backfill a new required field on every existing record.
+      const store = db.transaction.objectStore("notes");
+      store.openCursor().then(function walk(cursor) {
+        if (!cursor) return;
+        cursor.update({ ...cursor.value, syncStatus: cursor.value.syncStatus ?? "synced" });
+        cursor.continue().then(walk);
+      });
+    }
+  },
+});
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Writing migrations as one unconditional block that assumes every user is coming from the immediately previous version. Real users skip versions (an app that wasn't opened for months), and unconditioned migration code silently corrupts or skips data for anyone who wasn't on exactly <code>version - 1</code>.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q61">
+Q61. What's the role of a library like Dexie.js, RxDB, or PouchDB versus hand-rolling this with <code>idb</code>?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>idb</code> is a thin promise wrapper around raw IndexedDB - it removes the callback boilerplate but you still design and implement schema, querying, and sync yourself. Dexie.js goes further, adding a much friendlier query API (chained <code>.where().equals()</code> filters, compound indexes) and a well-regarded observable/live-query layer, but still leaves sync-with-a-server as your own responsibility to build. RxDB and PouchDB are a bigger step up the stack: they bake in an actual replication protocol (PouchDB famously syncs with CouchDB out of the box; RxDB supports several backends and a GraphQL replication plugin) plus built-in conflict-resolution primitives, essentially giving you a real offline-first sync engine rather than just a nicer local database API.
+</p>
+
+<p>
+The trade-off is the usual one: a full sync-engine library saves enormous effort if your backend fits its expected replication model, but is a much bigger dependency and abstraction to adopt than <code>idb</code>/Dexie, and is a poor fit if your backend is a bespoke REST/GraphQL API that doesn't speak the library's replication protocol - in that case hand-rolling the queue-and-reconcile logic on top of a lighter local-database wrapper is often the more pragmatic choice.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Framing this as "local-database-API" (idb, Dexie) versus "full replication engine" (RxDB, PouchDB) rather than treating all four as interchangeable options shows you understand they solve different-sized problems, and that the right choice depends on whether your backend can speak a replication protocol at all.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q62">
+Q62. How do you handle partial sync failures, where some queued mutations succeed and others fail?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Never let one failing entry block or corrupt the rest of the queue's processing state - a naive implementation that processes the outbox in a single transaction, or that stops all further syncing entirely on the first error, turns one bad mutation into a total sync outage. The pattern is to process each queued entry independently, dequeuing on individual success and leaving individual failures in place with their own retry count and last-error recorded, while continuing to attempt the rest of the queue (subject to the ordering constraint from Q50 for entries that are genuinely dependent on each other).
+</p>
+
+<p>
+Failures also need a classification: transient failures (network error, 503, timeout) should retry with backoff; permanent failures (a 400 validation error, a 409 conflict the server will never auto-resolve) should stop retrying automatically and surface the error to the user or a manual-resolution UI instead, since retrying a request the server will reject every time just wastes cycles and delays the healthy entries behind it.
+</p>
+
+</div>
+
+<pre>
+async function flushOutbox() {
+  const entries = await db.getAllSorted("outbox", "sequence");
+  for (const entry of entries) {
+    try {
+      await sendMutation(entry);
+      await db.delete("outbox", entry.id);
+    } catch (err) {
+      if (isPermanentFailure(err)) {
+        await db.put("outbox", { ...entry, status: "failed", error: err.message });
+        continue; // don't block the rest of the queue on a permanent failure
+      }
+      await db.put("outbox", { ...entry, retryCount: entry.retryCount + 1 });
+      break; // transient failure: stop here to preserve ordering, retry next cycle
+    }
+  }
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The distinction between "permanent, stop retrying and surface to the user" and "transient, retry with backoff" is the piece candidates most often skip - treating every failure identically either spams retries against a request that will never succeed, or silently gives up on one that would have worked on the next attempt.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h15">SECTION 12 - THE APP SHELL MODEL</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q63">
+Q63. What is the "app shell" model precisely, and how does it differ from just caching the whole page?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The app shell is the minimal HTML/CSS/JS needed to render the application's <em>chrome</em> - navigation, layout skeleton, header/footer, loading states - completely independent of any actual content, which is fetched separately and layered in afterward. The key architectural move is treating "the shell" and "the content" as two different cacheability profiles: the shell almost never changes and can be aggressively cache-first/precached (Q4-Q5), while content changes constantly and needs its own, usually much shorter-lived, caching or network-first strategy.
+</p>
+
+<p>
+This is a meaningfully different thing from "cache the whole rendered page," which conflates shell and content into one blob - either you cache too aggressively (content goes stale because the whole page, including data, is treated as immutable) or not aggressively enough (the shell itself gets re-fetched over the network every time, just to render the same nav bar it rendered yesterday). Splitting them means the shell paints instantly on every repeat visit from cache, while the content underneath streams in fresh, independent of how the shell was served.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The clean framing: "cache the skeleton like it's a static asset, fetch the content like it's dynamic data - because that's exactly what each one is." A candidate who describes app-shell as "cache the homepage" is missing the actual architectural insight.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q64">
+Q64. How do you architect a React app's build so the shell is a separate, cacheable bundle from route-level content?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Practically, this maps onto ordinary code-splitting done with the shell/content split in mind rather than purely by route. The layout components (nav, header, footer, app-level providers) and their styles should live in a bundle that's shared and stable across every route - bundlers naturally hoist genuinely shared code into a common chunk, but it helps to be deliberate about it (a dedicated <code>AppShell</code> component tree, imported by every route but never itself split per-route) so the bundler's chunk-splitting heuristics have an obvious, stable boundary to key off. Route-specific components and data-fetching logic are lazy-loaded per route via <code>React.lazy</code>/dynamic imports, so navigating to a new route only pulls in that route's chunk, never re-fetching the shell.
+</p>
+
+<p>
+On the service worker side, this maps directly onto Q5's precaching: the shell's stable, hashed bundle goes into the Workbox precache manifest (fetched once, essentially never re-fetched until it actually changes), while route chunks are handled by runtime caching rules (cache-first once fetched, since they're also hash-named, but not proactively precached unless you know a route is critical enough to warrant it).
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Precaching every route's JS chunk at install time "to be thorough." This bloats the initial install (slower first visit, more storage used) for routes the user may never visit - runtime caching for anything beyond the shell and the most critical routes is usually the better trade-off.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q65">
+Q65. How does the app shell model interact with SSR/Next.js, where the initial HTML already contains real content, not just a shell?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The classic app-shell model was designed for client-rendered SPAs, where the first HTML response genuinely is just a near-empty skeleton. SSR breaks that assumption on purpose - the whole point of SSR is that the first response already contains real, rendered content, which is good for first-paint and SEO but means "cache the shell, fetch content separately" isn't a clean fit for the very first request.
+</p>
+
+<p>
+In practice, an SSR/Next.js PWA applies the app-shell idea one layer up: the service worker uses network-first (or stale-while-revalidate) for the SSR'd HTML document itself, since that response mixes shell and content and freshness matters, while still aggressively cache-first precaching the truly static shell <em>assets</em> - the JS/CSS bundles, fonts, icons - that are shared across every server-rendered page and never change per-request. Client-side navigations after the first load behave much more like the classic SPA case (React hydration takes over, subsequent route transitions fetch only data/RSC payloads, not full documents), so the shell/content split reasserts itself naturally once you're past the initial SSR response.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Recognizing that SSR doesn't invalidate the app-shell idea, it just moves where the split happens - shell-vs-content applies to the static assets and to post-hydration navigation, while the very first HTML response is handled with ordinary network-first/SWR caching - shows real architectural thinking rather than reciting the SPA-era version of the pattern unchanged.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q66">
+Q66. What's the risk of an app shell cached too aggressively - stale navigation or branding surviving a rebrand or feature-flag flip?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Precisely because the shell is designed to be cached almost indefinitely, anything baked into it becomes sticky in a way that's easy to forget about - a nav item that should have been removed by a feature flag, an old logo after a rebrand, copyright text with last year's date. If the shell bundle's actual bytes didn't change (the flag check happens at runtime against a config the shell fetches separately, say), content-hashed cache-busting doesn't help at all, because from the cache's point of view nothing changed.
+</p>
+
+<p>
+The fix is treating anything that needs to update independently of a full deploy - feature flags, remotely configurable copy, A/B test assignments - as data the shell fetches at runtime (ideally via a short-TTL or network-first request) rather than as something baked into the shell bundle itself; the shell's job is structural layout, not the specific dynamic values rendered inside it. Anything that genuinely is baked into the shell bundle (real branding, real nav structure) does get the benefit of the standard hashed-filename fix from Q5/Q8 - a rebrand ships a new bundle hash, and the update flow in Q8 takes it from there.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Baking feature-flag-gated UI directly into the precached shell bundle and being surprised when disabling the flag server-side doesn't remove it for already-cached users. Anything meant to change without a full redeploy has to be fetched at runtime, not compiled into the aggressively cached shell.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q67">
+Q67. How do you combine the app shell model with code-splitting so the shell loads instantly but route chunks are fetched on demand?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The two techniques are complementary and meant to be layered: code-splitting decides <em>what JS gets bundled together</em> at build time, the app-shell caching strategy decides <em>how each resulting bundle gets served</em> at runtime, and they need to agree on the same boundary to actually pay off together. Concretely: the router-level split already isolates each route's code into its own chunk; the service worker's precache manifest includes only the shell chunk(s) (Q64), while route chunks are picked up by a runtime <code>registerRoute</code> rule matching the build's JS output pattern with a cache-first strategy (since they're hash-named, cache-first is safe and correct) plus an expiration cap (Q29) so chunks for routes the user visited once, long ago, don't accumulate forever.
+</p>
+
+<p>
+The net effect: first visit pays for the shell plus whatever route it landed on; every subsequent navigation to a <em>new</em> route pays a real, small network cost once (fetching that route's chunk), but every repeat visit to any <em>previously visited</em> route is fully cache-first and instant, and the shell itself is never re-fetched across any of it.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming that code-splitting and the caching strategy have to "agree on the same chunk boundary" to actually compound - splitting code one way while caching by a completely different URL pattern is a common gap that quietly defeats both optimizations.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q68">
+Q68. How do you design a loading/skeleton state so the shell renders instantly on both first visit and repeat visit?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The two visits have genuinely different constraints and deserve different handling rather than one generic spinner. On a <em>first</em> visit, nothing is cached yet - the shell itself has to come over the network, so the very first paint should be an inline, zero-dependency skeleton (critical CSS inlined in the initial HTML, no separate JS/CSS fetch required to show <em>something</em>) so the user sees structure immediately rather than a blank white screen while the shell bundle downloads. On a <em>repeat</em> visit, the shell is already cache-first from Cache Storage, so it should paint essentially instantly with no visible loading state at all for the shell itself - only the content underneath (which is genuinely being fetched fresh) needs its own skeleton/loading indicator, scoped to the content area, not the whole page.
+</p>
+
+<p>
+Conflating the two - showing a full-page skeleton on every visit regardless of whether the shell is actually cached - wastes the exact benefit the app-shell model is supposed to deliver: instant repeat visits.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reusing the same "cold start" loading UI on every visit regardless of cache state. If the shell is precached, showing a shell-level skeleton on a repeat visit is pure regression - the loading state belongs to the content region only, once the shell itself is reliably instant.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q69">
+Q69. How do you test that your app shell actually renders correctly with zero network connectivity, as part of CI?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This has to be a real browser test, not a unit test - the whole claim being verified ("the shell renders with the network fully off") only means something if a real service worker actually intercepted a real navigation. Playwright is the practical tool: launch a real browser context, navigate normally so the service worker installs and activates for real, then flip <code>context.setOffline(true)</code>, reload, and assert the shell's key structural elements are present and visible - nav, header, the app's root container - independent of whether any content data loaded successfully underneath.
+</p>
+
+</div>
+
+<pre>
+test("app shell renders with zero network", async ({ page, context }) =&gt; {
+  await page.goto("/");
+  await page.waitForFunction(() =&gt; navigator.serviceWorker.controller !== null);
+
+  await context.setOffline(true);
+  await page.reload();
+
+  await expect(page.locator("nav[data-testid=app-nav]")).toBeVisible();
+  await expect(page.locator("[data-testid=app-shell-root]")).toBeVisible();
+  // Content area may legitimately show an offline/error state - that's a separate assertion.
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Explicitly scoping the assertion to the shell's structural elements, and treating the content area's offline behavior as a separate, distinct test, mirrors the shell/content split from Q63 - conflating them in one assertion is the same modeling mistake in test form.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q70">
+Q70. What's the difference between the app shell model and "critical CSS inlining" - are they solving the same problem?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+They're related but solve different halves of the same "avoid a blank screen" problem, and interviewers sometimes probe whether you conflate them. Critical CSS inlining addresses the very first paint of a <em>single</em> page load - extracting just the CSS needed to render above-the-fold content and inlining it directly in the HTML <code>&lt;head&gt;</code>, so the browser doesn't block first paint on a separate stylesheet round trip. It's a same-request optimization with no dependency on caching or service workers at all.
+</p>
+
+<p>
+The app shell model addresses <em>repeat</em> visits and offline resilience by caching the layout/navigation structure itself so it doesn't need to be fetched (or fully re-rendered from scratch) again. They compose well together rather than compete: critical CSS gets the very first, uncached paint looking good as fast as possible, while the app shell's service-worker caching is what makes every visit <em>after</em> the first essentially free. Neither replaces the other - one is about the first millisecond of one page load, the other is about not repeating that work at all on return visits.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating "we inline critical CSS" as evidence the app already has an app-shell architecture, or vice versa. They're independent techniques that happen to both target early-render performance, and a mature PWA typically uses both together, not one instead of the other.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">SECTION 13 - PWA PERFORMANCE &amp; LIGHTHOUSE AUDITS DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q71">
+Q71. Beyond installability, what PWA-specific anti-patterns does Lighthouse flag - like a redirect on <code>start_url</code>?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A few subtle ones come up repeatedly in real audits. A <code>start_url</code> that redirects (say, to a locale-specific path, or through an auth check) fails the installability check outright, because the manifest's <code>start_url</code> is required to resolve directly without a redirect hop - locale/auth logic needs to live inside the app after it loads, not as a server-side redirect on the URL the manifest points at. A service worker registered but scoped so narrowly it doesn't actually cover the page that registered it is flagged as ineffective. A manifest served with the wrong MIME type (not <code>application/json</code> or <code>application/manifest+json</code>) can be silently ignored by some browsers even though it "looks" correct in the network tab. And a viewport meta tag missing or misconfigured (no <code>width=device-width</code>) undermines the "PWA optimized" checks even when installability itself passes.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the redirect-on-start_url case specifically is a strong signal - it's one of the more common real-world reasons a PWA that "looks" correctly configured mysteriously fails Lighthouse's installability check, and it's not obvious unless you've actually debugged it.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q72">
+Q72. How does a poorly written service worker fetch handler actively hurt LCP/INP, rather than just fail to help?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Once a service worker is in control, it sits in the path of <em>every</em> request, including the very first document and asset requests that determine LCP - so a slow or badly-implemented handler doesn't just fail to help, it becomes new overhead the unregistered version of the site never had. Concretely: a fetch handler that does an unnecessary <code>await</code> chain before deciding cache-vs-network on every single request adds latency to everything, even requests that end up going to network anyway; a cache-first strategy applied to something that should be network-first can serve a stale LCP-candidate image or hero asset, technically painting fast but painting the <em>wrong</em> thing; and opening a fresh Cache Storage handle (<code>caches.open()</code>) inside the hot path of every fetch rather than reusing a resolved handle adds avoidable per-request overhead at scale.
+</p>
+
+<p>
+The general principle: a service worker's fetch handler is now part of your critical rendering path for every resource, so its own code needs the same performance discipline as any other hot-path code - minimize branching cost, avoid redundant async work, and profile it (Q73) rather than assuming "it's just caching, it must be fast."
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating the service worker as pure upside because "it's just caching." A badly written fetch handler is squarely in the critical path and can regress Core Web Vitals for every user, cached or not - it needs performance scrutiny like any other code that runs on every request.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q73">
+Q73. How do you profile a service worker's own performance - cache lookup latency, handler overhead - using DevTools?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Chrome DevTools' Performance panel records service worker activity on its own thread track, separate from the main thread, when you record a trace while the SW is intercepting requests - you can see individual <code>fetch</code>/<code>install</code>/<code>activate</code> event handlers as distinct entries with real wall-clock duration, which is the most direct way to spot a handler that's unexpectedly slow. Wrapping suspect sections of your own SW code in <code>performance.mark()</code>/<code>performance.measure()</code> calls (the Performance API is available inside a service worker, unlike many DOM-adjacent APIs) surfaces custom, named timings in that same trace, which is far more actionable than guessing from aggregate page-load numbers.
+</p>
+
+<p>
+The Network panel's per-request timing breakdown, cross-referenced with which requests show "(ServiceWorker)" as their source (Q13), tells you specifically how much time is being added by interception versus how much would have happened anyway on a direct network request - the delta between a bypassed request (via "Bypass for network") and the same request normally intercepted is a clean before/after measurement of your fetch handler's actual overhead.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Describing the "bypass vs normal" A/B comparison as a way to isolate the service worker's actual added latency shows a genuine measurement methodology, not just "open the Performance tab and look at it."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q74">
+Q74. What's the risk of precaching too much at install time, and how does it show up in real metrics?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Every URL in the precache list has to actually be fetched during <code>install</code> before the worker is considered installed - so a precache manifest bloated with assets the user may never need (every route's JS chunk, every locale's translation file, high-res images "just in case") turns the very first visit into a much heavier one than the page itself required, competing for bandwidth with the resources actually needed to render that first visit. This shows up concretely as a worse Time to Interactive / LCP on first visit specifically (subsequent visits look fine, since by then everything's already cached) - a classic case of a metric regressing only for a subset of sessions, which makes it easy to miss in aggregate dashboards that blend first and repeat visits together.
+</p>
+
+<p>
+The fix is being deliberate about what's genuinely shell-critical (Q64) versus what should be runtime-cached on demand instead - precache only what every user needs on every visit, and let route-specific or rarely-used assets earn their way into the cache the first time they're actually requested.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Looking only at blended, aggregate LCP/TTI numbers and missing a first-visit-specific regression caused by an over-eager precache list. Segmenting performance metrics by first-visit versus repeat-visit is necessary to even see this class of problem.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q75">
+Q75. How do you audit and fix "does not respond with 200 when offline" failures that aren't obvious from the code?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This check specifically simulates a navigation to <code>start_url</code> with the network off and expects a real 200 - and it can fail for reasons that don't show up just reading the fetch handler in isolation. Common real causes: the fetch handler only intercepts requests matching a narrower pattern than <code>start_url</code> actually resolves to (a trailing slash, a query string mismatch); the precache step genuinely failed silently on a previous deploy (Q18) and the cache is simply missing the shell; or the fetch handler's fallback logic has a bug that only triggers on navigation-mode requests specifically, which is easy to miss if you only manually tested non-navigation asset requests.
+</p>
+
+<p>
+The direct way to audit it: open DevTools Application → Service Workers, tick "Offline," and manually navigate to the exact URL <code>start_url</code> resolves to, watching the Network panel for what actually gets served (or fails) - reproducing the exact check Lighthouse performs, rather than reasoning about the code abstractly.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming that you'd reproduce the exact failing scenario manually via DevTools' offline toggle - rather than only re-reading the fetch handler source - shows a debugging instinct: verify the actual observed behavior first, then work backward to the code.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q76">
+Q76. How would you set up a CI budget/regression gate using <code>lighthouse-ci</code> specifically for PWA-related metrics?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>lighthouse-ci</code> (the <code>@lhci/cli</code> package) runs Lighthouse against a set of URLs on every PR/build and can be configured with explicit assertions that fail the build if a metric regresses past a threshold - rather than relying on someone remembering to run Lighthouse manually and eyeball the score. For PWA-specific coverage, you assert on the installability-related audits directly (they still exist as individual Lighthouse audit IDs even though the bundled "PWA category" score was removed in v10) alongside the Core Web Vitals budgets that matter regardless of PWA status.
+</p>
+
+</div>
+
+<pre>
+// lighthouserc.json
+{
+  "ci": {
+    "collect": { "url": ["http://localhost:3000/"], "numberOfRuns": 3 },
+    "assert": {
+      "assertions": {
+        "installable-manifest": "error",
+        "service-worker": "error",
+        "offline-start-url": "error",
+        "largest-contentful-paint": ["error", { "maxNumericValue": 2500 }],
+        "cumulative-layout-shift": ["error", { "maxNumericValue": 0.1 }]
+      }
+    }
+  }
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming specific audit IDs (<code>installable-manifest</code>, <code>service-worker</code>) rather than vaguely "run Lighthouse in CI" shows you've actually configured this, not just heard it's a good idea.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q77">
+Q77. How does service worker caching interact with regular HTTP caching (<code>Cache-Control</code> headers) - which wins, and how can they conflict?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+They're two separate cache layers that a request can pass through, and understanding the order matters. A <code>fetch()</code> call issued from inside a service worker's handler still goes through the browser's normal HTTP cache first (respecting <code>Cache-Control</code>/<code>ETag</code>) before hitting the network - unless you explicitly opt out with <code>{ cache: "no-store" }</code> or <code>{ cache: "reload" }</code> on that fetch. This means "network-first" in your service worker can still return an HTTP-cache hit rather than a truly fresh network response, if the underlying resource's headers say it's still fresh - which is usually fine and even desirable (avoiding a redundant round trip), but can surprise you if you assumed "network-first" always means "definitely hit the server."
+</p>
+
+<p>
+The conflict case worth knowing: if a resource is served with long-lived, aggressive HTTP <code>Cache-Control</code> headers <em>and</em> your service worker also cache-firsts it into Cache Storage, you effectively have two independent caches of the same content that can drift out of sync if invalidated differently (clearing one doesn't clear the other) - which is exactly why content-hashed filenames (Q5/Q8) are valuable at both layers simultaneously: a new hash means a new URL, which trivially busts both the HTTP cache and the service worker's Cache Storage at once, with no coordination required between them.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Explaining that a service worker's <code>fetch()</code> still passes through the HTTP cache by default (unless overridden) is a detail many candidates miss - they describe the service worker's cache as the only cache in play, when in reality it's layered on top of the browser's existing HTTP caching.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q78">
+Q78. How do RUM tools distinguish service-worker-served responses from network-served ones, and why does that distinction matter?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The Resource Timing API (<code>PerformanceResourceTiming</code>, what most RUM tools read from under the hood) exposes exactly this via the <code>nextHopProtocol</code> and transfer-size fields - a service-worker-served response typically reports <code>transferSize: 0</code> and its timing entry reflects however long the service worker's own logic took to respond, not a real network transfer, letting RUM tooling separate "served instantly from cache by the SW" from "actually fetched over the wire" in the same metric stream.
+</p>
+
+<p>
+The distinction matters because blending them produces misleading aggregate numbers: a page's median load time can look excellent purely because most sampled sessions were repeat visits served entirely from the service worker's cache, masking a real regression in the actual network-served, first-visit experience that a smaller fraction of your traffic - and every genuinely new user - actually has. Segmenting performance data by "served via SW" versus "served via network" (or equivalently, first-visit versus repeat-visit, per Q74) is necessary to see either population's real experience clearly.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Connecting this back to Q74's first-visit-vs-repeat-visit blending problem shows the pattern recurring across the chapter: aggregate PWA metrics are almost always misleading unless segmented by cache-hit status, and RUM tooling needs to be configured with that in mind rather than trusted at face value.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h17">SECTION 14 - UPDATING A PWA SAFELY</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q79">
+Q79. What's the decision tree for prompting a user to update versus forcing it silently?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The right call depends on what actually changed, not on a blanket policy. A purely additive, backward-compatible change (a new feature behind a flag, a visual tweak, a bug fix that doesn't touch any contract the old client relied on) is safe to activate silently via <code>skipWaiting()</code>/<code>clients.claim()</code> without asking, since there's no real risk of a mid-session mismatch causing breakage. A change that alters the API contract between client and server (a renamed field, a changed request shape, a removed endpoint the old JS still calls) is not safe to force silently - an old tab still running old JS against a new backend, or new JS suddenly active mid-session against state it wasn't expecting, is exactly the failure mode the waiting phase (Q3) exists to prevent, so this class of change should always go through the "new version available, click to refresh" prompt (Q8), giving the user (and their in-progress work) a clean boundary to update across.
+</p>
+
+<p>
+A third category - a critical security fix or a fix for active data corruption - sometimes justifies forcing the update even more aggressively than a polite banner, up to and including a full-page interstitial blocking further use until refreshed, because the cost of staying on the old version outweighs the disruption of forcing it.
+</p>
+
+</div>
+
+<table border="1">
+<tr><th>Change type</th><th>Recommended update strategy</th></tr>
+<tr><td>Additive, backward-compatible</td><td>Silent skipWaiting/clients.claim, no prompt needed</td></tr>
+<tr><td>Breaking API/contract change</td><td>"New version available" banner, user-initiated refresh</td></tr>
+<tr><td>Critical security/data-corruption fix</td><td>Forced refresh, even an interstitial if severe enough</td></tr>
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming three tiers rather than a single blanket "always prompt" or "always force" policy is what shows real production judgment - the right answer genuinely depends on what the release contains, not on a fixed rule applied uniformly to every deploy.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q80">
+Q80. How do you deploy a breaking API change that requires the new service worker AND new client JS to ship in lockstep?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The core danger is that a service worker update and a client-JS update aren't atomic together from the browser's point of view - a tab can end up running old application JS against a newly-activated service worker (or vice versa) for a window of time, which is exactly wrong if the two were only ever tested and designed to work as a matched pair. The safe pattern is <b>backend-first, dual-compatibility rollout</b>: ship the backend supporting <em>both</em> the old and new contract simultaneously first, then ship the new client+SW pair, force that pair to update together via the "new version available" prompt from Q79 (never split across two separate silent deploys), and only remove backend support for the old contract once telemetry confirms essentially no clients are still running the old pair.
+</p>
+
+<p>
+The one thing to explicitly avoid is relying on "the service worker and the JS bundle happen to deploy in the same build, so they'll always update together" - they don't update atomically on the client just because they were built together; the waiting-phase mechanics (Q3) can still leave a tab on an old pairing for an arbitrary amount of time until it closes or the user accepts a refresh.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming that because the SW and the JS bundle were deployed in the same release, they'll always be consistent on the client. They can absolutely diverge if a tab is mid-update-cycle - backward/forward compatibility on the backend during the rollout window is what actually protects you, not an assumption about deploy atomicity.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q81">
+Q81. How do you roll out a service worker update gradually - a canary - rather than to 100% of users at once?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Service workers don't have a native, platform-level percentage-rollout mechanism the way some app-store distribution channels do - the browser will offer the new version to whoever's <code>sw.js</code> byte-comparison detects a difference, with no built-in concept of "only some users." Canarying has to be built at the infrastructure layer in front of that: serve a different <code>sw.js</code> (and its associated build) to a percentage of traffic via your CDN/edge layer or load balancer, keyed by a sticky cookie or user-bucket hash so a given user consistently gets the same version across requests rather than flip-flopping between canary and stable on every navigation.
+</p>
+
+<p>
+The practical risk to watch for specifically: because service worker scope is per-origin (Q11), you cannot canary by serving two different SWs to the same URL/scope for different users simultaneously in a naive way without very careful cache-key/versioning discipline - the safest implementation keys the cache names themselves (Q8) off the variant, so canary and stable users' caches never collide even while both are technically "active" for different segments of your traffic at the same time.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming that canarying a service worker is an infrastructure/edge-routing problem, not something the Service Worker API supports natively, is the detail that shows you understand where the platform's capability actually ends and where you'd need to build the rest yourself.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q82">
+Q82. What happens to a user's in-flight IndexedDB writes or queued background sync if you force-update the service worker mid-session?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+IndexedDB data itself is safe across a service worker update by default - it's origin-scoped storage, not tied to a specific worker version, so a new worker sees exactly the same database a moment after activating as the old worker saw a moment before. The real risk is around <em>in-flight logic</em>, not stored data: a queued background sync entry that the old worker's <code>sync</code> handler was written to process in one way might be picked up by the new worker's handler instead if the update completes between registration and firing - and if the new version changed the expected payload shape or the retry/dequeue logic, that queued entry could be misprocessed or silently dropped.
+</p>
+
+<p>
+The mitigation is treating your outbox schema itself as a versioned contract (Q60) - a new service worker's sync handler should be defensive about entries queued by a previous version (checking a schema-version field on each entry and handling old shapes explicitly, or migrating them) rather than assuming every entry it ever processes was written by code from the same deploy.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming a queued sync entry will always be processed by the exact worker version that created it. Given the waiting/activation mechanics, that's not guaranteed - the outbox format needs to be forward-compatible across at least one version boundary.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q83">
+Q83. How do you detect and recover from a service worker that's permanently broken in production - a "kill switch" pattern?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+If a bad service worker ships - one that throws on every fetch, or caches something that breaks the app for everyone who has it - you need a way to reach affected clients that doesn't depend on the broken worker itself cooperating. The standard "kill switch" pattern is a deliberately minimal, maximally defensive service worker version you can deploy as an emergency fix: its <code>install</code> handler clears every existing cache unconditionally, its <code>activate</code> handler calls <code>clients.claim()</code> immediately (skipping the normal cautious opt-in from Q8, since this is specifically an emergency), and its <code>fetch</code> handler does nothing but pass every request straight to the network - effectively returning the site to "no service worker" behavior for anyone who receives it, buying time to fix the real issue properly.
+</p>
+
+</div>
+
+<pre>
+// Emergency kill-switch sw.js - deploy this to unstick a broken worker
+self.addEventListener("install", (event) =&gt; {
+  event.waitUntil(
+    caches.keys().then((keys) =&gt; Promise.all(keys.map((k) =&gt; caches.delete(k))))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) =&gt; {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener("fetch", (event) =&gt; {
+  event.respondWith(fetch(event.request)); // always network, no caching, no interception logic
+});
+
+// Once stabilized, optionally have this version self-unregister entirely:
+// self.registration.unregister();
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Having a pre-written, tested "minimal, always-network, clears everything" service worker ready to deploy as a break-glass fix - rather than improvising one during an incident - is the kind of operational readiness senior interviewers specifically probe for with this question.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q84">
+Q84. How do you avoid update loops where <code>registration.update()</code> keeps finding a "new" worker that's actually identical, due to non-deterministic build output?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Because the browser's update check is a raw byte comparison (Q15), a build pipeline that isn't fully deterministic - embedding a build timestamp, a random build ID, or non-stable object/module ordering directly into the compiled <code>sw.js</code> - produces a genuinely different file on every build even when nothing about the actual logic changed, which the browser correctly (from its own narrow point of view) treats as a real update every single time, triggering install/waiting cycles for no real reason and needlessly nudging every open tab toward an "update available" prompt on every deploy, including ones that changed nothing about the SW itself.
+</p>
+
+<p>
+The fix is build-pipeline hygiene: ensure the service worker's own bundle output is reproducible given the same source (stable module ordering, no embedded wall-clock timestamps, using content hashes rather than build IDs for anything that needs a version identifier), and, if the SW file legitimately needs to reference a build identifier, keep that identifier itself content-derived (a hash of the actual precache manifest, say) rather than an incrementing counter or timestamp that changes even when nothing meaningful did.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Embedding <code>Date.now()</code> or a random UUID directly into the built service worker file "for debugging" and not realizing it defeats the browser's own change-detection, turning every single deploy into a forced update cycle regardless of whether anything real changed.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q85">
+Q85. How do you communicate a required hard refresh to users stuck on a very old, incompatible cached version?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+For a user who's been offline or simply never triggered an update check for a long time, a soft "new version available, click to refresh" banner may not even be reachable - if their cached JS is old enough, it might not contain the code that shows that banner at all, or it might be calling backend endpoints that have since been removed entirely (past the compatibility window from Q80). The backend is the more reliable channel here: have API responses include a minimum-supported-client-version header or field, and have even old client code check for it as a baseline capability (this check itself needs to be simple and stable enough to have existed in every version you still consider "supported to detect its own obsolescence") - on detecting it's below the minimum, show a blocking "please refresh to continue" screen rather than letting the old code keep running against a backend that no longer fully supports it.
+</p>
+
+<p>
+As a last resort for truly stuck clients (a service worker that itself is too broken to even check), the kill-switch pattern from Q83 combined with an explicit <code>self.registration.unregister()</code> in its <code>activate</code> handler forces a return to normal, uncontrolled network requests, which at least lets a subsequent plain page load reach current, unversioned server-rendered content that can then instruct the user to hard-refresh manually.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Recognizing that a badly-stuck client might not even be capable of running the "please update" logic you'd normally rely on, and designing the minimum-version check to be backend-driven and deliberately simple enough to survive in even very old client code, shows you've thought about the actual worst case, not just the common one.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q86">
+Q86. What monitoring would tell you your update strategy is actually working - percentage of clients on the latest SW version?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The single most useful metric is a version-adoption curve: have the client report its currently active service worker's version identifier (the cache-version string from Q8, or a build hash) on some regular cadence - page load, or a periodic beacon - and chart what percentage of active sessions are on the latest version versus each prior version, over time since the last deploy. A healthy update strategy shows that curve climbing quickly toward 100% within a reasonable window (hours to a few days, depending on your traffic's typical session frequency); a long tail that plateaus well below 100% and stays there is a direct signal of the orphaned-tab problem (Q20) or a broken update path affecting a real slice of users.
+</p>
+
+<p>
+Pairing that with the "time since a client's SW was last confirmed active/updated" distribution (not just current version, but staleness) catches the case where a user is nominally "on the latest version" but only because they happened to refresh recently, versus a user whose tab has genuinely been open and unresponsive to updates for a long time - the latter is the population your orphaned-tab mitigations (Q20) should be aimed at.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Proposing a version-adoption curve as a first-class production metric - not just "check for errors" - shows you think about service worker updates as an operational rollout to monitor over time, the same way you'd monitor any other staged deployment, rather than a fire-and-forget deploy step.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h18">SECTION 15 - PWA VS NATIVE APP TRADEOFFS DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q87">
+Q87. What specific capability gaps still exist between PWAs and native apps, beyond vague "native is better" claims?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Naming concrete gaps rather than gesturing at "native is more powerful" is what separates a strong answer here. Background execution is the biggest one: a native app can run meaningful background work (continuous location tracking, long-running background audio, VoIP-style always-on connections) that no web API grants nearly as freely - Background Sync (Q47) and Periodic Background Sync (Q48) are real but deliberately constrained and unreliable-by-design compared to native background task APIs. Deep OS integration - widgets, live activities, full Bluetooth/NFC access, background-persistent notifications with rich custom UI, tight calendar/contacts integration - remains meaningfully more capable natively. Performance for graphics-and-animation-heavy work (games, AR) still generally favors native rendering pipelines over the web platform's, though the gap has narrowed considerably. And platform trust/discovery - appearing in App Store search results, being installable through the store a user already trusts - is a distribution capability gap as much as a technical one.
+</p>
+
+</div>
+
+<table border="1">
+<tr><th>Gap</th><th>Native capability</th><th>Web/PWA reality</th></tr>
+<tr><td>Background execution</td><td>Persistent background tasks, always-on connections</td><td>Constrained, browser-throttled sync APIs</td></tr>
+<tr><td>Deep OS integration</td><td>Widgets, live activities, full Bluetooth/NFC</td><td>Partial, inconsistent (Web Bluetooth/NFC), no widgets</td></tr>
+<tr><td>Heavy graphics/AR</td><td>Native rendering pipeline</td><td>WebGL/WebGPU - closing gap, not closed</td></tr>
+<tr><td>Store discoverability</td><td>App Store/Play Store search &amp; trust</td><td>SEO only, unless wrapped (Q88)</td></tr>
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Listing specific, named capabilities (background execution, widgets, App Store search) rather than a generic "native has more access to the device" is exactly the concreteness senior interviewers are checking for on this question.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q88">
+Q88. How does Trusted Web Activity (TWA) or PWABuilder let you ship a PWA through the Play Store while keeping one codebase?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A Trusted Web Activity is a thin native Android wrapper - essentially a full-screen Chrome instance with no browser UI at all - that launches your existing, already-deployed PWA inside it, verified against your domain via Digital Asset Links so Android trusts it's genuinely your content and not a spoofed wrapper. Critically, it's not a rewrite or a second codebase: the wrapped app still runs your actual web app, served from your actual servers, so a bug fix or feature shipped to your website is live inside the TWA-wrapped app instantly too, without a store review cycle - you only need to resubmit the wrapper itself for changes to the native shell (icon, permissions), which is rare.
+</p>
+
+<p>
+PWABuilder (Microsoft's tool) automates generating this wrapper - and equivalent wrappers for iOS/Windows - from just your PWA's manifest URL, handling most of the store-submission boilerplate. This is the practical path many teams use to get store presence and discoverability (addressing part of the gap from Q87) while still maintaining exactly one web codebase as the source of truth.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The key nuance to state explicitly: a TWA is a wrapper around your live website, not a compiled snapshot of it - so it gets your normal deploy cadence "for free" instead of being frozen at store-submission time, which is the detail that makes this a genuinely different proposition than a plain WebView-wrapped hybrid app.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q89">
+Q89. Why has Apple/iOS Safari historically lagged in PWA API support, and what practical constraints does that put on strategy?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Apple has been the slowest major browser vendor to adopt several PWA-relevant APIs - Background Sync and Periodic Background Sync remain unimplemented, push notifications only arrived relatively recently (and initially only for installed, home-screen PWAs, not regular Safari tabs), and manifest support has trailed Chromium's in completeness (Q37). The commonly cited (though not officially confirmed by Apple) motivation is that a fully-capable PWA ecosystem is somewhat in tension with the App Store's role as the primary, revenue-generating distribution and review gate for iOS apps - a PWA that can do everything a native app can, installed with no App Store review or revenue share at all, is a different competitive dynamic than one still meaningfully behind native in capability.
+</p>
+
+<p>
+Practically, this means any cross-platform PWA strategy has to plan for a real, structural capability floor on iOS specifically, not just "slightly worse" - features like Periodic Background Sync simply cannot be relied on for iOS users at all, push notification UX needs iOS-specific handling and expectations, and "add to home screen" is manual with no <code>beforeinstallprompt</code> equivalent (Q37). Teams targeting a meaningful iOS user base with features that depend on the missing APIs often end up needing a native or React Native companion specifically to cover the iOS gap, even if the PWA is sufficient everywhere else.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Framing the iOS gap as a real strategic planning constraint - not just a technical footnote - and naming that it can be the deciding factor pushing a team toward a native/React Native companion app specifically for iOS, shows you'd actually factor this into a real product decision.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q90">
+Q90. How do you decide whether an app needs native features badly enough to justify wrapping a PWA with Capacitor/Cordova?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Capacitor (the modern, actively maintained choice; Cordova is largely legacy at this point) wraps your existing web app in a native shell and, critically, exposes a plugin bridge to real native APIs the open web platform doesn't have at all - full Bluetooth, native biometric auth, background geolocation, native share sheets, deep OS notification customization - while still letting you write the actual app logic once, in your existing web codebase. The decision test is specific and mechanical, not a vibe: list the exact native capabilities the product genuinely needs (not "might be nice"), check each one against what the current PWA/web-platform APIs already cover adequately (Q87's table), and if what's left over is a small, well-defined set of gaps, Capacitor plugins covering exactly those gaps is usually cheaper than either accepting the limitation or committing to a full separate native/React Native codebase.
+</p>
+
+<p>
+The trade-off to name honestly: you gain the missing native capabilities, but you also take on real native-app maintenance overhead you didn't have as a pure web deploy - App Store review cycles for the wrapper (even though the web content updates instantly, plugin/permission changes still require resubmission), platform-specific bugs in the bridge layer, and two more build targets to keep working. It's the right move for "we need three or four specific native capabilities," and the wrong move if the actual gap list turns out to be extensive enough that you're really building a native app with extra steps.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Proposing a concrete decision process - enumerate needed capabilities, check against what the web platform already covers, size the remaining gap - rather than a general "it depends" is what turns this into a strong, structured answer instead of a vague trade-off discussion.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q91">
+Q91. What are the real discoverability and distribution differences between App Store search/ASO and web SEO, and how do they change growth strategy?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+These are genuinely different growth channels with different mechanics, not just "two ways to get found." App Store Optimization (ASO) is a closed, ranked marketplace - users specifically go there intending to install something, search terms and keyword-stuffed metadata matter, ratings/reviews are a hard visible ranking and trust signal, and a well-optimized listing can drive install volume with comparatively little content marketing. Web SEO is open and content-driven - discovery happens through Google/Bing indexing actual page content, backlinks, and topical authority, which rewards a completely different kind of ongoing investment (content, structured data, page speed) and reaches users who weren't necessarily looking to "install" anything at all, often converting browsers into installs only after they've already found genuinely useful content.
+</p>
+
+<p>
+The strategic upshot: a PWA-first product's growth loop tends to look like organic/content-driven traffic that gradually converts a fraction of engaged visitors into installs (a much lower-friction, lower-commitment funnel than requiring an App Store visit up front), while a store-distributed app's growth loop leans harder on ASO, paid store placement, and word-of-mouth "go download the app" referrals. Products that genuinely benefit from both audiences often run a PWA as the top-of-funnel, low-friction default and treat any native/TWA store presence (Q88) as a second, complementary channel rather than a replacement.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming "we shipped a PWA, so we don't need to think about store presence at all" or the reverse. The two channels reach genuinely different user intents and are complementary for most consumer products, not mutually exclusive strategies.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q92">
+Q92. How do emerging web APIs - File System Access, Web Bluetooth, Web NFC - change this tradeoff, and what's their real browser-support reality?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+These APIs are steadily narrowing the capability gap from Q87, but each comes with real, current-day caveats that matter for a production decision. The File System Access API (<code>window.showOpenFilePicker()</code> - real read/write access to the local filesystem with user permission, not just an <code>&lt;input type="file"&gt;</code> upload) is genuinely useful for PWAs that feel like desktop productivity tools, but is Chromium-only - no Safari or Firefox support at all, so any dependency on it needs a fallback to traditional file upload/download for those browsers. Web Bluetooth lets a page pair with and communicate with real Bluetooth Low Energy devices directly, which is powerful for IoT/hardware-adjacent products, but is also Chromium-only and entirely unsupported on iOS (Apple has stated no plans to implement it, citing security/privacy concerns similar to the reasoning behind their broader PWA API caution from Q89). Web NFC (tap-to-read/write NFC tags) is narrower still - Chromium on Android only, nothing on desktop or iOS at all.
+</p>
+
+<p>
+The practical implication: these APIs are real and useful where they're supported, but none of them are "web platform now, universally available" the way Cache API or IndexedDB are - each one needs a genuine feature-detection-and-fallback strategy, and a product whose <em>core</em> functionality depends entirely on one of these (rather than being enhanced by it where available) is choosing to exclude a meaningful chunk of users on Safari/iOS, which circles back to the same platform-fragmentation constraint from Q89.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Being specific about which browsers actually support each API - rather than treating "modern web APIs" as a uniform, always-available category - shows you'd actually check compatibility tables before betting a product's core feature on one of these, not just cite them as evidence "the web is catching up to native."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q93">
+Q93. When would you specifically recommend a company invest in React Native or native, instead of doubling down on PWA capabilities?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is the synthesis question the whole section builds toward, and the strongest answers give a short, specific checklist rather than a philosophical essay. Recommend React Native/native when: the product's core value proposition depends on a capability the web platform genuinely can't deliver reliably across both major platforms today (persistent background execution, deep OS widget/live-activity integration, hardware access that's Chromium-only or entirely unsupported per Q92); the target audience is disproportionately iOS, where the PWA capability floor is structurally lower (Q89), and the missing pieces are ones the product actually needs, not just nice-to-haves; App Store/Play Store presence is itself a business requirement (enterprise procurement often mandates it, or the product category's users simply expect and search for a store listing); or the team already has meaningful React Native/native expertise and the cross-platform-web savings wouldn't offset the cost of the team learning a materially different architecture anyway.
+</p>
+
+<p>
+Conversely, stick with and invest further in a PWA when reach, low install friction, and instant update velocity matter more than the specific missing capabilities, when the team is web-native and would pay real "second stack" tax adopting React Native, or when the product is genuinely content/workflow-centric rather than hardware/background-execution-centric. The honest answer to "PWA or native" is almost never "PWA is inherently worse" - it's "does this specific product's requirements list include something on the real capability-gap list, and does that gap matter enough to justify a second codebase and its ongoing cost."
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Giving a short, concrete decision checklist rather than restating "it depends on the tradeoffs" is exactly what turns this into a senior-level closing answer - it shows you'd actually make this call, with real criteria, rather than just being able to list both sides.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q94">
+Q94. How would you architect a system to share business logic between a PWA and a React Native app, minimizing duplicate work?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The practical answer is extracting everything that isn't fundamentally about rendering into a shared, platform-agnostic package - API client code and data-fetching hooks (a TanStack Query setup with the same query keys/functions works essentially unchanged on both platforms), domain/business logic (validation rules, pricing calculations, permission checks - anything expressible as pure functions with no DOM or React Native primitive dependencies), state management (a Zustand or Redux store's logic is platform-agnostic by construction; only the components subscribing to it differ), and type definitions/schemas (a shared Zod schema validating API responses on both platforms guarantees they agree on shape). This typically lives in a monorepo (Turborepo/Nx) as an internal <code>@app/core</code> package that both the web PWA and the React Native app depend on.
+</p>
+
+<p>
+What deliberately does <em>not</em> get shared: actual rendering components, since React DOM and React Native use fundamentally different primitives (<code>&lt;div&gt;</code> versus <code>&lt;View&gt;</code>) - trying to force shared UI components across both (beyond a thin subset using something like <code>react-native-web</code>, which has its own real trade-offs and limitations) usually costs more in abstraction complexity than it saves. Platform-specific concerns - the service worker/caching layer entirely (meaningless in React Native), versus React Native's own native module bridge and offline storage choices - are inherently platform-specific and shouldn't be forced into the shared package at all.
+</p>
+
+</div>
+
+<table border="1">
+<tr><th>Layer</th><th>Share across platforms?</th><th>Why</th></tr>
+<tr><td>API client / data fetching</td><td>Yes</td><td>Same backend contract, same query logic</td></tr>
+<tr><td>Business/domain logic</td><td>Yes</td><td>Pure functions, no platform dependency</td></tr>
+<tr><td>State management logic</td><td>Yes</td><td>Store logic is platform-agnostic</td></tr>
+<tr><td>Type/schema definitions</td><td>Yes</td><td>Guarantees both platforms agree on shape</td></tr>
+<tr><td>UI components</td><td>No (mostly)</td><td>Fundamentally different rendering primitives</td></tr>
+<tr><td>Caching/storage layer</td><td>No</td><td>Service worker vs. native storage are unrelated</td></tr>
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Drawing a clear line at "share logic, not UI" - and naming exactly why (different rendering primitives, not just "it's harder") - is the detail that shows real experience straddling both platforms, rather than an idealized "just share everything" answer that ignores where the abstraction actually breaks down in practice.
+</p>
+</div>
+
+</div>
+
+<hr>
+
 </body>
 </html>
