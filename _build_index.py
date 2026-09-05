@@ -354,6 +354,7 @@ for group_idx, (group_name, nums) in enumerate(GROUPS):
             "track": track_name,
             "sections": subs,
             "readMins": read_minutes(content),
+            "qCount": len(questions),
         })
 
         # global search index: one [chapterIdx, questionId, text] triple per question,
@@ -383,8 +384,21 @@ hb = hb.replace("{{CHAPTER_COUNT}}", str(len(chapters)), 1)
 with open(os.path.join(ROOT, "handbook.html"), "w", encoding="utf-8", newline="\n") as fh:
     fh.write(hb)
 
+# ---- render quiz.html (randomized flashcard quiz shell) ----
+# Same CHAPTERS metadata (now carrying qCount per chapter) drives the topic
+# picker; quiz.html fetches each selected chapter's standalone file on demand
+# at quiz time, the same lazy pattern handbook.html uses for reading, so the
+# question/answer text itself is never duplicated into a build artifact.
+with open(os.path.join(ROOT, "_quiz_template.html"), "r", encoding="utf-8") as fh:
+    quiz_template = fh.read()
+
+quiz_html = quiz_template.replace("var CHAPTERS = [];", "var CHAPTERS = " + DATA + ";", 1)
+with open(os.path.join(ROOT, "quiz.html"), "w", encoding="utf-8", newline="\n") as fh:
+    fh.write(quiz_html)
+
 total_subs = sum(len(c["sections"]) for c in chapters)
 print("Chapters: %d, total sub-sections: %d, indexed questions: %d" % (len(chapters), total_subs, len(search_index)))
 print("Generated: handbook.html (single-file, mobile-friendly)")
+print("Generated: quiz.html (randomized flashcard quiz)")
 for c in chapters:
     print("  %s/%-2s  %-32s  %2d sections  [%s]" % (c["trackSlug"], c["num"], c["title"], len(c["sections"]), c["file"]))

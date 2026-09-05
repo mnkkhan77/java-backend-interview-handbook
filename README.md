@@ -138,10 +138,11 @@ Currently published:
 - **Mobile-adaptive** — collapsible sidebar and responsive layout.
 - **Searchable** — filter chapters and sub-sections instantly.
 - **400+ questions** with ROI ratings, frequency, sample answers, code snippets, and revision sheets across the interview chapters.
+- **Quiz Yourself** ([`quiz.html`](quiz.html), linked from the 🧠 Quiz button in the reader's top bar) — a randomized flashcard quiz drawn from the same Q&A across all 14,000+ questions. Pick tracks/topic groups (or leave everything unchecked to draw from the whole bank), set how many questions, then reveal each answer and self-mark Got it / Missed it for active-recall practice. Ends with a score, a missed-question list linking straight back into the handbook, and a lightweight per-question accuracy history saved in your browser (`localStorage`).
 
 ## 🚀 Usage
 
-Visit the [live site](https://inter-lyart.vercel.app), or serve this folder locally (e.g. `python -m http.server`) and open `handbook.html` through that server. Opening `handbook.html` directly as a `file://` path loads the shell but **not** any chapter content — chapters are fetched with `fetch()`, which browsers block against `file://` origins for security, so a real HTTP server (local or deployed) is required. Regenerate the handbook after adding or editing any chapter with `python _build_index.py`; CI re-checks this on every push.
+Visit the [live site](https://inter-lyart.vercel.app), or serve this folder locally (e.g. `python -m http.server`) and open `handbook.html` through that server. Opening `handbook.html` directly as a `file://` path loads the shell but **not** any chapter content — chapters are fetched with `fetch()`, which browsers block against `file://` origins for security, so a real HTTP server (local or deployed) is required. Regenerate the handbook (and `quiz.html`) after adding or editing any chapter with `python _build_index.py`; CI re-checks this on every push.
 
 ---
 
