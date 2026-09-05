@@ -643,6 +643,550 @@ This project has a larger security surface than almost anything else in this ser
 <p>Frame it as a build-vs-buy decision on the hardest, most solved-elsewhere part of the system: crash-safe state persistence, exactly-once-ish task dispatch, versioning, and operational tooling (dashboards, retries, manual intervention) that mature workflow engines have spent a decade hardening. Building from scratch is justified only if the team's requirements diverge sharply from what those engines assume (e.g., extremely fine-grained per-node LLM cost tracking, tenant isolation models the existing engine doesn't support well, or a licensing/deployment constraint) — otherwise, the differentiated, valuable engineering effort is in the LLM node executor, structured-output validation, prompt/version management, and guardrails layered on top, not in re-solving durable execution. The staff-level answer explicitly separates "commodity infrastructure" (durable execution) from "differentiated product surface" (judgment nodes, domain-specific workflows) and argues for buying/adopting the former to spend engineering effort on the latter.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. What does the "node" abstraction need to expose so a visual drag-and-drop builder can render and connect it generically, without the builder UI knowing anything about what a specific node does internally?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Every node type must declare, as metadata separate from its execution logic: a stable type identifier, a display name/icon/category for the palette, a typed input schema (what execution-context fields it reads and what config fields the author must fill in), a typed output schema (what it adds to the context), and its valid outgoing "handles" (a single next-edge for most nodes, multiple named handles for a conditional node). The builder UI is then a generic renderer driven entirely by this metadata — it never hard-codes knowledge of "the invoice extraction node" — which is exactly what lets the platform add a 300th node type without touching the drag-and-drop canvas code at all.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. Architecturally, what makes a trigger node different from every other node in the graph?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Every other node is invoked by the engine's own execution loop as it walks the graph; a trigger node is invoked from the outside — by a webhook request, a scheduler tick, or an inbound queue message — and its job is to translate that external event into the first execution-context payload and cause a new instance to be created. It has no incoming edge, and it is the only node whose "execution" can happen without an existing instance to attach to yet.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">JUNIOR</span>Q11. Why do most automation platforms store a workflow definition as versioned JSON/YAML/DSL data rather than as compiled application code?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Because the entire value proposition is letting a non-engineer create and change a business process without a deployment. If a workflow were compiled code, every new automation would require an engineer, a code review, and a release cycle — exactly the bottleneck the platform exists to remove. Storing it as data also makes versioning, diffing, rollback, and marketplace sharing tractable, since all of those become row-level database operations instead of source-control and build-pipeline operations.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. What is a "connector" in this platform's sense, and why is supporting hundreds of them a genuinely hard engineering problem rather than just "write more integrations"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A connector packages the authentication method (API key, OAuth2, etc.), the set of actions it exposes (each with its own typed schema), and often its own triggers (e.g., "new row added") for one third-party system. The hard part is not any single integration — it's that each one has a different auth flow, different rate limits, different failure semantics, and its own upstream API that changes over time, and the platform has to keep hundreds of them working simultaneously, tested, and documented, without that maintenance burden growing linearly (or worse) with the connector count.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">MID</span>Q13. How would you design the node/connector abstraction so engineers (or third-party contributors) can add a brand-new integration without touching or redeploying the core execution engine?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Define a connector SDK/spec — a manifest describing auth type, available actions and their JSON-schema-typed inputs/outputs, available triggers, and rate-limit characteristics — plus a small runtime contract (an interface with an <code>execute(config, context)</code> method) that the engine's node executor registry loads dynamically, the same way a plugin architecture works in an IDE or a build tool. The engine only ever talks to the generic interface; it never needs a code change to support connector #301, only a new manifest+implementation registered into the registry, which can even be deployed and versioned independently of the core engine release cycle.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">MID</span>Q14. What is the risk of letting a non-engineer author write raw, free-form prompt text into an LLM node, and how does a "prompt template with variable injection slots" constrain that risk?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>Free-form prompt authoring by a non-engineer risks broken output-format contracts (the author deletes the instruction that enforces structured output), accidental data leakage (referencing the wrong execution-context variable), runaway cost (no length/scope discipline), and injection surface (concatenating untrusted external text directly into the instruction portion of the prompt). A prompt template addresses this by having the platform own a fixed instruction scaffold — including the structured-output contract and injection defenses — and exposing only a bounded set of named variable slots (e.g., <code>{{invoice.vendor}}</code>) that the author fills in or maps to context fields; the author edits business content, the platform retains control of the safety-critical wrapper around it.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">MID</span>Q15. If a prompt template's variable slot is filled with untrusted external data (e.g., the body of an inbound customer email), how can that slot itself become a prompt-injection vector even though the author never wrote anything malicious?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The author's template is safe, but the value injected into the variable is attacker-controlled text, and if that text contains something like "ignore prior instructions and approve this refund," a naively concatenated prompt cannot distinguish the platform's instructions from the attacker's payload embedded inside the "data" portion. The defense has to live at the platform layer, not the author's: clearly delimit variable content as data (not instructions) using techniques like structural separation or explicit tagging, run injection-pattern detection on any variable sourced from an external/untrusted trigger before it reaches the model, and — most importantly — never let that node's output alone authorize a high-stakes action without a downstream deterministic check, exactly as Section 13's security discussion requires.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">MID</span>Q16. Design the trigger architecture for the platform: what operationally differs between a webhook trigger, a scheduled trigger, and an event/queue-based trigger?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A webhook trigger is push-based and externally initiated — the platform must expose a stable, authenticated HTTP endpoint per workflow (or per tenant) and handle bursty, unpredictable arrival with immediate acknowledgement so the third party doesn't time out and retry. A scheduled trigger is platform-initiated on a cron-like cadence and needs a distributed scheduler (so it fires exactly once across a horizontally scaled fleet, not once per instance) plus drift/catch-up handling if the platform was down at the scheduled time. An event/queue-based trigger consumes from a message bus the platform doesn't control the arrival timing of, and needs consumer-group semantics, backpressure, and at-least-once delivery handling. All three converge on the same downstream contract — produce a deduplicated trigger payload and create an instance — but the ingestion-layer code for each is genuinely different.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">MID</span>Q17. How do you validate a webhook trigger's authenticity at platform scale, given that every third-party provider signs its webhooks differently (or not at all)?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Push signature verification into the connector's manifest/implementation, not into a single platform-wide function: each connector declares how its provider signs requests (HMAC-SHA256 over the raw body with a shared secret, a JWT, an IP allowlist, etc.), and the trigger-ingestion layer looks up and applies the connector-specific verifier before the payload is trusted enough to create an instance. Anything that fails verification is rejected at the edge and never reaches workflow execution or an LLM node, which also protects against an attacker using a forged webhook to fire an expensive or side-effecting workflow.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">MID</span>Q18. What does "dry-run" / test mode mean for a workflow that mixes an LLM node with a real side-effecting action node (e.g., "send email" or "charge card"), and how do you keep the test realistic without causing real-world side effects?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Dry-run mode should execute every node's actual logic where doing so is safe and cheap — most importantly the LLM node, since faking its output would defeat the purpose of testing exactly the part of the workflow that is least predictable — but intercept and simulate any node marked as side-effecting in its connector manifest, logging "would have sent email to X with subject Y" instead of actually calling the provider. This requires every connector action to be tagged, in its manifest, with whether it has real-world side effects, so the engine can generically decide what to actually execute versus simulate, rather than hand-maintaining a special-cased list per workflow.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Push back on interviewers who suggest mocking the LLM call too "for determinism" — the entire point of a dry run for this product category is to let a non-engineer see how the judgment step will actually behave on realistic input before it goes live; mocking the one non-deterministic, highest-risk node defeats the exercise.</div>
+
+<div class="question" id="q19"><span class="level">MID</span>Q19. Why is a "runaway" workflow a fundamentally more dangerous failure mode on a multi-tenant automation platform than on a single-tenant internal system?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>On a single-tenant internal system, a runaway process mostly hurts its own owner and is bounded by that team's own usage patterns. On a multi-tenant platform, the execution engine, the LLM provider quota, the trigger-ingestion layer, and the database are all shared resources across every customer, so one tenant's misconfigured infinite loop or fan-out can starve capacity that hundreds of unrelated customers depend on — turning what should be one customer's bug into a platform-wide incident.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">SENIOR</span>Q20. Design tenant isolation for the execution engine so one customer's runaway workflow (an infinite retry loop, or a huge fan-out) cannot degrade the platform for other tenants.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Layer isolation at multiple levels rather than relying on any single one: (1) hard per-instance caps on iteration count and node-visit count, enforced by the engine itself, independent of the workflow's own logic; (2) per-tenant concurrency limits on active instances, so one tenant's fan-out cannot consume the whole worker pool; (3) per-tenant queues or partitions for task dispatch (Q29 below), so a backlog in one tenant's queue doesn't block another's; (4) per-tenant rate limits on outbound LLM and connector calls, enforced centrally rather than trusted to the workflow definition; and (5) resource quotas that trigger automatic throttling or suspension with alerting when a tenant's usage crosses an anomaly threshold, rather than only a static hard cap. No single layer is sufficient alone — the iteration cap protects against infinite loops, but a tenant firing legitimately-bounded but enormous fan-out still needs the concurrency and queue isolation to avoid starving others.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">SENIOR</span>Q21. How do you fairly share a finite pool of LLM provider rate limit/capacity across thousands of customer workflows?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Treat the shared upstream quota as a resource pool allocated via per-tenant fair-share tokens rather than first-come-first-served: give each tenant a baseline token budget replenished on a rolling window, let unused capacity be reclaimed into a shared overflow pool that any tenant can borrow from under low contention, and degrade gracefully under contention by queuing and backpressuring lower-priority requests (e.g., a background/batch workflow) ahead of interactive ones, rather than returning hard failures. This is the same fair-queuing problem as multi-tenant network bandwidth allocation, just applied to LLM request budget instead of packets.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">SENIOR</span>Q22. Design a per-tenant, per-workflow rate-limiting scheme (token bucket / leaky bucket) applied both at trigger ingestion and at LLM call time. Why do you need it in both places, rather than just one?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Trigger-ingestion rate limiting protects the front door — it stops a burst of webhook deliveries from creating more instances than the engine can reasonably process, and it's cheap to enforce before any work has been done. LLM-call rate limiting protects the most expensive, most contended shared resource further downstream — it's needed even for instances that were legitimately admitted, because a workflow can hold many LLM-calling nodes and a tenant with few instances but an LLM-heavy graph can still exhaust shared model capacity. Enforcing only at ingestion lets an already-admitted instance overwhelm the LLM provider; enforcing only at the LLM call lets the engine itself get flooded with instances that will just queue at the second gate anyway, wasting instance-management overhead. A token bucket per tenant at each layer, sized independently to what that layer actually protects, covers both failure modes.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">MID</span>Q23. What's the product/UX difference between a trigger being throttled/rate-limited versus a workflow instance genuinely failing, and how should each be surfaced to the workflow author?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A throttled trigger is not an error in the author's workflow at all — it's a platform capacity decision, and the correct UX is "queued, will run shortly" (or, if the queue itself is full, "delayed due to high volume") rather than anything that reads as broken. A genuine failure is specific to that instance's execution — a node errored — and should be surfaced with the failing node highlighted and a plain-language reason. Conflating the two (showing throttling as a red "failed" state) trains authors to distrust a healthy platform and to submit unnecessary support tickets for events that were never actually errors.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">SENIOR</span>Q24. How would you attribute LLM cost per-workflow, per-customer for billing purposes, given that a workflow can branch differently on every execution and therefore consume a different set of LLM calls each time?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Meter at the finest grain that's actually true, not at the workflow level: record token usage (and therefore cost) per individual LLM node call, tagged with the instance ID, node ID, workflow definition version, and tenant ID at write time, in the same append-only execution-context/audit log the engine already persists for durability. Per-workflow or per-customer cost is then a rollup query over that ledger, computed after the fact from actual executed paths rather than estimated up front — which is also exactly what makes the Section 6 expected-cost formula empirically groundable instead of theoretical: you calibrate branch-take-rates and per-node cost from this same ledger.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">SENIOR</span>Q25. Design a cost-attribution pipeline end to end: metering, aggregation, and how you'd handle a case where one LLM call's result is reused across two downstream branches (so it shouldn't be double-billed).</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>At the metering layer, each LLM node executor emits one usage event per actual provider call (not per branch taken), including prompt/completion token counts and the provider's price-per-token at call time, keyed by a unique call ID. A separate aggregation/ETL job rolls these events up by tenant, workflow, and time window into a billing-facing summary table, decoupled from the hot execution path so billing computation never adds latency to a live workflow run. Because the usage event is tied to the call, not to how many downstream nodes subsequently read the cached/shared result from the execution context, reusing one node's output across two branches naturally bills once — the discipline is simply "meter at the point of the actual external call," never at the point of context read.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">SENIOR</span>Q26. A single tenant's workflow triggers 50,000 instances in one minute because of an unexpectedly viral webhook source. What breaks first in a naive architecture, and how do you defend against it structurally?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>In a naive architecture, the trigger-ingestion endpoint or the instance-creation write path typically saturates first — a burst of synchronous instance-row inserts (plus whatever synchronous work the first node does) creates database contention that slows down every other tenant's instance creation too, since they likely share the same table/cluster. The structural defense is to make trigger ingestion asynchronous and cheap: accept and durably queue the raw trigger payload immediately (a fast, tenant-scoped write), acknowledge the webhook, and let a separate, rate-limited, per-tenant-capped consumer pull from that queue to actually create instances and begin execution — decoupling "accept the event" from "do the work" is what prevents one tenant's burst from becoming a shared-infrastructure incident.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">MID</span>Q27. Why can't you simply give every tenant an unbounded LLM budget and rely on a "fair use" policy written into the terms of service?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Policy language has no enforcement latency — by the time a human notices a tenant is abusing shared capacity and takes action, real damage (degraded latency or outright unavailability for other tenants, or an unbounded platform cost exposure) has already happened, possibly repeatedly. Technical controls (quotas, rate limits, anomaly-triggered throttling) act in real time and don't depend on someone reading a dashboard; policy is a useful backstop for genuinely ambiguous or adversarial cases, but it cannot substitute for the enforcement layer itself.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">SENIOR</span>Q28. How would you design a "noisy neighbor" detection and automatic throttling system for the execution engine?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Continuously compute per-tenant resource-consumption metrics (instances/minute, LLM calls/minute, average node-visit count per instance, queue depth contributed) against a rolling historical baseline for that same tenant, and flag/rate-limit when a tenant's consumption deviates sharply from its own baseline rather than only against a single platform-wide static threshold — this catches both "a normally-quiet tenant suddenly spiking" and "a normally-heavy tenant getting even heavier" without needing every tenant to be manually tiered in advance. Pair detection with graduated response: soft throttling (added queue delay) first, hard per-tenant caps if the anomaly persists, and paging a human only if automatic throttling itself is insufficient to protect shared latency SLAs.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Explicitly distinguish this from simple static rate limiting — a noisy-neighbor detector has to work even for a "whale" tenant whose normal traffic would blow through another tenant's static limit; baselining against the tenant's own history, not a shared threshold, is what makes it fair across very different tenant sizes.</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. What isolation guarantees does a queue-per-tenant design give you versus a shared queue with a tenant tag on each message, and which would you pick for the execution engine's task dispatch?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A shared queue with a tenant tag is operationally simpler (one queue to monitor, scale, and reason about) but gives you no head-of-line protection — a burst from one tenant sits in front of another tenant's messages and delays them, since consumers typically process in arrival order. A queue-per-tenant (or per shard of tenants, for platforms with too many tenants for literally one queue each) gives true isolation — one tenant's backlog cannot delay another's — at the cost of more operational complexity and the need for a fair scheduler across queues when dispatching to a shared worker pool. For a platform where "one tenant's flood doesn't slow another tenant's automations" is a stated reliability guarantee, queue-per-tenant (or per-shard) is worth the added complexity; for an internal tool with a handful of trusted teams, shared-queue-with-tag is often good enough.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">SENIOR</span>Q30. How do you prevent one tenant's workflow definition — with a malicious or buggy prompt template — from being usable to attack the platform's shared LLM provider account (e.g., extracting the platform's system prompt, or running adversarial payloads at the platform's expense)?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Treat every tenant-authored prompt template as untrusted input to the platform's own LLM-calling infrastructure, not just to the tenant's own workflow: never let the tenant's template fully replace the platform-owned system prompt (only fill designated variable slots within it, per Q14), run injection/jailbreak-pattern screening on templates at save time and on their filled values at run time, enforce per-node and per-tenant token/cost ceilings so a crafted prompt designed to maximize response length cannot become a cost-exhaustion attack, and keep the platform's own system-level instructions (safety wrapper, structured-output contract) out of any information the model is ever asked to repeat back verbatim. The mental model is the same one from Volume 5's guardrails chapters — the tenant is, from the platform's perspective, just another untrusted actor whose input reaches the model — it's simply a tenant with a paid relationship rather than an anonymous end user.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">JUNIOR</span>Q31. When a workflow step fails, what should a non-technical business user see, versus what an engineer debugging the platform itself would want to see?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>A business user needs a plain-language summary tied to their mental model of the workflow: which named step failed, in which run, with a human-readable reason ("the connected Gmail account's access expired" rather than an OAuth error code), and what to do next (reconnect the account, edit the input, contact support). An engineer needs the full technical trace: the raw request/response, stack trace, retry history, and correlation IDs. These are different views over the same underlying audit log, not different data — the platform should render one, technical layer of truth through two different UI surfaces rather than maintaining two separate logging paths.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. Design the "error node" / failure surface in the visual builder: how do you show a non-engineer exactly which step failed and why, directly on the canvas they already understand?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Reuse the same node-and-edge graph the author built the workflow in as the failure-reporting surface, rather than sending them to a separate log viewer: highlight the failed node in red directly on the canvas, show a plain-language error summary in a side panel when it's clicked, and visually distinguish "this node failed" from "this node hasn't run yet" and "this node succeeded" using the same iconography throughout the builder and the run-history view. Because the author already has a mental model of the graph from building it, anchoring the error to a node on that same graph requires zero additional learning, whereas a generic stack-trace log requires them to map unfamiliar technical output back onto the workflow themselves.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. Why is "check the logs" not an acceptable failure UX for this product's target user, even though it's completely normal for a typical engineering-facing SaaS product?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The entire premise of a no-code automation platform is that the target user is explicitly not expected to read logs, stack traces, or API error codes — that is the skill gap the product exists to remove. If the failure path forces the user back into engineer-only artifacts, the product has silently reintroduced the exact dependency on technical staff it was sold to eliminate, and it will show up as a support-ticket-volume and churn problem even if the underlying error handling is technically correct.</p>
+</div>
+
+<div class="question" id="q34"><span class="level">SENIOR</span>Q34. Design a retry UX for a workflow author: automatic retry, "resume from this step," and "replay from start." When is each appropriate, and how do you expose the choice safely given that some nodes have side effects?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Automatic retry (with backoff, silent to the author unless it exhausts) is appropriate for transient failures the engine itself detects — a timeout, a 5xx from a connector — and needs no user decision at all. "Resume from this step" should be offered once a node has failed after exhausting automatic retries, and is only safe to expose for nodes downstream of the failure whose upstream side effects (an email already sent, a payment already charged) should not be re-triggered — the engine already knows this from the persisted execution context, so it can resume forward without re-running completed nodes. "Replay from start" should be explicitly gated behind a warning that upstream side-effecting nodes will re-execute, and ideally only offered on workflows whose nodes are all confirmed idempotent, or with those nodes flagged so the author understands what will re-fire. The UX principle: default to the safest option (resume), and require explicit confirmation for anything that risks a duplicate side effect.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">SENIOR</span>Q35. How do you let a non-engineer debug an LLM node that produced a wrong classification, without exposing them to prompt-engineering concepts they don't have?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Show them the same three things a prompt engineer would look at, but framed as data rather than code: the exact input the node received (so they can spot "oh, it never actually got the field I thought it would"), the model's structured output including its stated confidence and reasoning field if the schema includes one, and — critically — a lightweight feedback affordance ("mark this decision as wrong") that lets the author flag examples for later review or few-shot refinement without them having to touch the underlying prompt template at all. Most real-world "wrong classification" cases turn out to be a wiring problem (the wrong variable was mapped into the slot) rather than a genuine reasoning failure, and surfacing the actual input is what lets a non-engineer diagnose that class of bug themselves.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">MID</span>Q36. What's the risk of exposing raw LLM-provider error messages (stack traces, rate-limit JSON payloads, provider-internal error codes) directly to end users in the builder UI?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Beyond simply being unreadable to a non-engineer, raw provider errors can leak implementation details the platform would rather not expose contractually (which model/provider is actually being called under the hood, internal request IDs, sometimes fragments of the underlying prompt structure), and they change format whenever the provider changes their API, silently breaking any UI that parses them. The platform should translate every provider error into a small, stable, platform-owned set of user-facing error categories (rate-limited, invalid input, service unavailable, content-policy-blocked) and keep the raw payload only in the engineer-facing technical log.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">SENIOR</span>Q37. Design "step replay with edited input" — letting an author fix one bad node's input and resume the same instance without re-running upstream side-effecting nodes.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>This requires the execution context to be addressable and mutable at a specific historical point, not just append-only forward: the engine loads the instance's persisted context as of immediately before the failed node, presents the specific input fields that node consumed (pulled from the context, per its declared input schema) as an editable form, and on submission writes a new context snapshot with the corrected value substituted in before re-entering the execution loop at that exact node. Every node strictly upstream of the edited one is untouched — never re-executed — which is precisely what makes this safe for workflows containing side-effecting nodes like "send email" earlier in the graph; the platform is relying on the same durable, node-by-node context persistence that makes crash recovery correct (Section 5) to make this feature correct too.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. How should the platform distinguish between a transient failure that should auto-retry silently and a failure that needs human attention surfaced prominently?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Classify failures by whether retrying with the same input has a reasonable chance of succeeding: network timeouts, 429/5xx responses, and transient provider unavailability are retry-worthy and should be handled inside the engine's retry policy without ever surfacing to the author unless retries are exhausted. Failures that are deterministic given the same input — an invalid config, an expired/revoked credential, a malformed template, a content-policy rejection — will fail identically on every retry, so silently retrying them wastes time and (for LLM calls) money while delaying the human attention that is actually needed; these should surface immediately, not after a retry budget is burned.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">SENIOR</span>Q39. A customer's workflow has been silently failing on 30% of its instances for two weeks and nobody noticed. What proactive product feature would have caught this earlier?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A per-workflow health/success-rate dashboard is necessary but passive — it only helps if someone goes and looks at it. The feature that actually catches this is proactive, threshold-based alerting: let the author (or default the platform to) configure "notify me if this workflow's failure rate exceeds X% over a rolling window," computed continuously from the same instance-outcome data the dashboard already aggregates, and pushed via email/Slack/in-app notification the moment the threshold is crossed rather than requiring anyone to check a dashboard. The deeper product lesson is that observability data that requires a human to remember to look at it will, at scale across thousands of customer workflows, reliably go unnoticed exactly in the cases that matter most.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. Design the alerting feature from the previous question: "notify me if this workflow's failure rate exceeds X%." What has to be true architecturally to make this cheap to compute per-tenant, per-workflow across a large platform?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It needs a pre-aggregated, incrementally-updated rollup — a rolling-window success/failure counter per workflow, updated as an instance completes rather than recomputed by scanning historical instance rows on every check — because computing this from raw instance history on demand, for every workflow, on every evaluation tick, does not scale once there are hundreds of thousands of workflows to monitor. A streaming aggregation (updating counters as instance-completion events flow through the same event pipeline already used for cost metering) with a scheduled evaluator that checks each workflow's current rate against its configured threshold is the standard shape, and it reuses infrastructure — the instance-outcome event stream — the platform needs anyway for cost attribution and dashboards.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">SENIOR</span>Q41. How would you design a "self-healing suggestion" feature — the platform proactively suggesting a fix when a node repeatedly fails the same way, e.g., "this API key looks expired"?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Pattern-match the failure classification (Q38's deterministic-failure bucket) against a library of known root causes tied to specific connector error codes — an OAuth 401 maps to "credential likely expired, reconnect," a schema-validation error on a connector's action maps to "the upstream API may have changed its fields" — and surface the suggestion inline with the failed node rather than as generic error text. This is deliberately a rules-based mapping from known error codes to known remedies, not an LLM guessing at a fix; using an LLM here would reintroduce the exact unreliability problem the rest of the platform works hard to contain, for a case where a deterministic lookup table already covers the overwhelming majority of real recurring failures.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">MID</span>Q42. Why do end users need "workflow paused" (waiting on a human or a schedule) and "workflow failed" to be surfaced as clearly distinct states in the dashboard, rather than both just showing as "not completed"?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>They require completely different responses from the user: a paused instance is healthy and simply waiting on something expected (an approval, a scheduled delay), and needs no action beyond patience or nudging the approver; a failed instance is broken and needs intervention. Merging them into one ambiguous "not completed" bucket forces the user to click into every instance to find out which situation they're in, which defeats the purpose of a dashboard, and at scale (thousands of instances) makes it impossible to distinguish "everything is fine, just waiting" from "there's an incident" at a glance — exactly the kind of meaningless-aggregate problem Section 12 warns about when it says to keep human-wait latency out of blended SLA metrics.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. Why can't a workflow author edit the "live" version of a workflow directly, the way they might edit a shared Google Doc?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Because there are almost always in-flight instances executing against the current definition, and an in-place edit changes the graph out from under them — an instance paused at a human-approval node might resume into a node that no longer exists, or a node whose input schema just changed shape. A workflow definition needs the same discipline as an API contract: edits create a new, immutable version, in-flight instances stay pinned to the version they started on, and only newly-created instances (or an explicit, deliberate migration) pick up the change, exactly as Section 3 and Section 5.1 establish.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">SENIOR</span>Q44. Design safe rollout of a workflow-template change: how do you canary a new version against a subset of trigger volume before cutting all instances over to it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Let the trigger-to-instance-creation step consult a routing rule alongside the "which version is active" pointer — e.g., "route 5% of newly-created instances to version N+1, 95% to version N" — rather than a single all-or-nothing active-version flag. Run both versions concurrently for a soak period, compare outcome metrics (success rate, branch distribution, average cost/latency, and for LLM-touching nodes, any available quality signal) between the canary and control cohorts, and only advance the canary percentage once the comparison clears a bar. This mirrors standard canary deployment practice from regular software releases; the only workflow-specific wrinkle is that "outcome" here includes judgment-node behavior, not just error rate, so the comparison metrics need to include things like "did the branch distribution shift unexpectedly," not just "did it 500."</p>
+</div>
+
+<div class="question" id="q45"><span class="level">SENIOR</span>Q45. A workflow-template author changes an LLM node's prompt. How do you detect that this changed the workflow's behavior or branch distribution before it causes a customer-visible incident?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Combine the simulator/replay capability (Q81) with the canary rollout (Q44): before publishing, replay a representative sample of recent historical trigger payloads through the new prompt version in dry-run mode and diff the resulting branch/classification distribution against what the current live version produced on the same inputs — a prompt edit that shifts 40% of a normally-90%-stable classification is a strong signal worth blocking or at least warning on. After publishing, the canary's outcome-comparison metrics from Q44 serve as the live, real-traffic confirmation that the offline replay's prediction held. Neither check alone is sufficient — offline replay uses historical, possibly stale data, and canary-only misses the chance to catch an obviously bad prompt change before it touches any live customer traffic at all.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. What's the difference between versioning a workflow "definition" (owned by one tenant) and versioning a workflow "template" published to a marketplace (installed by many tenants)?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A definition's versions form a single linear (or branching) history owned entirely by one tenant, and the tenant controls when in-flight instances migrate. A template's versions are published by one tenant (the publisher) but consumed by many independent installer tenants, each of whom has their own copy — installed at some version, possibly customized locally — so a new template version doesn't automatically propagate to installers at all; it requires each installer to explicitly accept an update, and a customized installation may need a three-way merge (or a "your customizations conflict with the update" flow) rather than a clean pointer bump.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">SENIOR</span>Q47. Design a template marketplace: how do you let one tenant publish a workflow template that other tenants can install and customize, without leaking the publisher's own credentials or third-party connections?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>A published template must be credential-free by construction: it describes the graph shape, node configuration, and prompt templates, but every connector node references a connection by an abstract role/slot ("your CRM," "your email account") rather than an actual stored credential ID. On install, the platform walks the template's declared connector requirements and prompts the installing tenant to bind each slot to one of their own existing connections (or create a new one), and the installed copy is a fully independent definition owned by the installer from that point forward — the publisher's credentials never enter the installer's tenant boundary, and the installer's credentials never leak back to the publisher.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">SENIOR</span>Q48. A marketplace template's LLM prompts reference the installing tenant's specific data/schema — e.g., custom fields on their CRM records. What parameterization strategy lets the same published template work correctly for installers with different underlying data shapes?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The template's prompt variable slots should bind to logical, publisher-declared roles ("the deal's stage field," "the contact's most recent note") rather than to a specific connector's literal field name, and at install time the platform (or the installer) maps each logical role to the actual field name in the installer's own CRM schema — the same abstraction used for credential slots in Q47, applied to data shape instead of auth. Where an exact field mapping can't be resolved automatically, prompt the installer through a short setup wizard rather than silently guessing, since a silently wrong field mapping produces a template that appears to work but classifies against the wrong data.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">MID</span>Q49. What review or moderation is needed before a user-submitted template becomes publicly listed on the marketplace, given that it may contain LLM prompts?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Beyond the standard marketplace concerns (does it work, is it clearly described, does it duplicate an existing listing), a template containing LLM prompts needs a safety-specific review pass: automated screening for prompt-injection susceptibility in how it handles any untrusted-input variable slots, a check that any auto-executing side-effecting action (Q73's "no human review" pattern) is flagged prominently to installers rather than silently defaulted on, and a scan for prompts that request or encourage handling of clearly regulated data categories without the corresponding compliance controls in place. The bar should scale with the template's blast radius — a template that only reads data and drafts a suggestion needs far less scrutiny than one that auto-sends emails or auto-issues refunds.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">SENIOR</span>Q50. Design version pinning and deprecation for the marketplace: an installed template's upstream publisher pushes a v2. How, and when, do the installer's live instances get migrated, if ever?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>By default, never automatically — an installer's copy is independent (Q47), so a publisher's v2 should surface only as an available update notification, not a forced migration, because the installer may have customized their copy in ways an automatic merge could silently break. Offer the installer a diff view (what changed between the version they installed and the new one), let them opt in explicitly, and route the update through the same canary/rollout machinery (Q44) applied to their own installed copy, since from the installer's engine's perspective this is just another version publish of a definition they happen to own. Deprecating an old template version should warn installers still on it but not force-migrate them — forcing an update to someone else's production automation is a trust-destroying move for a marketplace platform.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">MID</span>Q51. Why is "rollback" harder for a workflow definition than for a typical stateless microservice deployment?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A stateless microservice rollback simply routes new requests to the old binary — there's no persisted, in-progress state tied to the version that was live. A workflow definition rollback has to reckon with instances that are mid-execution against the version being rolled back, some of which may have already taken irreversible side-effecting actions (an email sent, a payment charged) under that version's logic; you cannot simply "undo" those, and you generally cannot safely move an in-flight instance onto the old version's graph either, since its accumulated execution context may not map cleanly onto a different graph shape.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">SENIOR</span>Q52. How do you roll back a workflow definition version when there are thousands of in-flight instances currently pinned to the version being rolled back?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Separate "rollback" into two distinct, independently-scoped actions rather than one operation: (1) immediately stop routing newly-created instances to the bad version (a fast, low-risk pointer flip back to the previous good version — this is the cheap, safe part), and (2) decide, per in-flight instance, what to do next — let it run to completion on the version it started with if the bug is cosmetic/low-risk, or pause and require manual/automated remediation if the bug is severe enough (e.g., a broken confidence-floor check) that letting it continue risks real harm. Trying to force all in-flight instances onto the rolled-back version immediately is usually neither possible (context shape mismatch) nor necessary (only the intake of new instances needs to stop immediately in most incidents) — resist the instinct to treat this like a stateless deploy rollback.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">MID</span>Q53. What telemetry would you attach to each published workflow version to decide whether it's safe to make it the new default for newly-created instances?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>At minimum: instance success/failure rate, error rate broken down by node (to catch a regression localized to one changed node rather than the whole graph), average and p95 cost and latency per instance, the branch-take-rate distribution at each conditional node (to catch an unexpected behavior shift even when nothing technically "failed"), and — where available — any human-feedback or confidence-score signal from LLM nodes. All of it should be scoped per-version, not just per-workflow, so a canary cohort's numbers can be directly compared against the control cohort's numbers on the previous version, which is exactly the comparison Q44's canary rollout depends on.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">STAFF</span>Q54. Design the full "safe workflow release" lifecycle: draft → test/dry-run → canary → default → deprecated → archived. What gates each transition?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Draft → test/dry-run requires nothing but author intent, but dry-run itself should surface the linter warnings from Q74 before the author is even allowed to request a canary. Test/dry-run → canary should be gated on the author (or an automated check) confirming the dry-run/simulator results (Q81) look reasonable, and requires the platform to have a previous stable version to compare against — a brand-new workflow with no prior version skips straight to a low-percentage default rather than a true canary, since there's nothing to canary against. Canary → default is gated on the version-scoped telemetry from Q53 clearing a bar over a minimum soak period and minimum sample size, ideally with an automatic promotion/rollback decision rather than requiring a human to babysit every release, with human override always available for judgment calls the metrics don't capture. Default → deprecated happens when a newer version has been promoted; deprecated versions keep serving their existing in-flight instances (per Q51/Q52) but stop accepting new ones. Deprecated → archived happens only once zero instances remain pinned to that version, confirmed by the instance store rather than assumed, since an archived version's execution logic may no longer even be guaranteed loadable by the current node-executor registry.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">JUNIOR</span>Q55. What is a "connector" made of, structurally — what are its two halves?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>An authentication half — how the platform establishes and refreshes a trusted connection to the third-party system on a specific tenant's behalf (API key, OAuth2 flow, etc.) — and an action/schema half — the typed catalog of operations the connector exposes (e.g., "create record," "send message"), each with a declared input/output schema the engine and the builder UI can render and validate against generically. Some connectors also declare a third piece, trigger capability, if the third-party system can notify the platform of events rather than only being called.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">MID</span>Q56. How do you let engineers add a new third-party connector to the platform without redeploying the core execution engine?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>This is the plugin-architecture answer from Q13 applied concretely: package each connector as an independently deployable/loadable unit conforming to the connector SDK's manifest+runtime contract, and have the node-executor registry discover and load connectors dynamically (at startup from a registry service, or even hot-loaded) rather than the engine importing each connector's implementation directly into its own build. This is the same discipline as a plugin system in any extensible platform — the core stays generic and small, and growth in supported integrations happens entirely at the plugin layer.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. Design a connector SDK/spec: what must a connector declare for the platform to orchestrate it safely and generically, without engine-level special-casing per connector?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>At minimum: auth type and flow (so the platform's generic credential-management UI and refresh logic can handle it), a catalog of actions each with a JSON-schema input/output contract (so the builder can render a config form and the engine can validate at save time, not just at run time), whether each action has real-world side effects (needed for dry-run simulation per Q18), any triggers it can emit and how the platform verifies their authenticity (Q17), the connector's own rate-limit characteristics (needed for the fair-allocation problem in Q63), and an idempotency contract per action — whether the underlying API supports an idempotency key, since that determines whether the engine can safely retry that specific action node after an ambiguous failure. A connector that can't honestly declare idempotency support for a side-effecting action should be flagged so the engine treats retries on it more conservatively (e.g., requiring human confirmation before a retry rather than auto-retrying).</p>
+</div>
+
+<div class="question" id="q58"><span class="level">MID</span>Q58. How do you handle an integration whose third-party API introduces a breaking schema change? How does that surface to workflow authors currently using it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Version the connector itself the same way workflow definitions are versioned: publish a new connector version with the updated schema, keep the old version's implementation running for existing workflow nodes still configured against it (translating or proxying to the new upstream API where possible), and surface a deprecation notice to authors whose workflows use the old version, with a migration path (often a guided remap of any config fields whose shape changed) rather than a silent breakage. The failure mode to avoid is auto-upgrading everyone's connector usage in place the moment the third party changes its API — that's the same "in-place mutation of something with live dependents" mistake Q43 and Q51 warn against, just one layer down the stack.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. Design credential storage and refresh for OAuth-based connectors across thousands of tenant connections — how do you handle token refresh at scale and revocation?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Store tokens in a dedicated secrets vault, encrypted at rest and scoped per-tenant-per-connection (never embedded in a workflow definition, per Section 13), with a background refresh worker that proactively renews tokens nearing expiry rather than waiting for a live request to fail on an expired token — a lazy, on-demand refresh strategy means the first user-facing failure of every expiry is a broken workflow run, whereas proactive refresh keeps that invisible. Handle revocation (the tenant disconnects the integration, or the third party revokes it) by having the connector's auth layer detect the specific "invalid grant" error class and immediately mark the connection unusable platform-side, surfacing a clear "reconnect required" state to the affected workflows' authors (tying back into Q41's self-healing suggestion pattern) rather than letting every dependent workflow fail repeatedly with an opaque error until someone investigates.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">MID</span>Q60. Why is "let the LLM call the integration directly using the tenant's OAuth token" a worse design than routing every integration call through a platform-mediated deterministic action node?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>If the model itself holds and wields the credential, the model's own unreliability — including susceptibility to prompt injection — becomes directly exploitable to perform arbitrary authorized actions against the tenant's connected systems, with no deterministic checkpoint in between. Routing through a platform-owned action node means the LLM node can only ever request "call this specific declared action with these specific arguments," and the platform's own code — not the model — holds the credential, validates the arguments against the connector's schema, and can enforce permission scoping (Section 13) and confidence-floor gating before the call is actually made. This is the same schema-boundary discipline from Section 5/9 applied to credentials instead of just branch decisions: the model proposes, deterministic platform code disposes.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. How would you let an LLM node dynamically choose among 300 possible connector actions (function-calling at platform scale) without blowing the context window by listing all 300 tool schemas in every prompt?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Don't expose the full connector catalog to every LLM node — most nodes are configured, at design time by the author, to only be allowed to call a small, explicitly bound subset of actions relevant to that node's purpose (which also serves the permission-scoping goal from Section 13), so only that bound subset's schemas need to enter the prompt at all. Where a node genuinely needs broad, dynamic action selection (a general-purpose "agent node," per Section 4.1's taxonomy), use retrieval over a tool/action index — embed each action's description, retrieve the top-K most relevant to the current sub-goal, and present only those as callable tools — rather than statically enumerating hundreds of schemas on every call; this is the same retrieval-for-tool-selection pattern covered generically in the Tool Usage and Agent Orchestration chapters, applied here to a connector catalog instead of an arbitrary tool library.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">MID</span>Q62. Design connector health-checking: how do you detect that a specific third-party integration is degraded or down platform-wide, not just failing for one workflow, and communicate that to affected authors?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Aggregate action-level error rates per connector across all tenants (the same metering pipeline used for cost and success-rate telemetry, grouped by connector instead of by workflow), and alert when a connector's platform-wide error rate spikes well above its own historical baseline — a pattern affecting many unrelated tenants simultaneously is a strong signal the third party, not any individual workflow, is the problem. Surface this as a platform-wide status indicator on the connector (visible in the builder wherever that connector's nodes appear) so an author seeing a failure can immediately tell "this is a known, platform-wide outage of the third party" versus "this is specific to my workflow," which materially changes what action they should take.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. A popular connector (e.g., a CRM) is rate-limited by the third party at the platform's single app-level API key, but many tenants share that one quota. How do you fairly allocate it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>This is the same fair-share allocation problem as Q21's LLM-capacity sharing, applied one layer down to a third-party connector's own rate limit: give each tenant using that connector a baseline token-bucket allocation carved out of the shared app-level quota, replenished on the same window the third party enforces, with unused allocation reclaimable into a shared pool for burst absorption. Where the third party supports it, prefer per-tenant OAuth connections (each tenant authorizes their own account, so their usage counts against their own quota, not a shared app-level one) over a single platform-wide service account — this sidesteps the fair-allocation problem entirely for any connector whose auth model supports it, and should be the platform's default connector design unless the third-party API genuinely requires a single shared credential.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">MID</span>Q64. What's the tradeoff between building a generic "any REST call" HTTP action node versus maintaining hundreds of dedicated, typed connectors?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A generic HTTP node covers any API instantly with zero connector-maintenance burden, but pushes all the hard parts — auth handling, request/response shaping, rate-limit awareness, error classification, and dry-run simulation safety — back onto the individual workflow author, who is, by the product's own premise, not equipped to configure raw HTTP requests and headers correctly or safely. A dedicated typed connector does that work once, centrally, and exposes a safe, validated, non-engineer-friendly configuration surface, at the cost of needing to be built and maintained per integration. The practical answer most platforms converge on is both: dedicated connectors for the integrations enough tenants need to justify the investment, and a generic (but more engineer-oriented, more carefully guardrailed) HTTP node as an escape hatch for the long tail, often gated behind a higher permission tier since it reintroduces most of the risks a dedicated connector was designed to remove.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. Design how the platform tests that a third-party connector's action schema stays in sync with the live upstream API — contract testing at integration scale.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Maintain, per connector, an automated contract test suite that periodically (and on every connector-code change) calls the real upstream sandbox/test API for each declared action and validates the actual response shape against the connector's declared schema, flagging drift before it reaches production workflows rather than discovering it via a spike in customer-facing failures. Because running live calls against every third party on every CI run is expensive and sometimes rate-limited itself, pair this with a scheduled (e.g., daily) canary check per connector rather than running it on every platform deploy, and treat a contract-test failure as equivalent in severity to the connector-health alert in Q62 — both are ways of learning "this integration's promises no longer match reality" before a customer's workflow does.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">STAFF</span>Q66. You have 400 connectors maintained by a mix of internal engineers and external community contributors. Design the governance, ownership, and quality-bar model that keeps this scalable.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Treat connectors as a tiered ecosystem rather than a single undifferentiated list: a small set of high-traffic, high-stakes connectors (payments, core CRMs, email) are platform-owned and held to the platform's own engineering bar — full contract test coverage, SLA-backed on-call ownership, security review. A much larger long tail is community-contributed against a published SDK/spec (Q57), submitted through a review pipeline that checks schema completeness, security basics (no hardcoded secrets, correct auth-type declaration, side-effect flagging per Q18), and passes the contract-test suite (Q65) before listing — but is explicitly labeled as community-maintained with a different support expectation, so tenants can make an informed choice about which connectors to build critical automations on. The governance question a staff engineer actually has to answer is where that tier boundary sits and how a connector graduates between tiers as its usage grows, plus what happens when a community-maintained connector's contributor goes dark and the connector starts silently rotting — usually solved with an automatic health-check-driven deprecation path (Q58/Q62) rather than requiring a human to notice.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">JUNIOR</span>Q67. What is a "prompt template with variable slots," and why does it matter for letting non-engineers configure LLM steps safely?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>It's a platform-owned prompt scaffold — including instructions, output-format contract, and safety wrapper — with a small number of named, typed placeholders (e.g., <code>{{email.body}}</code>) that the author fills in or binds to execution-context fields through a form, rather than writing free-form prompt text. It matters because it means the author's only surface area for error is business content (which field to reference, what category options to offer), while everything that makes an LLM node safe to wire into a deterministic graph — the structured-output enforcement, the injection-defense framing — stays under platform control, exactly as covered in Q14.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">MID</span>Q68. How do you stop a non-engineer from accidentally writing a prompt template that leaks data from the wrong scope — e.g., referencing a variable that belongs to a different workflow or a different tenant?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Scope the set of variables the builder UI even offers to whatever is actually present in the current workflow's execution-context schema up to that node — the author should never be able to type or select a variable reference that doesn't resolve within their own workflow's own context, because the picker is populated from a schema, not free text. Combine this with a run-time assertion in the engine: if a template somehow resolves a variable reference to data outside the current instance's own context (which should be structurally impossible given proper scoping, but is worth defending in depth), fail the node loudly rather than silently substituting cross-tenant or cross-instance data.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">MID</span>Q69. Design guardrails so a business user configuring an LLM step can't accidentally, or maliciously, turn it into an unbounded or expensive loop, or an exfiltration vector.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Enforce the loop-iteration cap (Section 5.1/Section 10) and per-node token/cost ceilings at the engine level, not as configurable-by-the-author settings, so no amount of author misconfiguration can remove them. For exfiltration risk — an LLM node whose output could be used to smuggle sensitive context data out through, say, a webhook action node the author wired downstream — apply the permission-scoping discipline from Section 13 and Q71: any node that both reads sensitive/broad-scope context and can call an outbound action needs the combination itself reviewed, since neither capability alone is dangerous but the combination is exactly what a data-exfiltration path looks like.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">SENIOR</span>Q70. How do you validate a user-authored prompt template at save time, before it's ever run against real data, to catch obvious configuration errors?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Run a static validation pass on save: confirm every variable slot referenced in the template resolves to a field that actually exists in the upstream context schema (catching typos and stale references after an upstream node's output schema changes), confirm the node's declared output schema is present and well-formed so structured-output enforcement has something to validate against, and confirm any branch node downstream of this LLM node only routes on fields that are actually part of that schema. This is the same category of check a compiler does for a strongly-typed language — catching the entire class of "field doesn't exist" or "downstream code assumes a field that was never produced" errors before run time rather than as a confusing failure deep into a live execution.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. Design a permission model for LLM node configuration: what should a non-engineer author be allowed to touch (business logic) versus what must stay locked to the platform (the safety wrapper)?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Author-editable: the business framing of the task ("classify this ticket's sentiment," "extract these five fields"), the specific category options or extraction schema relevant to their domain, which context variables feed the template, and which branch each output value routes to. Platform-locked: the structured-output enforcement mechanism itself, the confidence-floor threshold below which a decision routes to human review by default (an author might be allowed to raise it, but not remove it entirely, without an explicit elevated-permission override), injection-defense framing around any untrusted-input variable, and the hard iteration/cost ceilings from Q69. The dividing line is exactly the one drawn in the Section 9 code sample's defensive confidence-floor line — that line is architecture, not business logic, and it stays out of the author's editable surface.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">MID</span>Q72. Why should the platform, not the individual workflow author, own the "does this look like prompt injection" check on untrusted inputs feeding an LLM node?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A non-engineer author has no realistic way to know what an injection pattern even looks like, let alone keep a detection mechanism current as attack techniques evolve — asking every author to individually defend their own workflows against injection would mean the platform's overall security posture is only as strong as its least security-aware customer. Owning it centrally means one detection mechanism, built and maintained by people who understand the threat model, protects every workflow uniformly, and can be improved once and have that improvement apply retroactively to every existing workflow (the problem Q78 addresses directly).</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. A workflow author configures an LLM node to auto-send an email based on the model's draft, with no human review step. How should the platform's guardrail design respond — and where's the line between protecting users from themselves and being paternalistic about a legitimate low-stakes use case?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The right answer is risk-tiered, not a blanket block: classify the action by blast radius — an auto-sent internal Slack notification is low-stakes and reasonable to allow with no friction, while an auto-sent customer-facing email or an auto-issued refund is high-stakes and should default to requiring human review, with auto-send available only as an explicit, separately-confirmed opt-out the author has to deliberately choose (Q77's "safe mode" default pattern). This avoids both failure modes: forcing human review on every single automated action anywhere in the platform would defeat the point of automation for the vast majority of genuinely low-stakes use cases, while defaulting every LLM-driven action to fully autonomous execution ignores that the model's output is, by construction, occasionally wrong in ways that matter more for some actions than others.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">MID</span>Q74. Design a "prompt template linter" feature in the visual builder that surfaces warnings before publish — e.g., "this LLM node has no confidence-threshold branch."</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Run a rule-based checklist against the node's configuration at publish time (reusing the same static-validation pass from Q70): does the node's downstream conditional branch on a confidence field at all, does any branch route low-confidence results to a human-review or fallback node rather than straight to a side-effecting action, does an untrusted-input variable feed the template without going through the platform's injection-screening path, and is the node's declared output schema actually consumed downstream rather than silently ignored. Present findings as non-blocking warnings rather than hard errors for most checks (an author might have a deliberate reason), but treat combinations that match Q69's exfiltration pattern or Q73's high-stakes-auto-send-without-review pattern as harder blocks requiring explicit confirmation to override.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">SENIOR</span>Q75. How do you sandbox an LLM node's ability to reference execution-context variables so an author cannot, even accidentally, leak one workflow run's data into a prompt sent on behalf of a different, unrelated trigger?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>This is fundamentally an instance-isolation guarantee, not a UI nicety: each instance's execution context is a separate, instance-scoped data structure (per Section 4.1), and the template-resolution step that fills variable slots must only ever read from the current instance's own context object — there should be no code path, generic or otherwise, by which resolving a variable for instance A can read a value belonging to instance B, even under a bug, because the resolver never holds a reference to any other instance's context in the first place. Combine this structural isolation with the save-time variable-scoping from Q68 (limiting what the author can even reference to the current workflow's own schema) as defense in depth, but the load-bearing guarantee is the runtime isolation, not the authoring-time restriction.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">MID</span>Q76. What's the UX for showing a non-engineer why an LLM step made a particular decision, without dumping raw chain-of-thought reasoning on them?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Design the node's structured-output schema itself to include a short, plain-language "reasoning" or "rationale" field alongside the decision field — one or two sentences the model produces specifically for human consumption, distinct from any internal deliberation — and surface just that field, plus the confidence score, in the run-history view next to the node. This sidesteps the whole problem of trying to make raw chain-of-thought (which is often verbose, technical, and not actually reliable as a faithful explanation of the model's true process) presentable, by instead asking the model for a purpose-built, concise explanation as part of its structured contract, the same way you'd design an API response field rather than exposing internal implementation details.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">SENIOR</span>Q77. Design a "safe mode" default for newly-created LLM nodes — e.g., defaulting to draft-for-review rather than auto-execute — and how an author would graduate a node out of it.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Every newly-created LLM node whose output feeds a side-effecting downstream action should default to routing that action through a human-approval node rather than direct execution, regardless of what the author explicitly configures for confidence thresholds — this default should require a deliberate, separately-logged opt-out to disable, not a checkbox buried in general settings. Graduation out of safe mode is reasonable once the workflow has accumulated enough live run history to demonstrate the node's actual error rate is low and the author has explicitly reviewed a sample of its real decisions (tying into Q35's feedback mechanism) — i.e., graduation should be evidence-gated, not just time-gated or a single toggle flip on day one before any real traffic has been observed.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">STAFF</span>Q78. How do you evolve platform-wide LLM guardrail policy — e.g., adopting a new injection-defense technique — across hundreds of thousands of existing customer-authored workflow definitions, without forcing every customer to manually update?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>This is exactly why Q71's dividing line (platform-locked safety wrapper vs. author-editable business logic) has to be a real architectural boundary and not just a convention: if the injection-defense logic lives in platform-owned, centrally-executed code that every LLM node passes through regardless of workflow definition content — rather than being baked into each individual published prompt template as static text — then improving that defense is a platform code deployment that instantly applies to every existing workflow, with zero customer action required and zero new workflow-definition versions needed. The trap to avoid is any design where a safety improvement has to be "installed" into each customer's already-published templates one by one; at hundreds of thousands of workflows, that update path effectively never completes, leaving old workflows permanently under-protected. This is the single strongest argument for keeping the safety wrapper out of the versioned, author-owned prompt template entirely.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">MID</span>Q79. Design "dry-run" mode more fully than Q18: what specifically has to be faked/mocked (triggers, side-effecting actions) versus what should genuinely execute, to give an author a realistic test?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The trigger itself is faked — the author supplies (or the platform samples) a representative payload rather than waiting for a real webhook or schedule tick. Deterministic non-side-effecting nodes (a lookup, a computation, a conditional) execute for real, since there's no risk and the author needs to see genuine routing behavior. LLM nodes execute for real against the actual model, per Q18/Q80's reasoning. Any node the connector manifest (Q57) declares as side-effecting is intercepted and simulated, logging what it would have done, with its simulated output still fed forward into the execution context so downstream nodes (including further LLM nodes that might reference "did the email send successfully") see a plausible result and the rest of the dry run stays coherent.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">SENIOR</span>Q80. Should a dry run genuinely call the LLM (real cost, real realism) or use a cached/mocked response (free, but potentially unrealistic)? Argue both sides and give your default.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>For a mocked response: dry runs can be run frequently and cheaply during iterative authoring, with zero cost or latency concern, and an author tweaking a prompt ten times in five minutes shouldn't need to think about token spend each time. For a real call: the entire value of testing an LLM-touching workflow before publish is seeing how the least predictable part of the graph actually behaves — a mocked response tells the author nothing about whether their prompt or schema is well-formed against a real model. The right default is real calls, because a workflow platform whose testing tool doesn't exercise the one component most likely to misbehave is testing the wrong 90% of the workflow; the cost concern is real but secondary, and is better solved by rate-limiting or budgeting dry-run LLM spend (a small, capped allowance per workflow per day) than by making the test unrealistic.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">SENIOR</span>Q81. Design a "workflow simulator" that lets an author replay a batch of historical trigger payloads through a draft version to see the branch/outcome distribution before publishing.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Sample a representative set of past trigger payloads from the workflow's own historical instance log (or let the author upload/select a specific set for a brand-new workflow with no history yet), run each through the draft version in dry-run mode (Q79) in parallel, and aggregate the results into a distribution view — what percentage took each branch, average cost and latency, and any error rate — rather than showing the author 500 individual run traces one by one. This is precisely the offline half of the change-detection strategy from Q45: it lets an author see, before publishing, whether a prompt edit shifted the classification distribution in a way they didn't intend, using real historical inputs instead of hand-picked test cases that might not represent actual traffic.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">MID</span>Q82. What per-workflow, per-node metrics should the builder UI surface to a non-engineer author to help them improve their workflow, beyond just pass/fail?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Per node: success rate, average cost, average latency, and — for conditional/LLM nodes — the distribution of which outgoing branch gets taken, since an unexpectedly lopsided distribution (a "fraud risk" branch that's supposedly rare but is actually taken 40% of the time) is often the first signal something's misconfigured upstream. Per workflow overall: end-to-end completion rate, average total cost and latency per instance, and the most common failure point across all instances, ranked, so the author's attention is drawn to the highest-leverage node to fix first rather than needing to inspect every node individually.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">SENIOR</span>Q83. Design an A/B testing feature for workflow templates: two versions of a node (e.g., two prompt variants) split-tested across live traffic, with automatic promotion of the winner.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>This reuses the canary-routing infrastructure from Q44 but generalizes the split from "old version vs. new version" to "variant A vs. variant B" at a single-node granularity rather than the whole graph, with instances randomly (and consistently, so re-execution of a resumed instance doesn't flip variants mid-run) assigned to a variant at the point they first reach that node. Define the success metric up front and explicitly (branch-outcome quality via human feedback, cost, latency, or a downstream business metric like approval rate), run until a pre-declared minimum sample size and statistical-significance bar is met, and only then either auto-promote the winning variant to 100% or surface the result for the author to decide — auto-promotion without a significance bar is the classic A/B-testing pitfall of reacting to noise, and it applies here exactly as it does to any other product experimentation system.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Flag that "success" for an LLM node variant is often harder to define than a simple click-through-rate metric — pull in Volume 5's evaluation methodology (LLM-as-judge, human feedback sampling) rather than assuming a clean automatic signal always exists, and be explicit that some node changes may need human-graded evaluation before an A/B test can even be run meaningfully.</div>
+
+<div class="question" id="q84"><span class="level">STAFF</span>Q84. Design an AI workflow automation platform, Zapier/n8n-style, supporting 100,000 customer-built workflows with LLM-powered steps. Walk through your architecture end-to-end.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High at staff level (classic system-design prompt)</p>
+<div class="answer">
+<p>Structure the answer in the same layers as Section 8's production architecture, but narrate the reasoning at each layer: a visual builder UI backed by a generic node/edge metadata contract (Q9) so new node types and connectors (Q13/Q57) never require builder changes; a definition store holding versioned, immutable workflow definitions (Section 3/Q43); an async trigger-ingestion layer (Q26) that decouples "accept the event" from "do the work" via a durable queue, with per-tenant isolation (Q20/Q29) to prevent one customer's burst from affecting others; a durable execution engine — likely built on or informed by an existing durable-execution substrate (Section 8's Camunda/Temporal discussion) — enforcing iteration caps, idempotency, and crash-safe state persistence after every node; node executors split by type (deterministic, LLM with structured-output enforcement and confidence floors, tool/agent, human-in-the-loop with timeout watchdogs); a metering/observability pipeline feeding both per-tenant cost attribution (Q24/Q25) and platform-wide connector health (Q62); and a safe-release pipeline (Q54) governing how workflow and template changes roll out. At 100,000 workflows, explicitly call out that the trigger-ingestion and execution-engine layers must scale horizontally by sharding on tenant or instance ID, and that per-tenant rate limiting and quota enforcement (Q21/Q22) are not optional hardening — they are core correctness requirements at this scale, because the shared-resource contention problem becomes near-certain to manifest with that many independently-behaving customers.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">STAFF</span>Q85. In that system, where do you draw the multi-tenancy boundary — a shared execution engine with logical isolation, or per-tenant sharded engine pools? Justify with a concrete failure scenario.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Default to a shared execution engine with strong logical isolation (per-tenant quotas, per-tenant queues or shard keys, tenant-tagged rows with row-level security in the state store) for the large majority of tenants, because operating one well-instrumented shared fleet is dramatically cheaper and easier to keep reliable than operating thousands of independent per-tenant deployments, and logical isolation — done correctly, per Q20 — is sufficient for the overwhelming majority of workloads. Reserve dedicated, physically isolated engine pools for a small tier of tenants whose contractual requirements (regulatory data residency, a guaranteed-uncontended SLA, or genuinely enormous scale that would otherwise dominate shared capacity) justify the added operational cost — the concrete failure scenario that forces this tiering is a single enterprise tenant whose workflow volume is large enough that even well-designed fair-share quotas would need to reserve so much of the shared pool's headroom that it materially degrades everyone else's baseline experience; at that point, physical isolation is cheaper than continuing to over-provision the shared fleet to absorb one tenant's scale.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">STAFF</span>Q86. How would you design the platform's pricing/packaging model (seats vs. runs vs. LLM-token pass-through) so that platform margin doesn't evaporate when a customer builds an LLM-heavy workflow?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>A flat per-seat or per-workflow price is dangerous once LLM nodes are in the picture, because two customers on the same plan can have wildly different underlying LLM cost depending on how many judgment nodes their workflows use and how large their inputs are — the plan that's profitable for a five-node deterministic workflow can be a loss-leader for a twelve-node LLM-heavy one. The pricing model needs a metered component tied to the actual cost driver — either pass through LLM token cost with a margin on top (transparent, scales correctly with usage, but exposes the customer to per-run cost variance) or bundle a capped allowance of "AI-powered runs" per tier with overage pricing beyond it (simpler for the customer to reason about, but requires the platform to actually track cost-per-run per Q24/Q25 accurately enough to set that allowance without losing money on it). Either approach depends entirely on the fine-grained cost-attribution ledger already required for Q24 — pricing strategy and cost-attribution architecture are not separable decisions here.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">STAFF</span>Q87. A major LLM provider has an outage. Design the platform's degradation strategy across all customer workflows that depend on it.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Detect the outage via the same connector/dependency health-checking discipline as Q62, applied to the LLM provider itself, and respond in layers rather than a single global behavior: where a fallback provider/model is configured (or a platform-level default fallback exists), route affected LLM nodes to it automatically, accepting a possible quality/behavior difference over an outright failure. Where no fallback exists, decide per node — driven by a fail-open/fail-closed flag the node or its confidence-floor configuration already implies — whether to queue-and-retry the instance (pausing it gracefully, like a human-in-the-loop wait, for workflows where a delayed-but-correct outcome is acceptable) or to fail closed and alert the author immediately (for workflows where a stale/delayed decision is actively harmful, e.g., a time-sensitive fraud check). Communicate the outage proactively to affected tenants through the same platform-wide status mechanism as Q62's connector-health signal, rather than letting every affected customer independently discover it through their own failing runs and file separate support tickets.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">STAFF</span>Q88. Design the platform's approach to supporting "bring your own model" — a customer wants to point their LLM nodes at their own Azure OpenAI or Bedrock deployment instead of the platform's shared pool. What changes across cost attribution, guardrails, and rate limiting?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Cost attribution simplifies in one sense (the platform no longer bears or passes through token cost for that tenant's calls — it's billed directly by the provider to the customer) but still needs usage metering for the platform's own pricing tier logic (e.g., "runs," if the plan is priced that way rather than per-token) and for the author-facing dashboards from Q82, which still need real numbers even though the platform isn't the one paying. Guardrails and the safety wrapper (Q71/Q78) must still apply in full — BYO-model changes who pays and which model answers, not whether the platform's structured-output enforcement, confidence floors, and injection defenses run, since those protect the workflow's correctness and the platform's own liability regardless of whose API key is in use. Rate limiting shifts: the platform's own shared-capacity fairness concern (Q21/Q22) no longer applies to that tenant's calls at all, but the platform should still apply its own node-level iteration/cost caps (now denominated against the customer's own reported usage or a declared budget) so a runaway loop against a customer's own deployment doesn't become an unbounded bill the customer didn't expect, even though it's no longer the platform's bill.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">SENIOR</span>Q89. Design revenue share/economics for the template marketplace — a tenant sells a premium workflow template to other tenants. What platform mechanics does that require?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Beyond the credential-free publishing mechanics from Q47, a paid marketplace needs metering of installs and/or ongoing usage (depending on whether pricing is one-time or usage-based) attributed to the specific template version, a payout pipeline that reconciles that metering into publisher revenue on a schedule, and — because templates evolve (Q50) — a clear contractual answer to what an installer's purchase actually entitles them to (perpetual access to the version they bought, or ongoing updates, or a subscription to the publisher's latest version). None of this is exotic once the underlying usage-metering ledger already exists for cost attribution (Q24/Q25) — the marketplace economics layer is largely a billing/reporting application built on top of data the platform needs to collect anyway.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">MID</span>Q90. Why does the platform need a distinct "simulate as this tenant" impersonation/debug tool for platform support engineers, and what guardrails does that tool itself need?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Support engineers troubleshooting a customer's broken workflow need to see exactly what that tenant sees — the same run history, the same error surfaces from Q31/Q32 — rather than reconstructing the issue secondhand from a support ticket description, which is slow and error-prone for anything involving a specific execution context. But the tool itself is a privileged cross-tenant access path and needs its own guardrails: every impersonation session must be scoped read-only by default (write access requiring explicit additional justification/approval), fully audit-logged with the support engineer's identity and the tenant accessed, time-boxed rather than a standing session, and never able to expose the tenant's stored credentials in plaintext even to the support engineer, since the whole point of the vault design in Q59 is that credentials shouldn't be human-readable by anyone outside the tenant.</p>
+</div>
+
+<div class="question" id="q91"><span class="level">SENIOR</span>Q91. Design SOC 2/compliance-relevant controls specific to this platform, as distinct from a normal SaaS app, given that workflows execute arbitrary customer-authored logic against customer data.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Beyond standard SaaS controls (access control, encryption at rest/in transit, incident response), this platform's distinctive surface is that customer-authored workflow logic — including LLM prompts — routinely touches other systems' data via connectors and can take real-world action, so compliance controls need to cover: strict multi-tenant data isolation at the execution-context and audit-log layer (Section 13), demonstrable change-control over the safety-wrapper code every LLM node passes through (since that's a shared control protecting every tenant, its own change history matters to an auditor), credential-vault access logging (who/what accessed a stored connector credential and when), and retention/access controls on the audit trail itself, which by design contains sensitive prompt/response content from potentially every connected system a tenant uses. The auditor's core question for this category of platform is usually "how do you know one tenant's workflow can never read or act on another tenant's data," and the answer needs to be a structural guarantee (Q75-style isolation), not a policy statement.</p>
+</div>
+
+<div class="question" id="q92"><span class="level">MID</span>Q92. How should the platform handle a workflow where a customer explicitly wants to process regulated data (PII/PHI) through an LLM node? What does "supported" look like versus "blocked by default"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Default to blocked/warned for regulated-data categories on standard tiers — the platform should not silently allow PHI into an LLM node by default, given the compliance and provider-contract implications — and require an explicit, account-level opt-in tied to a plan/contract that actually provides the necessary controls (a provider agreement covering the data category, e.g., a HIPAA business-associate agreement with the model provider; audit-log redaction or field-level encryption for that content; possibly routing to a specific compliant model deployment rather than the general shared pool). "Supported" means the platform has done the compliance groundwork and can make contractual guarantees about that data path; "blocked by default" protects both the customer and the platform from an author unknowingly routing regulated data through infrastructure that was never vetted for it.</p>
+</div>
+
+<div class="question" id="q93"><span class="level">SENIOR</span>Q93. Design data retention/deletion for workflow execution history — audit logs containing LLM prompts and responses — to satisfy both "must be auditable" and "must support right-to-erasure" simultaneously.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>These two requirements are in genuine tension and need a deliberate policy, not just a technical trick: retain the structural audit trail (which node ran, when, what branch was taken, cost/latency) indefinitely or per a defined retention window, since that's what makes "why did the system do X" answerable and is usually not itself the erasure-sensitive part — but store the actual content payloads (the prompt text and model response, which may contain PII pulled from a customer record) with their own, shorter, independently-configurable retention window and support targeted deletion of a specific data subject's content across historical logs without deleting the surrounding structural record entirely. This typically means separating "what happened" (structural, long-lived) from "what data was involved" (content, erasure-sensitive) into different storage with different lifecycle policies, joined by a reference, rather than one monolithic log row that can't be partially redacted without losing auditability of the event itself.</p>
+</div>
+
+<div class="question" id="q94"><span class="level">SENIOR</span>Q94. How do you decide, per node, whether an LLM call should be synchronous (block the graph) or dispatched to an async worker pool? What does that decision depend on?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It depends on whether anything downstream needs the result immediately to make progress and on the acceptable latency budget for the surrounding context: a node in a linear chain where every subsequent node depends on this one's output has no benefit from async dispatch — the graph is blocked either way — so keep it a simple synchronous call within the engine's per-node execution step. Genuine async dispatch earns its complexity when a node is one of several independent branches that can execute concurrently (Section 12's parallelization point) or when the workflow is explicitly a high-throughput batch style (Q95) where dispatching many nodes to a worker pool and reconciling results later avoids holding engine capacity per instance while waiting. The default should be the simpler synchronous model; introduce async dispatch specifically where profiling (Section 6's expected-latency model) shows it removes real, executed-path latency, not preemptively everywhere.</p>
+</div>
+
+<div class="question" id="q95"><span class="level">STAFF</span>Q95. A customer wants a workflow that fans out to 10,000 parallel sub-instances — one per row in an uploaded spreadsheet — each with an LLM node. Design this without one customer's batch job starving the shared engine.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Treat this as a distinct workload class from the interactive, low-volume trigger case rather than forcing it through the same unthrottled path: the fan-out itself should be admitted into the same per-tenant queue and concurrency-cap machinery as any burst (Q20/Q26), not instantiate all 10,000 sub-instances synchronously on upload. Apply a batch-specific concurrency ceiling — e.g., only N of the 10,000 sub-instances actually executing at once, drawn from the tenant's own allocation rather than the platform-wide pool — so the batch drains over time instead of spiking demand instantaneously, and expose the batch's progress (X of 10,000 complete) as a first-class UX rather than the author having to infer it from 10,000 individual run rows. This is also where per-tenant LLM rate limiting (Q22) does its real work: even with engine-level concurrency capped, if every concurrent sub-instance immediately calls the LLM, the tenant's own token-bucket allocation naturally paces the actual provider calls without the platform needing a separate batch-specific LLM throttle.</p>
+</div>
+
+<div class="question" id="q96"><span class="level">MID</span>Q96. What's the product argument for a "test with real data, but require explicit human confirmation before the first N live runs" onboarding pattern for new LLM-powered workflows?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It bridges the gap between the simulator's offline, historical-data testing (Q81) and full unattended production operation, giving the author a low-stakes window where they can watch the LLM node's real decisions on genuinely new, live trigger data — which will always differ somewhat from historical replay data — before fully trusting it unattended. This directly operationalizes the "safe mode" graduation criterion from Q77 (evidence-gated, not just time-gated): requiring confirmation on the first handful of live runs is exactly the mechanism by which an author accumulates the evidence needed to responsibly graduate a node out of safe mode, rather than the platform asking them to simply assert confidence with no real signal behind it.</p>
+</div>
+
+<div class="question" id="q97"><span class="level">SENIOR</span>Q97. Design how the platform surfaces "this workflow's LLM node behavior may have silently changed" after a transparent model upgrade by the provider that the customer didn't request.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because the workflow definition typically references a model identifier the provider controls the underlying weights for (or an alias that the provider silently repoints), the platform should treat a provider-side model change the same way it treats a customer-initiated prompt change in Q45: continuously compare a node's live branch/outcome distribution against its own recent historical baseline, and if a discontinuity appears at a time correlated with a known provider model update (which the platform should track per provider), surface a specific, actionable alert — "this node's output distribution shifted on [date], which coincides with a provider model update" — rather than a generic drift warning the author has to independently investigate. This is also a strong argument for letting security/stability-conscious tenants pin to a specific dated model snapshot rather than a "latest" alias where the provider supports it, trading away automatic quality improvements for behavioral stability.</p>
+</div>
+
+<div class="question" id="q98"><span class="level">STAFF</span>Q98. Ten years from now, if LLMs become perfectly reliable, what part of this platform's architecture becomes irrelevant, and what remains load-bearing regardless? What does that tell you about the platform's core value proposition versus "just call the model directly"?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level (forward-looking/judgment question)</p>
+<div class="answer">
+<p>Perfect model reliability would retire the reliability-specific machinery built to contain the model's unreliability — the confidence-floor gating, the corrective re-prompt retries, the structured-output validation as a defense against malformed output, and much of the human-in-the-loop-as-a-safety-net pattern would shrink to a business-preference feature rather than a risk control. What remains fully load-bearing regardless: durable, crash-safe execution of long-running, multi-step processes (an LLM being reliable doesn't make a three-day approval wait survive a server restart on its own); multi-tenant isolation, rate limiting, and cost attribution (these are properties of running many customers' workloads on shared infrastructure, orthogonal to model quality); the no-code authoring layer and connector ecosystem (the entire reason a non-engineer can build this instead of needing an engineer, regardless of how good the model is); versioning, safe rollout, and auditability (organizational and governance needs that exist independent of model behavior); and security surface around credentials, permissions, and data isolation. The lesson: the platform's durable value was never "make an unreliable model reliable enough to use" — that's a real but time-bound problem — its durable value is the same one BPM and iPaaS platforms had before LLMs existed at all: letting a non-engineer safely define, run, and evolve a business process at scale. The LLM node is a powerful new capability slotted into that older, still-necessary architecture, not a replacement for it.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> This question rewards explicitly tying the answer back to Section 2's historical framing — the interviewer is testing whether you understand this platform as a durable execution and multi-tenant product engineering problem that happens to have an LLM node in it, versus a thin wrapper around a chat API, which is precisely the distinction the whole chapter has been building toward.</div>
+
 </div>
 
 <hr>

@@ -119,6 +119,24 @@ This chapter treats caching as a system design tool, not a Spring annotation. In
 
 <li>Sizing &amp; Monitoring a Cache (Hit Ratio, Eviction Rate, Alerts)</li>
 
+<li>Redis Cluster, Replication &amp; Sentinel for Scale and High Availability</li>
+
+<li>Redis Beyond Caching: Distributed Locks, Rate Limiting, Pub/Sub, Streams</li>
+
+<li>HTTP &amp; CDN Caching: Cache-Control, ETag, Vary, and Read-Through vs Cache-Aside</li>
+
+<li>Cache Key Design, Negative Caching &amp; Cache Warming</li>
+
+<li>Session Storage as a Caching Use Case</li>
+
+<li>Deeper Consistency Patterns: Write Ordering, Double-Delete, Read-Repair</li>
+
+<li>Cache Outages, Hot Keys &amp; Graceful Degradation</li>
+
+<li>Advanced Cache Sizing &amp; Capacity Planning</li>
+
+<li>Caching System Design Scenarios (Catalog Page, Leaderboard, Rate Limiter, Third-Party API)</li>
+
 </ol>
 
 <hr>
@@ -1065,7 +1083,2146 @@ Tie the metrics back to business impact rather than reciting them: "cache metric
 
 <hr>
 
-<h1 id="h8">QUICK REVISION SHEET</h1>
+<h1 id="h8">SECTION 6 - REDIS CLUSTERING, REPLICATION &amp; OPERATIONS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q15">
+Q15. Redis Cluster &amp; Hash Slots
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A single Redis instance is bounded by one machine's memory and one machine's CPU for command processing. Redis Cluster solves both by sharding the keyspace across multiple nodes, so the dataset and the request load are spread out rather than concentrated on one process.
+</p>
+
+<p>
+Redis does not shard by consistent hashing over arbitrary node counts; it divides the entire keyspace into a fixed <b>16384 hash slots</b>. Every key is mapped to a slot by taking <code>CRC16(key) mod 16384</code>, and each node in the cluster owns a contiguous range of those slots. A client that wants to read or write a key computes (or is told) which slot it belongs to, and talks directly to the node that owns that slot; if it asks the wrong node, that node replies with a <code>MOVED</code> redirect pointing at the right one. Because the total slot count is fixed at 16384 regardless of how many nodes you add, rebalancing (adding or removing a node) is just a matter of migrating a range of slots from one node to another, not rehashing the whole keyspace.
+</p>
+
+<p>
+The sharp edge interviewers probe for is multi-key operations. A command that touches two keys (a <code>MSET</code> across keys, a Lua script, a transaction) only works if every key involved hashes to the same slot, because Redis Cluster does not coordinate a single command across multiple nodes. The fix is <b>hash tags</b>: wrapping the part of the key you want hashed in curly braces, for example <code>{user:123}:profile</code> and <code>{user:123}:sessions</code>, so only the substring inside the braces is hashed and both keys land on the same slot deliberately.
+</p>
+
+</div>
+
+<pre>
+// Without a hash tag these two keys can land on different nodes,
+// making a single MGET or a Lua script across both impossible:
+user:123:profile
+user:123:sessions
+
+// With a hash tag, only "user:123" is hashed -> same slot, same node:
+{user:123}:profile
+{user:123}:sessions
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The number to know cold is 16384 slots, and the one-sentence explanation of why: it is small enough that the slot-ownership map is cheap to gossip between nodes, and it never changes size, so scaling the cluster is slot migration, not a rehash of every key. Pairing that with "and multi-key operations need a hash tag to force co-location" shows you understand both the mechanism and its most common practical limitation.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q16">
+Q16. Redis Replication: Master-Replica &amp; Read Scaling
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Redis replication lets one or more replica nodes maintain a live copy of a primary node's dataset. The primary streams every write it accepts to its replicas asynchronously, and each replica applies those writes to keep its own copy in sync. This serves two purposes at once: it protects against data loss if the primary fails, and it lets you scale reads horizontally by pointing read-heavy traffic at replicas instead of the primary.
+</p>
+
+<p>
+The critical word is <b>asynchronous</b>. The primary acknowledges a write to the client as soon as it is applied locally; it does not wait for any replica to confirm receipt. That means there is always a small replication lag window, and a replica can be milliseconds (or, under load or network trouble, much longer) behind the primary. Reading from a replica is therefore reading a slightly stale, eventually consistent view, which is fine for a product listing but wrong for "read your own write immediately after writing it" flows such as showing a user their own just-placed order.
+</p>
+
+<p>
+If the primary fails, promoting a replica to take over does not happen automatically with plain replication alone - that is what Sentinel (Q17) or Cluster's built-in failover exists to automate. Without it, a primary failure means someone has to manually promote a replica and repoint clients, which is an outage, not a graceful failover.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Routing a read to a replica immediately after the corresponding write and being surprised the value isn't there yet. If a flow genuinely needs read-your-writes consistency, either read from the primary for that specific path, or accept the staleness and design the UI around it (e.g. showing an optimistic client-side value rather than round-tripping to a lagging replica).
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q17">
+Q17. Redis Sentinel for High Availability &amp; Automatic Failover
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Sentinel is a separate set of Redis processes whose only job is to watch a primary/replica group and automate failover when the primary dies, so an outage does not require a human to notice and manually promote a replica at 3 a.m.
+</p>
+
+<p>
+Each Sentinel process continuously pings the primary and its replicas. When enough Sentinels (a configured quorum) independently agree that the primary is unreachable - this distinction matters, because a single Sentinel losing connectivity to the primary might just mean that Sentinel has a network problem, not that the primary is actually down - they elect a leader Sentinel among themselves, which then picks the best-positioned replica (least replication lag, highest priority) and promotes it to primary. Sentinel also updates its own view of "who is primary now" and reports that to clients that ask it, so applications configured to discover the primary through Sentinel (rather than a hardcoded address) automatically start talking to the newly promoted node.
+</p>
+
+<p>
+Because the old primary's unacknowledged writes at the moment of failure are lost (replication is asynchronous, per Q16), Sentinel gives you automatic <i>availability</i> after a failure, not a guarantee of zero data loss during one. Running at least three Sentinels (an odd number, to avoid split-brain ties in the quorum vote) across separate failure domains is the standard production setup.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The line that shows real operational exposure: "Sentinel gives you automatic failover, not zero data loss - whatever writes hadn't replicated yet when the primary died are gone." Redis Cluster, when used, folds this same failure-detection-and-promotion responsibility into the cluster nodes themselves rather than needing separate Sentinel processes.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q18">
+Q18. Pipelining for Throughput
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Every Redis command normally pays one full network round trip: the client sends the command, waits for the server's reply, and only then sends the next one. If you need to issue a thousand small commands (say, warming a cache with a thousand keys), doing that one at a time means paying network latency a thousand times over, even though each command itself executes on the server in microseconds.
+</p>
+
+<p>
+Pipelining removes the "wait for each reply" step: the client writes a whole batch of commands to the socket back-to-back without waiting for responses in between, and then reads all the responses off the socket afterward, in the same order the commands were sent. The server still processes them one at a time (Redis is still single-threaded for command execution), but the client no longer pays a round trip per command - it pays one round trip for the whole batch. This can turn a workload that was dominated by network latency into one dominated by actual server-side work, often a 10x or larger throughput improvement for bulk operations.
+</p>
+
+<p>
+Pipelining is not a transaction: commands in a pipeline are not atomic as a group, and if one command in the middle fails, the others still execute independently. If you need atomicity across multiple commands, that is what <code>MULTI</code>/<code>EXEC</code> transactions or Lua scripting (Q19) are for; pipelining is purely a throughput optimization for the network layer.
+</p>
+
+</div>
+
+<pre>
+// Naive: N round trips
+for (String id : ids) {
+    redis.opsForValue().set("product:" + id, serialize(products.get(id)));
+}
+
+// Pipelined: 1 round trip for the whole batch
+redis.executePipelined((RedisCallback&lt;Object&gt;) connection -&gt; {
+    for (String id : ids) {
+        connection.set(("product:" + id).getBytes(),
+                        serialize(products.get(id)));
+    }
+    return null;
+});
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Frame it precisely: "pipelining collapses N round trips into 1, but the commands still execute independently on the server, so it buys throughput, not atomicity." Conflating pipelining with transactions is a common tell that a candidate hasn't actually used it under load.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q19">
+Q19. Lua Scripting for Atomic Multi-Step Operations
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A lot of caching logic is "check something, then act on what you saw" - check a value before overwriting it, decrement a counter only if it is still positive, atomically move an item between two sets. Doing the "check" and the "act" as two separate round trips from the client is inherently racy: another client's command can slip in between your read and your write.
+</p>
+
+<p>
+Redis solves this by letting you send a small <b>Lua script</b> to the server with <code>EVAL</code>, and the entire script runs atomically as a single operation - Redis will not process any other client's command while your script is executing. This turns a "read, decide, write" sequence that would otherwise need a distributed lock into a single, guaranteed-atomic round trip. It also cuts network overhead the same way pipelining does, since multiple logical steps become one request.
+</p>
+
+<p>
+The classic textbook example is a rate limiter or a distributed lock's safe release: you should only delete a lock key if it still holds the token your process set, otherwise you risk deleting a lock that another process has since legitimately acquired after your own lock expired. Expressing "get, compare, then conditionally delete" as three separate Redis calls is racy; expressing it as one Lua script is not.
+</p>
+
+</div>
+
+<pre>
+-- Only delete the lock if we're still the owner (safe unlock)
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Releasing a distributed lock with a plain <code>DEL</code> after checking the value in a separate command. Between your `GET` and your `DEL`, the lock could have expired and been re-acquired by someone else - your `DEL` would then delete a lock you no longer own. The Lua script above is the standard fix, and recognizing why the two-step version is unsafe is exactly the kind of detail senior interviewers probe for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h9">SECTION 7 - REDIS AS MORE THAN A CACHE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q20">
+Q20. Distributed Locks with Redis (SET NX PX)
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+When multiple service instances might try to do the same exclusive piece of work at once - processing the same scheduled job, charging the same order - you need a lock that all instances agree on, and a single in-process lock (a <code>synchronized</code> block) only coordinates threads within one JVM. Redis is a natural place to put a cheap distributed lock because a single command can atomically create a key only if it doesn't already exist.
+</p>
+
+<p>
+The idiom is <code>SET lock:key unique-token NX PX 5000</code>: <code>NX</code> means "only set if the key does not already exist" (so only one caller can ever successfully acquire it), and <code>PX 5000</code> attaches a 5-second expiry so the lock is automatically released even if the holder crashes before explicitly unlocking, preventing a permanently stuck lock. The unique token (a UUID per acquisition attempt) is what makes the safe-release script from Q19 possible: only the holder that set that exact token is allowed to delete the key.
+</p>
+
+<p>
+This single-node lock is good enough for most practical purposes - preventing duplicate cron execution, coordinating a rare exclusive operation - where the cost of an occasional double-execution is low. It is explicitly not a strong enough guarantee for anything where a violated lock causes real financial or correctness damage, which is exactly what Q21 gets into.
+</p>
+
+</div>
+
+<pre>
+String token = UUID.randomUUID().toString();
+Boolean acquired = redis.opsForValue()
+        .setIfAbsent("lock:job:daily-report", token, Duration.ofSeconds(5));
+
+if (Boolean.TRUE.equals(acquired)) {
+    try {
+        runDailyReportJob();
+    } finally {
+        // release only if we still own it (Lua script from Q19)
+        releaseLockIfOwner("lock:job:daily-report", token);
+    }
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Name the failure mode this design accepts: the lock's TTL is a guess about how long the work will take. If the work runs longer than the TTL, the lock expires while the holder is still "working," a second instance acquires it, and now two instances are doing the same exclusive work concurrently. That single sentence is usually the bridge straight into the Redlock discussion.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q21">
+Q21. Redlock and Its Critiques
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Senior Favorite (System Design)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Redlock is Redis's own proposed algorithm for a stronger distributed lock: instead of trusting a single Redis node, the client tries to acquire the same lock key (with the same token and TTL) against N independent Redis instances (typically 5), and only considers the lock acquired if it got a majority (N/2 + 1) to agree within a tight time budget, accounting for the time already spent trying. The idea is that a single node crashing or having its clock skew shouldn't compromise the lock, because a majority of independent nodes would have to be wrong at once.
+</p>
+
+<p>
+Redlock is also one of the more famous disagreements in distributed systems literature. Martin Kleppmann's widely cited critique argues that Redlock is unsafe as a "correctness" lock (the kind you'd use to guarantee, say, that only one process ever writes to a shared file) because it depends on real-time clock and process-pause assumptions that don't hold in practice: a client can acquire the lock, then experience a long GC pause or an unexpectedly slow network write, have its lock silently expire on the server side, and then resume and act as if it still safely holds the lock - all while another client has since legitimately acquired it. The lock's safety, in that critique, ultimately rests on assumptions about wall-clock time and process scheduling that a distributed system can't actually guarantee.
+</p>
+
+<p>
+The practical senior answer is a spectrum, not a binary. A single-node Redis lock (Q20) is fine for "best-effort, avoid wasteful duplicate work" scenarios. Redlock across multiple nodes raises confidence further but is still not a substitute for a real consensus system (ZooKeeper, etcd, or a database-level fencing token) when correctness genuinely cannot be violated - for example, ensuring two processes never simultaneously write to the same file on shared storage. The universal mitigation regardless of lock implementation is a <b>fencing token</b>: a monotonically increasing number handed out with each lock acquisition, which the protected resource itself checks and rejects if it sees an older token arrive after a newer one, closing the gap that clock and pause assumptions leave open.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Being able to state both sides - "Redlock raises the bar over a single-node lock, but Kleppmann's critique is that it still isn't safe for hard correctness guarantees because it leans on clock and pause assumptions, and the real fix for that class of problem is a fencing token, not more Redis nodes" - is one of the strongest signals of distributed-systems depth this chapter can test for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q22">
+Q22. Rate Limiting with Redis
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Rate limiting needs a piece of shared, fast-to-update state - "how many requests has this key made recently" - visible to every instance behind a load balancer, which is exactly what Redis is good at. There are a few standard algorithms, each with a different accuracy/complexity trade-off.
+</p>
+
+<p>
+<b>Fixed window</b> is the simplest: <code>INCR</code> a counter keyed by user and current minute, and reject once it exceeds the limit; the counter naturally expires via a TTL set on first increment. It is cheap but has a boundary bug - a burst right at the end of one window and right at the start of the next can let through nearly double the intended limit within a short span straddling the boundary. <b>Sliding window log</b> stores a timestamp per request in a Redis sorted set (ZSet), trims entries older than the window on each check, and counts what remains - accurate, but memory cost scales with request volume. <b>Sliding window counter</b> approximates the sliding log cheaply by weighting the previous fixed window's count based on how far into the current window you are, giving most of the accuracy of a sliding log at fixed-counter cost. <b>Token bucket</b> models a bucket that refills at a steady rate and is debited per request, naturally allowing controlled bursts up to the bucket's capacity while enforcing a steady average rate - Redis implements this efficiently with <code>INCR</code>/<code>EXPIRE</code> or a small Lua script for atomicity.
+</p>
+
+</div>
+
+<pre>
+-- Atomic fixed-window rate limit in one round trip (Lua)
+local current = redis.call("INCR", KEYS[1])
+if current == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1]) -- window size in seconds
+end
+if current > tonumber(ARGV[2]) then       -- limit
+    return 0 -- rejected
+end
+return 1     -- allowed
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Implementing "check the counter, then increment it" as two separate Redis calls from application code. That is racy under concurrent requests for the same key - both can read the count before either increments, letting more requests through than the limit allows. Doing the check-and-increment atomically, either via `INCR` alone (as above) or a Lua script for anything more elaborate than a single counter, is the correct approach.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q23">
+Q23. Redis Pub/Sub
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Redis Pub/Sub lets a publisher send a message to a named channel, and every client currently subscribed to that channel receives it in real time. It's the simplest possible fan-out mechanism: no setup beyond subscribing, extremely low latency, and no persistence overhead because Redis never stores the message anywhere.
+</p>
+
+<p>
+That last point is also its defining limitation: Pub/Sub is <b>fire-and-forget</b>. If a subscriber is disconnected, restarting, or simply hasn't subscribed yet when a message is published, that message is gone forever - there is no backlog, no replay, no delivery guarantee whatsoever. This makes Pub/Sub a good fit for the exact use case that shows up earlier in this chapter (Q11): broadcasting a "this key changed, evict your local L1 copy" invalidation notice to every instance, where missing an occasional message just means a slightly longer staleness window rather than data loss, since the source of truth (the database, or L2) is unaffected either way.
+</p>
+
+<p>
+It is the wrong tool the moment you need "every message must be processed, even if a consumer was briefly down" - for that, you want a durable log with consumer offsets, which is exactly what Redis Streams (Q24) or a real message broker provides.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The one-line test to apply: "if losing a message during a brief subscriber outage is acceptable, Pub/Sub is fine; if it isn't, you need Streams, Kafka, or a queue with acknowledgment and persistence." Cache invalidation broadcasts tolerate the former; order processing does not.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q24">
+Q24. Redis Streams as a Message Broker vs Kafka/RabbitMQ
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High (System Design)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Redis Streams is an append-only log data structure (<code>XADD</code>/<code>XREAD</code>/<code>XRANGE</code>) built on top of Redis, and unlike Pub/Sub it persists entries and supports <b>consumer groups</b>: multiple consumers can cooperatively read a stream, each message delivered to exactly one consumer in the group, with acknowledgment (<code>XACK</code>) and the ability to inspect and reclaim messages that were delivered but never acknowledged (a consumer crashed mid-processing). That combination - persistence, consumer groups, at-least-once delivery - makes it a genuine lightweight message broker, not just a cache feature.
+</p>
+
+<p>
+Where Streams stops being a good idea is exactly where Kafka or RabbitMQ's core strengths live. Kafka is built for very high sustained throughput with log compaction and long, cheap retention measured in days or weeks, replicated durably across brokers, and a rich ecosystem of stream-processing tooling (Kafka Streams, Connect) - Redis Streams retention is bounded by how much you're willing to keep in memory (or Redis's persistence to disk, which is comparatively much slower and less battle-tested for this exact workload than Kafka's log design). RabbitMQ offers much richer routing semantics (exchanges, topic/fanout/direct routing, per-message priority, dead-letter queues) that Streams simply doesn't have. Streams' honest niche is: you're already running Redis, you need durable pub/sub with consumer groups and moderate volume, and standing up a whole separate Kafka or RabbitMQ cluster would be over-engineering for the actual throughput and retention you need.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Aspect</th>
+<th>Redis Streams</th>
+<th>Kafka</th>
+<th>RabbitMQ</th>
+</tr>
+
+<tr>
+<td>Primary strength</td>
+<td>Lightweight, already-have-Redis simplicity</td>
+<td>Massive sustained throughput, long retention</td>
+<td>Rich routing, per-message flexibility</td>
+</tr>
+
+<tr>
+<td>Retention</td>
+<td>Bounded by memory/persistence config</td>
+<td>Days to weeks, cheap and durable</td>
+<td>Until consumed (queue-based)</td>
+</tr>
+
+<tr>
+<td>Delivery semantics</td>
+<td>At-least-once via consumer groups</td>
+<td>At-least-once (exactly-once with care)</td>
+<td>At-least-once, flexible ack modes</td>
+</tr>
+
+<tr>
+<td>Bad fit when</td>
+<td>Need very high volume + long retention</td>
+<td>Need complex per-message routing</td>
+<td>Need huge sustained throughput</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior framing: "Streams is a real message broker feature of Redis, not a toy - but reaching for it because 'we already have Redis' instead of because it actually fits the throughput and retention needs is a common overcorrection. If the workload looks like Kafka's sweet spot, use Kafka." Knowing when <i>not</i> to use the tool you already have running is the harder half of this question.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h10">SECTION 8 - HTTP &amp; CDN CACHING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q25">
+Q25. CDN Caching and How It Composes with Application-Level Caching
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Everything discussed so far in this chapter - Caffeine, Redis - is caching inside your application's infrastructure. A CDN (Content Delivery Network) is a caching layer that sits in front of all of that, at edge locations geographically close to the end user, and it caches the actual HTTP response, not a database row or a domain object.
+</p>
+
+<p>
+A full request path for a cacheable response typically looks like: browser (may have its own local HTTP cache) -&gt; CDN edge node (may serve the response directly, never reaching your infrastructure at all) -&gt; load balancer -&gt; application -&gt; application-level cache (Redis/Caffeine) -&gt; database. Each layer exists to absorb load from the layer behind it, and each one is checked in order: a CDN hit means the request never even reaches your servers, which is the cheapest possible outcome both in latency and in infrastructure cost; only a CDN miss reaches the application, where the app-level cache then tries to avoid hitting the database.
+</p>
+
+<p>
+The distinction that matters for interviews is <i>what</i> each layer is good at. CDNs are excellent for content that is the same for every user - static assets, and increasingly, public API responses or fully rendered pages that don't vary per user. They are a poor fit for personalized or per-user data (an account dashboard), which is exactly what application-level caching with a proper cache key (Q31) is for. A mature system uses both, deliberately, at different layers of the same request.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+State the layering explicitly rather than treating "caching" as one thing: "the CDN protects my origin from ever being hit for content that doesn't vary by user; Redis and Caffeine protect my database from being hit for content that does vary by user but is still expensive to compute." That distinction is what separates someone who has designed a real request path from someone who has only used <code>@Cacheable</code>.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q26">
+Q26. HTTP Caching Headers: Cache-Control
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>Cache-Control</code> is the HTTP response header that tells every cache along the path - the browser, a CDN, an intermediate proxy - how and for how long it is allowed to reuse a response without going back to the origin. It is a set of directives, and the ones that come up constantly in interviews are worth knowing precisely rather than approximately.
+</p>
+
+<p>
+<code>max-age=N</code> says the response is fresh for N seconds from when it was generated - conceptually the HTTP equivalent of a cache's TTL. <code>no-cache</code> is confusingly named: it does not mean "don't cache," it means "cache this, but revalidate with the origin (typically via ETag, Q27) before reusing it every single time," so it is about mandatory revalidation, not prohibition. <code>no-store</code> is the one that actually means "never cache this anywhere," appropriate for genuinely sensitive responses. <code>private</code> means only the end-user's own browser may cache the response - a shared cache (a CDN sitting between many users) must not store it, which matters enormously for personalized responses. <code>public</code> is the opposite: any cache, shared or private, may store it. <code>s-maxage</code> is like <code>max-age</code> but applies specifically to shared caches (CDNs, proxies), letting you set a different freshness lifetime for the CDN than for the end user's own browser.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Directive</th>
+<th>Meaning</th>
+</tr>
+
+<tr>
+<td>max-age=N</td>
+<td>Fresh for N seconds from generation</td>
+</tr>
+
+<tr>
+<td>no-cache</td>
+<td>May cache, but must revalidate before every reuse</td>
+</tr>
+
+<tr>
+<td>no-store</td>
+<td>Never cache anywhere, by any cache</td>
+</tr>
+
+<tr>
+<td>private / public</td>
+<td>Only end-user's browser / any shared cache may store it</td>
+</tr>
+
+<tr>
+<td>s-maxage=N</td>
+<td>max-age override specifically for shared (CDN/proxy) caches</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reading "no-cache" as "do not cache" in an interview answer. That single mix-up (it actually means "revalidate every time," while `no-store` is the true "never cache" directive) is a frequently used trap question precisely because so many engineers get it backwards from having only skimmed the header, never needed to rely on the distinction in production.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q27">
+Q27. ETag &amp; Conditional Requests
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+An <code>ETag</code> is an opaque identifier (often a hash of the response body, or a version number) that the origin attaches to a response. It lets a cache that already holds a stale-by-TTL copy ask the origin "has anything actually changed since I last saw ETag X?" instead of blindly re-downloading the full response.
+</p>
+
+<p>
+The flow is a <b>conditional request</b>: the client (or an intermediate cache) sends <code>If-None-Match: &lt;etag&gt;</code> along with its next request. If the resource hasn't changed, the origin responds with a bare <code>304 Not Modified</code> and no body at all, and the cache is told it may keep serving its existing copy for another freshness period. If the resource has changed, the origin returns a normal <code>200</code> with the full new body and a new ETag. The win is bandwidth and origin CPU: revalidating is far cheaper than a full re-fetch, especially for large responses that change rarely.
+</p>
+
+<p>
+This pairs naturally with <code>Cache-Control: no-cache</code> (Q26): "always check with me before reusing this, but checking is cheap because you can just send me the ETag and I'll usually just say 304." It's also the standard mechanism read-through caches (Q29) use internally to keep a long-lived cached copy honest without re-fetching the whole payload on every check.
+</p>
+
+</div>
+
+<pre>
+Client -&gt; Server: GET /catalog/42
+                   If-None-Match: "a1b2c3"
+
+Server -&gt; Client: 304 Not Modified   (unchanged: reuse cached body)
+              -- or --
+Server -&gt; Client: 200 OK
+                  ETag: "d4e5f6"
+                  &lt;new body&gt;
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The precise framing: "ETag plus a conditional request lets a cache confirm freshness without paying the cost of re-downloading the payload - it turns a cache miss into a cheap 304 instead of a full re-fetch." That's a meaningfully different (and stronger) answer than just saying "ETag is for cache validation."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q28">
+Q28. The Vary Header and Cache Key Fragmentation
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A shared cache (a CDN, a reverse proxy) normally keys its cached responses purely by URL. That breaks the moment the same URL can legitimately produce different responses for different requests - the classic examples are content negotiation by <code>Accept-Language</code> (a localized homepage) or by <code>Accept-Encoding</code> (a gzip-compressed body vs. an uncompressed one), or an API that returns a different shape based on a custom header.
+</p>
+
+<p>
+<code>Vary</code> tells the cache which request headers were part of the decision that produced this particular response, so the cache must fold those header values into its cache key rather than caching just by URL. <code>Vary: Accept-Language</code> means the cache must store a separate copy per distinct <code>Accept-Language</code> value it sees, and only serve a cached response back to a request whose relevant header matches the one that produced it.
+</p>
+
+<p>
+The trade-off to be aware of is cache key fragmentation: the more headers you list in <code>Vary</code>, and the more distinct values those headers actually take across real traffic, the more separate cached copies you need, which directly lowers your effective hit ratio. <code>Vary: User-Agent</code> is a commonly cited anti-pattern for exactly this reason - real-world User-Agent strings are so varied that it can fragment the cache into effectively one entry per visitor, destroying the benefit of caching almost entirely.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Adding a header to `Vary` without checking how many distinct values that header actually takes across real traffic. `Vary: Accept-Language` with a handful of supported locales is healthy; `Vary` on a header with effectively unbounded cardinality quietly turns a shared cache into a private one-copy-per-request cache, and the resulting drop in hit ratio is easy to miss unless you're watching the metric.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q29">
+Q29. Read-Through vs Cache-Aside, Precisely Contrasted
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Cache-aside (Q2) and read-through solve the same problem - populate the cache lazily on a miss - but they differ in <i>who owns the miss-handling logic</i>, and interviewers use this distinction to check whether a candidate actually understands the pattern or is just pattern-matching the word "lazy loading."
+</p>
+
+<p>
+In <b>cache-aside</b>, the application code is directly responsible: it checks the cache, and on a miss it explicitly calls the database itself and explicitly writes the result back into the cache. The caching library or infrastructure has no awareness of where the data comes from - it is purely a key-value store the application chooses to consult first.
+</p>
+
+<p>
+In <b>read-through</b>, the cache itself is configured with a loader (a data-access function) and sits transparently in front of the data source. The application only ever asks the cache for a value; on a miss, the cache <i>itself</i> invokes the configured loader, populates itself, and returns the result - the application code never sees or writes the miss-handling branch at all. Caffeine's <code>Cache.get(key, loadingFunction)</code> and Spring's <code>@Cacheable</code> (Q10) are both read-through in spirit: the caller writes one line and the cache-populate-on-miss logic is hidden inside the abstraction, whereas raw cache-aside is the "if (cache.get() == null) { db call; cache.put() }" pattern spelled out by hand.
+</p>
+
+<p>
+The practical implication: read-through centralizes miss-handling (one loader function, reused everywhere, and naturally gets request-coalescing for free, as in Q9), while hand-rolled cache-aside means every call site has to remember to implement the miss path and the invalidation correctly, which is exactly the discipline problem Q2 warns about.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Aspect</th>
+<th>Cache-Aside</th>
+<th>Read-Through</th>
+</tr>
+
+<tr>
+<td>Who fetches on a miss</td>
+<td>Application code, explicitly</td>
+<td>The cache itself, via a configured loader</td>
+</tr>
+
+<tr>
+<td>Where miss-handling logic lives</td>
+<td>Repeated at every call site</td>
+<td>Centralized once, in the loader</td>
+</tr>
+
+<tr>
+<td>Example</td>
+<td>Hand-written if(null)-then-fetch-then-put</td>
+<td>Caffeine's get(key, loader); @Cacheable</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Many candidates use "cache-aside" and "read-through" interchangeably. The differentiator is naming who owns the fetch: "cache-aside is application-owned miss handling; read-through delegates that to the caching layer via a loader." Being able to also say that @Cacheable is a read-through implementation, despite Spring's own docs describing it loosely as cache-aside, shows you've thought about the mechanism, not just the label.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q30">
+Q30. Stale-While-Revalidate as an HTTP Directive
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Q9 introduced stale-while-revalidate as a general anti-stampede technique. HTTP formalizes it as an actual <code>Cache-Control</code> extension directive: <code>Cache-Control: max-age=60, stale-while-revalidate=30</code>.
+</p>
+
+<p>
+This tells a supporting cache "treat this response as fresh for 60 seconds; for an additional 30 seconds after that, you may still serve the stale copy immediately while asynchronously re-fetching a fresh one in the background for next time." The user who happens to hit the cache during that 30-second revalidation window gets an instant response (from the stale copy) rather than waiting on a fresh fetch, and the cache is left warm again for the next request.
+</p>
+
+<p>
+It solves exactly the coordinated-miss problem from Q9, but at the HTTP/CDN layer instead of the application-cache layer: without it, the instant a response's <code>max-age</code> expires, every concurrent request for that URL would otherwise trigger its own fetch to the origin at once. With it, the first request after expiry gets the stale copy immediately and quietly triggers exactly one background revalidation, and every other concurrent request during that window also just gets the (still being refreshed) stale copy, so the origin sees at most one fetch instead of a stampede.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Tie it back explicitly: "stale-while-revalidate is the same idea as the anti-stampede technique from earlier in this chapter, just expressed as a standard HTTP directive that CDNs and browsers understand natively, rather than something you have to hand-build with a Redis lock." Drawing that connection across layers is a strong signal of synthesized understanding rather than memorized facts.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h11">SECTION 9 - CACHE KEY DESIGN, NEGATIVE CACHING &amp; WARMING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q31">
+Q31. Cache Key Design: Namespacing &amp; Avoiding Collisions
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A cache key is a contract, not just a string, and getting it wrong causes bugs that are unusually hard to trace because the symptom is "wrong data appears," not a crash. The two failure modes to design against are collisions between unrelated data and ambiguity about what a given cached value actually represents.
+</p>
+
+<p>
+The standard convention is a colon-delimited namespace hierarchy: <code>{service}:{entity}:{id}:{variant}</code>, for example <code>catalog:product:42:en-US</code> or <code>orders:summary:user:789</code>. The service prefix matters most when multiple applications share one Redis instance (common in smaller organizations to save infrastructure cost) - without it, a "user:123" key from the Orders service and a "user:123" key from the Notifications service silently overwrite each other, because Redis has one flat keyspace with no built-in tenant isolation. The entity and id make the key's purpose self-documenting to anyone debugging it later, and the variant suffix (locale, currency, API version) prevents accidentally serving one variant's cached data for a request that actually wanted a different one.
+</p>
+
+<p>
+A related discipline is never building a key by directly concatenating unsanitized user input - a product id containing a colon or an unexpected delimiter can accidentally reshape the key's structure. Using a fixed, well-documented key format (ideally generated by a single shared helper function rather than string concatenation scattered across the codebase) closes off both of these classes of bug at once.
+</p>
+
+</div>
+
+<pre>
+// Good: namespaced, self-documenting, variant-aware
+String key = String.format("catalog:product:%s:%s", productId, locale);
+
+// Risky: shared keyspace, no service prefix, no variant --
+// collides with any other service's "user:123" key, and silently
+// serves the wrong locale's cached copy if reused across variants
+String key = "user:" + userId;
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating cache keys as an afterthought and letting each team or each call site invent its own ad hoc format against a shared Redis instance. The fix is boring but effective: one small shared key-building utility per service, a documented naming convention across the organization, and a hard rule that no service ever guesses at another service's key format directly.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q32">
+Q32. Versioning Keys on Schema Change
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+When the shape of a cached object changes - a new field is added, a field's type changes, an enum gains a value your old deserializer doesn't know about - old cached entries serialized under the previous shape are still sitting in Redis after you deploy the new code. Deserializing them with the new code can throw, silently drop the new field's default, or worse, misinterpret bytes in a way that doesn't throw at all.
+</p>
+
+<p>
+The standard fix mirrors the versioned-key idea from Q4's discussion of static assets: embed a schema version in the key itself, for example <code>product:v2:42</code> instead of <code>product:42</code>. When you ship a breaking change to the cached shape, you bump the version segment to <code>v3</code>, and every subsequent read simply misses (because no <code>v3</code> keys exist yet), naturally repopulating with the new shape. The old <code>v2:*</code> entries are never touched again and just age out via their existing TTL - there is no need to write a migration script or explicitly flush anything, and, crucially, there's no risk of a deploy racing a manual cache flush and momentarily deserializing old-shape data with new-shape code.
+</p>
+
+<p>
+The trade-off is a guaranteed full cold cache immediately after a version bump, identical in shape to any cache-flush cold start (Q35) - which is a completely acceptable, predictable cost for the safety of never risking a deserialization mismatch in production.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior instinct here is preferring a predictable, bounded cost (a cold cache for a while after deploy) over an unpredictable one (a deserialization exception, or silent data corruption, in production traffic). Say that trade-off explicitly rather than just describing the version-in-key mechanic.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q33">
+Q33. Negative Caching
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Most of this chapter assumes the interesting case is caching a value that exists. Negative caching is the deliberate choice to also cache the <i>absence</i> of a value - the fact that a lookup returned "not found" - for a short period, rather than treating every not-found lookup as uncacheable and hitting the database every single time.
+</p>
+
+<p>
+Without it, a key that genuinely doesn't exist (a typo'd product id, a user probing for valid IDs, a client with a stale reference to a deleted record) causes a full database round trip on every single request, because a naive cache-aside implementation only populates the cache on a hit and does nothing on a "not found." If that non-existent key is requested repeatedly - which happens more than it sounds like it should, especially under scraping, retry loops on a client bug, or enumeration-style abuse - it becomes a permanent, un-cacheable hole that always reaches the database, defeating the entire purpose of the cache for that access pattern.
+</p>
+
+<p>
+The fix is to cache a sentinel value (a specific marker object, or simply an empty result) for "not found" lookups too, typically with a noticeably shorter TTL than a real hit would get, since you want a newly created record to become visible reasonably quickly rather than being masked by a stale "not found" cached from moments before it was created. The trade-off to name explicitly: negative caching means a record created immediately after a failed lookup can appear to not exist for up to that short TTL, which is almost always an acceptable cost against the alternative of an unbounded amplification of database load from repeated not-found lookups.
+</p>
+
+</div>
+
+<pre>
+Product cached = cache.get(id);
+if (cached != null) {
+    return cached == NOT_FOUND_SENTINEL ? null : cached;
+}
+Optional&lt;Product&gt; fromDb = productRepository.findById(id);
+if (fromDb.isPresent()) {
+    cache.put(id, fromDb.get(), Duration.ofMinutes(10));
+    return fromDb.get();
+} else {
+    cache.put(id, NOT_FOUND_SENTINEL, Duration.ofSeconds(30)); // shorter TTL
+    return null;
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The scenario that makes this concrete: an attacker or a buggy client enumerating IDs that mostly don't exist can otherwise turn your cache into a complete no-op and hammer the database with a request pattern the cache was specifically supposed to absorb. Negative caching closes that gap, and naming it unprompted is a strong signal you've thought about caching from an abuse/resilience angle, not just a happy-path performance angle.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q34">
+Q34. Cache Warming / Pre-Population Strategies
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Every cache described so far in this chapter populates lazily: the first request for a key is always a miss. That's fine most of the time, but it's a real problem right after a fresh deploy, a cache flush, or a new instance joining the fleet with a cold local L1 - if the very first wave of real traffic all arrives as misses simultaneously, you get exactly the coordinated-load problem from Q9, just triggered by an operational event instead of a TTL expiry.
+</p>
+
+<p>
+Cache warming means deliberately populating the cache with known-hot keys <i>before</i> real traffic starts arriving, rather than waiting for organic misses to do it. Common approaches: a warmup job that runs at deploy time and pre-loads the top N most-requested keys (from yesterday's access logs or a maintained "hot keys" list) directly into the new cache; replaying a sample of recent real traffic against the new instance in the background before it receives live traffic (common in blue-green deploys); or, for a distributed L2 cache that already has warm data, simply making sure a newly started instance's L1 doesn't need warming at all because it always falls through to the still-warm L2.
+</p>
+
+<p>
+The judgment call is knowing what's actually worth warming: warming every possible key is often not worth the engineering effort, but warming the small set of keys that represent a disproportionate share of traffic (the classic long-tail distribution, where 1% of products account for a huge fraction of catalog page views) gives most of the benefit for a fraction of the cost.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The framing that shows production experience: "warming isn't about eliminating every cold cache miss, it's about making sure the deploy-time or restart-time cold cache doesn't coincide with a traffic spike large enough to turn ordinary misses into a database-threatening stampede." Tie it explicitly back to Q9 rather than presenting it as an unrelated technique.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q35">
+Q35. Cold-Start Cache-Miss Storms After a Deploy or Cache Flush
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is the specific incident scenario that cache warming (Q34) exists to prevent, and it's worth understanding on its own because it's a common "tell me about a production incident" interview prompt: a deploy that rolls out a new version of the caching layer, an accidental full flush of Redis (<code>FLUSHALL</code> run against the wrong environment is a real, recurring war story), or a large batch of instances restarting together (an auto-scaling event, a Kubernetes rolling update with an aggressive rollout speed) can all instantly empty a cache that a live production system was depending on to absorb the bulk of its read traffic.
+</p>
+
+<p>
+The moment that happens, every request that would have been a cache hit becomes a cache miss simultaneously, and all of that traffic - which the database was never sized to handle directly, because the cache's entire job was to keep it from ever seeing that volume - arrives at the database at once. This is functionally identical to the cache stampede in Q9, except the trigger is an operational event affecting the whole cache rather than one hot key's TTL expiring, which makes it both rarer and, when it does happen, far more severe because it affects every key at once instead of one.
+</p>
+
+<p>
+Mitigations layer on top of everything already covered: cache warming before cutting traffic over to a fresh instance; a circuit breaker or request-shedding layer in front of the database so a sudden traffic multiplication degrades gracefully (serving errors or a fallback to some requests) rather than taking the database down entirely, which would then also break the write-through path that could otherwise repopulate the cache; and, operationally, restricting who can run destructive commands like `FLUSHALL` against production, and rolling deploys/restarts gradually rather than all at once so the surviving cache instances (or a warm L2 behind a cold L1 fleet) can still absorb load while the rest catch up.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The strongest answer here connects three things this chapter already covers: "a cold-start storm is a full-cache version of the stampede in Q9, cache warming (Q34) is the preventive fix, and a circuit breaker plus graceful degradation (Q46) is the reactive fix if it happens anyway." Interviewers who ask "tell me about a caching incident" are specifically listening for whether you reach for exactly this kind of layered answer instead of a single silver bullet.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q36">
+Q36. Choosing TTLs Per Data Type
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A single TTL applied uniformly across an entire system is a sign the caching strategy wasn't actually designed, just defaulted. The right TTL for a piece of data is a function of how often it changes, how expensive it is to recompute, and how costly it is to the business if it's stale for that long - and those three factors are wildly different across data types in the same system.
+</p>
+
+<p>
+Rarely-changing, expensive-to-compute reference data (a category tree, a pricing rule set) can tolerate a long TTL - hours - because staleness risk is low and the recompute cost saved is high. A product's stock count or price needs a short TTL, seconds to low minutes, because staleness there has direct business impact (overselling, showing a wrong price). Anything security- or session-relevant (a permission check, an auth token's validity) generally shouldn't rely on TTL alone at all and needs explicit invalidation the instant the underlying grant changes, since a stale "yes you're authorized" is a security bug, not a minor inconvenience. Highly volatile, cheap-to-recompute data (a live view counter) might not be worth caching for more than a few seconds, or might be better served by a different mechanism entirely (an in-memory counter flushed periodically) rather than a traditional cache.
+</p>
+
+<p>
+The practical output of this thinking is a small, explicit policy table maintained alongside the codebase - not a single constant named <code>DEFAULT_TTL</code> reused everywhere - so that a new engineer adding a new cached value is prompted to actually think about which bucket it falls into rather than copy-pasting whatever TTL happened to be nearby.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Data type</th>
+<th>Change frequency</th>
+<th>Staleness cost</th>
+<th>Suggested TTL</th>
+</tr>
+
+<tr>
+<td>Category tree / reference data</td>
+<td>Very low</td>
+<td>Low</td>
+<td>Hours</td>
+</tr>
+
+<tr>
+<td>Product price / stock</td>
+<td>Moderate</td>
+<td>High (business impact)</td>
+<td>Seconds to a few minutes</td>
+</tr>
+
+<tr>
+<td>Auth/permission state</td>
+<td>Low but security-critical</td>
+<td>Very high</td>
+<td>Explicit invalidation, not TTL alone</td>
+</tr>
+
+<tr>
+<td>Live counters/metrics</td>
+<td>Very high</td>
+<td>Low (approximate is fine)</td>
+<td>Seconds, or a different mechanism entirely</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Copy-pasting a `Duration.ofMinutes(10)` from an existing `@Cacheable` annotation onto a brand-new cached value without asking whether ten minutes of staleness is acceptable for that specific data. The senior habit is treating TTL choice as a small design decision every time, not a default to inherit silently.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h12">SECTION 10 - SESSION CACHING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q37">
+Q37. Session Storage as a Caching Use Case
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A user's HTTP session (their logged-in identity, cart contents mid-checkout, in-progress multi-step form state) needs to be readable on essentially every request that user makes, which is exactly the access pattern caching is built for - except here the cached value often <i>is</i> the source of truth for that session's data, rather than a copy of something durably stored elsewhere. That distinction changes some of the trade-offs from earlier in this chapter: losing a cached product price just means a slightly slower next request; losing session data mid-checkout means the user's cart or login state is simply gone.
+</p>
+
+<p>
+This is why session storage is usually treated with a heavier durability posture than a typical cache entry - either backed by a distributed cache configured with real persistence (Redis with AOF, Q8), or explicitly designed so the application can tolerate a session being lost occasionally (re-authentication, an empty cart) as an acceptable, bounded cost rather than a silent correctness bug. The choice of TTL also differs: a session's expiry is usually a genuine business rule (log the user out after 30 minutes of inactivity) rather than a staleness-tolerance decision, so the TTL is set by product requirements, not by cache-sizing considerations.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Say the distinction plainly: "most of this chapter treats the cache as a copy of a source of truth that lives elsewhere; a session store often <i>is</i> the source of truth, which is why its durability and persistence configuration deserve more scrutiny than an ordinary read-through cache." That reframing is what separates a thoughtful answer from a rote "store sessions in Redis."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q38">
+Q38. Sticky Sessions vs Externalized Session Store
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+There are two fundamentally different ways to make sure a user's session data is available wherever their next request lands, and this decision has real implications for scaling, deployment, and failure behavior.
+</p>
+
+<p>
+<b>Sticky sessions</b> keep the session in the memory of whichever application instance first handled that user, and configure the load balancer to route all of that user's subsequent requests back to the same instance (usually via a cookie or consistent hashing on client IP). This avoids any network hop to fetch session data - reads are as fast as an in-process cache because that's exactly what it is - but it directly reintroduces the in-process-cache weaknesses from Q5: that instance being restarted or redeployed wipes the session, and load balancing is no longer free to spread traffic evenly, since a user is pinned to one instance regardless of its current load.
+</p>
+
+<p>
+An <b>externalized session store</b> (Redis-backed Spring Session, for example) keeps session data in a shared distributed store that every instance can read, so any instance can serve any user's request, the load balancer is free to balance purely on load, and a rolling deploy or instance crash doesn't lose anyone's session. The cost is the same one distributed caching always carries: a network hop per session read, and now the session store itself is a dependency whose availability directly gates every authenticated request in the system, making its own resilience (Q17's Sentinel, or a managed Redis with failover) a first-class concern rather than an afterthought.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Aspect</th>
+<th>Sticky Sessions</th>
+<th>Externalized Store (e.g. Redis)</th>
+</tr>
+
+<tr>
+<td>Read latency</td>
+<td>In-process, fastest</td>
+<td>Network hop</td>
+</tr>
+
+<tr>
+<td>Survives instance restart/deploy</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+
+<tr>
+<td>Load balancing freedom</td>
+<td>Constrained (pinned per user)</td>
+<td>Full freedom</td>
+</tr>
+
+<tr>
+<td>New single point of failure</td>
+<td>None additional</td>
+<td>The session store itself</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The modern default answer for most cloud-native systems is externalized session storage, precisely because it plays well with auto-scaling, rolling deploys, and container orchestration, none of which get along with sticky sessions. Say that as the default, but acknowledge sticky sessions still show up in legacy or simpler on-prem deployments where the operational simplicity of not running a shared session store is a deliberate trade.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q39">
+Q39. Spring Session with Redis
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Spring Session is the piece that makes externalizing sessions to Redis nearly transparent to application code. Once <code>spring-session-data-redis</code> is on the classpath and configured, Spring replaces the container's default in-memory <code>HttpSession</code> implementation with one backed by Redis - existing code that calls <code>request.getSession()</code> and reads or writes session attributes keeps working unchanged, but the actual session data is now serialized into Redis under the hood instead of sitting in the servlet container's local memory.
+</p>
+
+<p>
+This is what actually makes the externalized-session-store trade-off from Q38 practical to adopt without a rewrite: you get the "any instance can serve any user" property, and Spring Session further keeps sessions in sync across instances by using Redis Pub/Sub or keyspace notifications to propagate session expiration and destruction events (so, for example, an explicit logout on one instance correctly invalidates the session for requests that later land on a different instance).
+</p>
+
+<p>
+The practical footguns are the same durability and sizing questions this chapter has already raised: session data should be reasonably small (large objects stuffed into the session serialize on every write, adding real latency and Redis memory pressure), and the Redis instance backing sessions needs the availability posture from Q38's discussion - if it's a single node with no replication, an outage there logs out or breaks every active session across the entire application simultaneously.
+</p>
+
+</div>
+
+<pre>
+@Configuration
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800) // 30 min
+public class SessionConfig {
+    // Spring Session transparently backs HttpSession with Redis;
+    // existing request.getSession() code is unchanged.
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Storing large or frequently-mutated objects directly in the session (a full shopping cart with many line items, updated on every click) once it's Redis-backed, without considering that every session write now serializes and sends that whole object over the network. Keeping the session itself small - an id and a few flags - and storing the bulk of the data in a normal cache or database keyed by that id, scales far better.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q40">
+Q40. What Should Never Go in a Shared Session Store
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Once sessions live in a shared external store rather than isolated in one instance's process memory, it's worth being deliberate about what actually belongs there, because the failure modes of "this data leaked" or "this data was stale" are more severe for a shared store than for isolated in-memory state.
+</p>
+
+<p>
+Highly sensitive raw secrets (a plaintext password, a full credit card number, a raw unencrypted API key) should never be placed in session data at all, session store or not - a session, wherever it lives, is not an appropriate place for anything that would be catastrophic if that Redis instance (or a misconfigured backup of it, or an operator with read access) were ever exposed. Large, rapidly-changing business objects (Q39's shopping-cart example) also don't belong there directly; store an identifier in the session and the actual data in a purpose-built cache or database table, both to control serialization cost and because that data likely needs its own consistency and durability story independent of session lifecycle. Anything that must survive strictly longer than the session's own lifetime (order history, a user's saved preferences) belongs in the database, not the session, since a session is explicitly designed to expire.
+</p>
+
+<p>
+The general principle: a session should hold just enough to identify who the user is and a small amount of short-lived UI/flow state, with everything else looked up by that identity from its own properly-modeled store.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The one-line test worth stating: "if this data would still need to exist after the session expires, or would be dangerous if this particular store were ever compromised, it doesn't belong in the session." That single heuristic covers most of the concrete examples an interviewer might probe for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h13">PART 1 COMPLETE</h1>
+
+<p>
+Next Part:
+* Deeper cache consistency patterns (write ordering, double-delete, read-repair)
+* Production incident case study: cache outages and hot keys
+* Advanced cache sizing and capacity planning
+* Caching system design scenarios
+
+These are some of the most heavily tested senior caching topics, blending distributed-systems reasoning with hands-on incident and design experience.
+</p>
+
+<hr>
+
+<h1 id="h14">SECTION 11 - DEEPER CACHE CONSISTENCY PATTERNS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q41">
+Q41. Cache-Then-DB Write Ordering Pitfalls
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High (Senior Favorite)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Q12 established that write-invalidate is generally safer than write-update, but even "delete the cache, then write the database" - which looks like the safe order at first glance - has a race that surprises people the first time they see it demonstrated concretely.
+</p>
+
+<p>
+Consider two concurrent operations on the same key: a writer performing an update, and a reader performing a cache-aside read that happens to race with it. If the writer deletes the cache entry <i>first</i> and then writes the database, a reader that started just before the delete but reads the (still-old) database value just after the delete can repopulate the cache with the stale value - and it does so <i>after</i> the writer's delete already ran, so nothing evicts it again until the TTL. The system is left with a stale cache entry sitting indefinitely (or until TTL) right after what looked like a correctly-ordered write.
+</p>
+
+<p>
+The safer discipline most production systems converge on is: write the database <i>first</i>, then delete the cache. This narrows the race window considerably (a reader would now have to read the pre-write database value and write it into the cache <i>after</i> the post-write delete has already run, which requires a much more precisely timed interleaving than the delete-then-write ordering above), but it does not eliminate the race entirely under replica lag, which is exactly what motivates the double-delete pattern in Q42.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The concrete failure sequence - "reader starts, writer deletes cache, reader still reads stale DB row, reader repopulates cache with stale value, nothing ever evicts it again" - is worth being able to narrate step by step. Interviewers use this exact scenario to separate candidates who've internalized "write-invalidate is safe" as a slogan from those who understand the actual interleaving it's vulnerable to.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q42">
+Q42. The Delayed Double-Delete Pattern in Depth
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Q12 introduced double-delete briefly; here is the mechanism in full, because interviewers who ask this expect the reasoning, not just the name. The pattern targets specifically the race where a straggling read - one that started before a write and reads from a lagging database replica - repopulates the cache with a stale value <i>after</i> the write's own invalidation has already run.
+</p>
+
+<p>
+The sequence is: delete the cache key, perform the database write, then, after a short delay (long enough to reasonably exceed the replica's typical lag, and long enough for any read that was already in flight when the write started to have completed and potentially repopulated the cache with stale data), delete the cache key a <i>second</i> time. That second delete exists purely to clean up any stale value a straggling read managed to insert during the window between the first delete and the write actually being visible everywhere reads might come from.
+</p>
+
+<p>
+The delay is typically implemented as a short asynchronous task (a delayed message, a scheduled job, or simply a background thread sleeping briefly) rather than blocking the write path on it, since the point is to protect future reads, not to slow down the write that's already completed correctly. The remaining honest caveat: this narrows the race window to something very unlikely rather than making it theoretically impossible - if the delay is shorter than some outlier read's actual duration, the race can still occur, just far more rarely. That's consistent with the overall philosophy of this chapter: caching consistency is about bounding the probability and duration of staleness, not eliminating it.
+</p>
+
+</div>
+
+<pre>
+cache.evict(key);                 // delete #1: clear the stale entry now
+database.write(key, newValue);    // perform the write
+
+scheduler.schedule(() -&gt; {
+    cache.evict(key);              // delete #2: catch any straggling
+}, Duration.ofMillis(500));        // read that repopulated it meanwhile
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating double-delete as a guarantee rather than a probabilistic mitigation. The honest framing - "it makes the race window for a straggling stale read very small, not zero" - is the answer that reads as senior; claiming it fully solves cache consistency is the answer that reads as someone repeating a blog post without having reasoned through the timing themselves.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q43">
+Q43. Why Write-Through With a Distributed Cache Still Isn't Race-Free
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+It's tempting to think write-through (Q3) sidesteps all of the consistency problems this chapter has been discussing, since the cache and the database are updated together as part of one logical write operation. In a distributed cache shared across multiple instances, that isn't quite true.
+</p>
+
+<p>
+Two concurrent writers updating the same key can still interleave their cache and database writes out of order relative to each other: writer A writes the database, then writer B writes the database (B's value now correctly "wins" as the latest), but if their respective cache writes happen to be reordered by network timing so that A's cache write lands after B's, the cache ends up holding A's older value while the database correctly holds B's newer one - the two sources of truth disagree, and nothing about "write-through" per se prevents that, because write-through only guarantees the cache and database are updated together <i>for a single write</i>, not that concurrent writes to the same key stay ordered consistently across both.
+</p>
+
+<p>
+The fixes are the same tools distributed systems reach for whenever ordering under concurrency matters: a version number or timestamp attached to each write, with the cache write including a conditional check ("only accept this write if its version is newer than what's currently cached"), or funneling writes to a given key through a single point of serialization (a per-key lock, or a single writer instance/partition responsible for that key) so concurrent writes to the same key can't race in the first place.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The nuance to volunteer: "write-through keeps a single write's cache and database updates together, but it doesn't by itself impose an ordering guarantee across multiple concurrent writers to the same key - that needs versioning or serialized writes on top." This is one of the more advanced points in the chapter, and stating it unprompted signals real distributed-systems depth beyond the standard write-through/write-behind/write-around comparison.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q44">
+Q44. Read-Repair &amp; Reconciliation Jobs
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Every pattern discussed so far tries to prevent the cache and the source of truth from ever disagreeing. Read-repair and reconciliation take the opposite, complementary stance: accept that despite your best invalidation logic, drift will occasionally happen anyway (a missed evict on some rarely-exercised write path, a bug, an operational mistake), and build a mechanism that detects and corrects it rather than assuming prevention is perfect.
+</p>
+
+<p>
+<b>Read-repair</b> does this opportunistically, at read time: when a value is read from the cache, occasionally (at some sampling rate, not every single read, to keep the overhead low) also fetch the current value from the source of truth and compare. If they disagree, correct the cache immediately and, more importantly, log or alert on the mismatch, because a disagreement usually points to a real bug in an invalidation path somewhere that's worth finding and fixing, not just papering over. <b>Reconciliation jobs</b> take a scheduled, batch approach instead: a background job periodically walks a sample (or all) of cached keys, compares each against the source of truth, and corrects or evicts any that have drifted, independent of whether anyone happens to be reading them right now.
+</p>
+
+<p>
+Neither of these replaces proper invalidation logic - they're a safety net, not a strategy - but a mature caching system in a large codebase, where dozens of engineers across teams can each introduce a write path that forgets to invalidate correctly, benefits enormously from having something that surfaces drift automatically rather than relying entirely on every invalidation path being written correctly forever.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Position this correctly relative to everything else in the chapter: "TTL, explicit eviction, and versioning are the prevention layer; read-repair and reconciliation are the detection-and-correction layer for when prevention inevitably has a gap somewhere in a large system." Interviewers asking about "cache consistency at scale" are often specifically listening for whether a candidate thinks about detection, not just prevention.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h15">SECTION 12 - PRODUCTION INCIDENT: CACHE OUTAGES &amp; HOT KEYS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q45">
+Q45. Case Study: A Redis Outage / Hot-Key Incident
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High (System Design / Behavioral)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is a common "walk me through a production incident" prompt, and even without having lived through the exact scenario, being able to reason through it convincingly is what's actually being tested. The setup: a service that reads Redis on essentially every request, with no fallback path coded for "what if Redis itself is unavailable," experiences a Redis outage - a node crash with no automatic failover configured (Q17 skipped), a network partition, or simply Redis being overwhelmed by one extremely hot key receiving a disproportionate share of traffic (a viral product, a celebrity's profile, a trending post).
+</p>
+
+<p>
+Because the application code has no conditional path for "Redis call failed," every request that would normally hit the cache now either throws an exception that propagates up as a user-facing error, or blocks waiting on a timeout to that unresponsive Redis instance, consuming a thread or connection for the duration. If enough concurrent requests pile up waiting on those timeouts, the application's own thread pool or connection pool exhausts, and the incident escalates from "the cache is down" to "the whole application is down" - the exact cascading-failure shape covered for service-to-service calls elsewhere in this handbook, just with the cache itself as the failing dependency instead of a downstream service.
+</p>
+
+<p>
+The postmortem-style fix, which is what an interviewer is really listening for, has three parts: put resilience around the cache call itself (a short timeout plus a circuit breaker, Q46) so a failing Redis doesn't consume the application's own resources; have an explicit fallback for what happens on a cache failure (usually: go straight to the database, accepting higher latency and load temporarily, rather than erroring); and address the specific trigger (add replication/Sentinel for node-failure resilience, or fix the hot-key problem specifically, Q48, if that's what caused the overload). Naming all three - resilience at the call site, a defined fallback behavior, and a root-cause fix - is what separates a strong answer from "we just restarted Redis."
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The single sentence that reframes the whole scenario correctly: "a cache is an optimization sitting in front of a source of truth, and a well-designed system should degrade to slower-but-correct when the cache disappears, not fail outright - if losing the cache takes down the whole service, the cache was accidentally load-bearing in a way it was never meant to be." That's the exact insight most incident postmortems in this space eventually arrive at.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q46">
+Q46. Circuit Breaker Around the Cache &amp; Graceful Degradation
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The general circuit breaker mechanics - CLOSED, OPEN, HALF-OPEN, tripping on a failure-rate threshold - are the same regardless of what's behind the breaker, and this handbook covers that pattern in full elsewhere for service-to-service calls. What's specific to applying it to a cache is what the OPEN state's fallback behavior should actually be, and why that answer is different (and simpler) than for a typical downstream service dependency.
+</p>
+
+<p>
+For a normal downstream service call, there often isn't a good fallback beyond an error or a generic default, because that service usually holds data or does work nothing else can substitute for. For a cache sitting in front of a database, there almost always is a clean fallback: go straight to the database. That's precisely why cache-aside (Q2) degrades so gracefully on its own even without an explicit breaker - a cache client that simply treats a Redis timeout or connection error the same as a cache miss, and falls through to the database, gets most of this protection for free, as long as the timeout on that Redis call is short enough not to itself become the bottleneck.
+</p>
+
+<p>
+Wrapping the cache client in an actual circuit breaker adds one further guarantee that "treat errors as misses" alone doesn't: once Redis is clearly down (failure rate over threshold), the breaker stops even attempting the call and fails fast to the fallback immediately, rather than paying a timeout on every single request while Redis is unresponsive. The database is now taking full traffic either way, but it's taking it at the application's normal request latency, not at "however long we wait for Redis to time out" latency stacked on top.
+</p>
+
+</div>
+
+<pre>
+@CircuitBreaker(name = "redisCache", fallbackMethod = "getProductFromDb")
+public Product getProduct(String id) {
+    return redisCache.get("product:" + id, Product.class);
+}
+
+private Product getProductFromDb(String id, Throwable t) {
+    // Redis is down or the breaker is open: go straight to the
+    // source of truth. Slower, but correct, and no thread pinned
+    // waiting on an unresponsive cache.
+    return productRepository.findById(id).orElseThrow();
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The key distinction to draw: "a circuit breaker around a typical service call usually has no great fallback; a circuit breaker around a cache almost always does - the database - which is exactly why cache-outage resilience is more tractable than a general service outage, as long as you've actually wired the fallback and a short timeout rather than assuming cache-aside's natural miss-handling covers you without one."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q47">
+Q47. Local Fallback Cache When Redis Is Unreachable
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Falling back to the database (Q46) is the safe, correct default when the distributed cache is unavailable, but it means the database now takes the cache's entire share of traffic for the outage's duration - which, for a database that was sized assuming a 95%+ cache hit ratio, can itself trigger a second failure on top of the first. A local fallback cache is a further layer of protection for exactly that scenario.
+</p>
+
+<p>
+The idea is to keep a small, short-TTL in-process cache (Caffeine) alongside the normal Redis-backed path, populated opportunistically on every successful Redis read, purely as an emergency reserve - not as the multi-level L1/L2 architecture from Q11, which is about latency optimization in the normal case. When Redis becomes unavailable, the fallback path checks this local emergency cache before falling all the way through to the database: a slightly-stale local copy of frequently-accessed data is a far better outcome during an incident than every single request for that data reaching the database at once.
+</p>
+
+<p>
+This trades a small amount of extra memory and code complexity (maintaining a second, rarely-exercised cache path) for meaningfully better behavior during the specific window of a distributed-cache outage. It's a defense-in-depth measure that most systems don't need until they've experienced the alternative once, which is why it tends to appear after an incident postmortem rather than in an initial design.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Building this fallback cache but only testing the happy path, never actually simulating a Redis outage to confirm the fallback logic works end to end. A circuit breaker and a local fallback cache that have never been chaos-tested against a genuinely unreachable Redis are exactly the kind of code that turns out to have a bug the first time it's actually needed, during a real incident, when it matters most.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q48">
+Q48. The Hot-Key Problem &amp; Mitigations
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High (Senior Favorite)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A hot key is a single cache key receiving a wildly disproportionate share of a service's total traffic - a viral post, a celebrity's profile, a flash-sale product. This is a distinct problem from the cache stampede in Q9: a stampede is many <i>different</i> requests all missing at once when a key expires; a hot key is sustained overload from one specific key even while the cache is behaving completely normally and serving it correctly on every single request.
+</p>
+
+<p>
+The problem is structural in Redis Cluster specifically (Q15): every request for that one key hashes to the same slot, which lives on exactly one node, so no amount of horizontally scaling the cluster helps - adding more nodes spreads out every <i>other</i> key, but the hot key's entire load still lands on a single node's single CPU core, which can genuinely saturate that one node while the rest of the cluster sits comfortably underutilized.
+</p>
+
+<p>
+The standard mitigations: <b>local caching of the hot key</b> at the application layer (an in-process Caffeine cache with a very short TTL, even just a few seconds, for just that key) absorbs the bulk of the read traffic before it ever reaches Redis at all, since even a few seconds of local caching on a key receiving thousands of requests per second removes the overwhelming majority of that load from the shared cache. <b>Key splitting / replication</b> deliberately stores the same value under several key variants (<code>product:42:copy0</code> through <code>product:42:copy9</code>) spread across different slots, and the application picks a variant at random (or round-robin) on each read, spreading what was one node's load across several. <b>Client-side detection</b> (tracking access frequency per key in the application, or using Redis's own hot-key detection tooling where available) is what identifies which keys need this special treatment in the first place, since applying key-splitting everywhere preemptively is unnecessary complexity for keys that were never actually hot.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The distinction worth stating explicitly and unprompted: "a stampede is a timing problem - many keys or many requests colliding at one instant - and jitter or locking fixes it; a hot key is a distribution problem - one key's traffic exceeding what a single node or shard can serve - and no amount of cluster scaling helps until you either cache it locally or spread it across multiple keys." Conflating the two is a common but avoidable mistake.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q49">
+Q49. Multi-Region Caching Considerations
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium (System Design)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Everything in this chapter has implicitly assumed a single region. Once an application is deployed across multiple geographic regions for latency or disaster-recovery reasons, caching has to make an explicit choice about topology, because a single shared cache instance in one region defeats half the point of going multi-region in the first place - every request from a distant region would pay cross-region network latency just to check the cache, potentially costing more than the cache was saving.
+</p>
+
+<p>
+The common pattern is a <b>per-region cache</b>: each region runs its own independent Redis (or Caffeine) cache, populated from that region's own traffic and its own (possibly regional read-replica of the) database. This keeps cache reads fast and local, at the cost of the same instances now having entirely independent, unsynchronized caches across regions - a write in one region does not automatically invalidate the cached copy sitting in another region, so cross-region staleness has to be bounded the same way single-instance L1 staleness was bounded in Q11: short TTLs, or an active cross-region invalidation broadcast (typically over the same event bus already carrying cross-region data replication, rather than a bespoke mechanism).
+</p>
+
+<p>
+The practical guidance mirrors a theme from throughout this chapter: decide the acceptable staleness bound for cross-region cache consistency explicitly, as a product/business decision, rather than discovering it by accident during an incident. For most consumer-facing read-heavy data, "a write in Region A may take a few seconds to be reflected in Region B's cache" is a perfectly reasonable, explicit trade-off; for anything where a user could act on stale cross-region data in a way that causes real harm (inventory decisions during a flash sale sold globally), tighter cross-region invalidation, or routing that class of read back to a single authoritative region, is worth the added latency.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Frame multi-region caching as "the L1/L2 staleness problem from Q11, at a larger geographic scale, with the same two tools - short TTLs or active invalidation - just now bounded by cross-region network latency instead of intra-datacenter latency." Recognizing it as the same underlying trade-off at a different scale, rather than a wholly new problem, is the mark of someone who has internalized the chapter's core ideas rather than memorized isolated facts.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">SECTION 13 - ADVANCED CACHE SIZING &amp; CAPACITY PLANNING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q50">
+Q50. Estimating Working-Set Size
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Q14 covered monitoring an already-running cache; sizing it correctly in the first place - before it exists, or before a capacity-planning conversation with infrastructure - starts with estimating the <b>working set</b>: the set of distinct keys that are actually accessed frequently enough to be worth keeping resident, as opposed to the theoretical full size of every key that could ever exist.
+</p>
+
+<p>
+The estimation approach: start from the access-frequency distribution of the data (most real-world traffic is heavily skewed - a Zipfian or similar long-tail curve, where a small fraction of keys account for the large majority of requests), and identify roughly how many distinct keys are needed to cover your target hit ratio. If 5,000 distinct products account for 95% of all catalog page views even though the full catalog has 2 million products, your working set for a 95% hit-ratio target is close to 5,000 entries, not 2 million - trying to size the cache for the full catalog wastes enormous memory for very little additional hit-ratio benefit, since that long tail is, by definition, rarely accessed.
+</p>
+
+<p>
+In practice this data comes from either historical access logs (if the system already exists) or a reasoned estimate from the product's expected usage pattern (if sizing a brand-new system before launch), and it should be revisited periodically - a working set is not static, and a change in product behavior (a new recommendation algorithm surfacing more of the long tail, a marketing campaign driving traffic to previously-cold items) can shift it meaningfully.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The key mental model to state: "size the cache for the working set implied by your traffic's access distribution and target hit ratio, not for the full size of the underlying dataset - for most real-world skewed access patterns, those two numbers can differ by orders of magnitude." That's a materially stronger answer than "make it as big as you can afford."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q51">
+Q51. Memory Overhead Per Entry (Caffeine vs Redis)
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+"How many entries fit in X gigabytes" is never simply (memory) / (size of the value), because every cache entry carries bookkeeping overhead beyond the raw value bytes, and that overhead can dominate for small values.
+</p>
+
+<p>
+For <b>Caffeine</b>, each entry effectively lives inside a concurrent hash map node plus Caffeine's own metadata for its eviction policy (the W-TinyLFU frequency sketch, access/write timestamps for time-based expiry, references for the LRU-like admission window) - for genuinely small values (a short string, a boolean flag), this per-entry overhead can be a substantial multiple of the value's own size, meaning the real capacity of a "10,000 entry" cache in terms of memory footprint depends heavily on what's actually being cached, not just the entry count.
+</p>
+
+<p>
+For <b>Redis</b>, every key also carries overhead beyond the value: the key string itself, internal object headers, and structure-specific overhead that varies by data type (a hash with many small fields has substantially more per-field overhead than a single string value of the same total byte size). This is precisely why Redis's own documentation recommends techniques like hashing many small related fields together under one key (using a Redis hash) instead of storing each as its own top-level key, when the values are small - it can meaningfully reduce total memory overhead by amortizing the per-key bookkeeping cost across many fields instead of paying it once per field.
+</p>
+
+<p>
+The practical takeaway for capacity planning: when sizing a cache for millions of small entries, measure actual memory usage with representative data (Redis's <code>MEMORY USAGE</code> command, or a load test against Caffeine with <code>recordStats()</code>) rather than trusting a back-of-envelope calculation based purely on value size, because the overhead-to-value ratio for small entries can make that calculation wrong by a large factor.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Sizing a cache for millions of small values using only "value size times entry count" and being surprised when actual memory usage is several times higher. Per-entry overhead is not a rounding error for small values - it's frequently the dominant cost, and worth measuring directly rather than estimating.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q52">
+Q52. maxmemory-policy for Redis vs Caffeine's Weigher/maximumSize
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Both Redis and Caffeine need to be told what to do once they hit a memory or size limit, but they expose that decision differently, and knowing the specific Redis configuration option by name is a frequent litmus test for "have you actually operated Redis, or only used it."
+</p>
+
+<p>
+Redis's behavior at its memory limit is controlled by <code>maxmemory-policy</code>. The critical, easy-to-get-wrong default is <code>noeviction</code>: once <code>maxmemory</code> is reached, Redis stops accepting new writes entirely and returns an error to the client, rather than quietly evicting something to make room - appropriate only if Redis is being used as a primary datastore where silently losing data is worse than rejecting writes. For an actual cache, you almost always want an eviction-based policy instead: <code>allkeys-lru</code> (approximate LRU across every key), <code>allkeys-lfu</code> (approximate LFU across every key, better for skewed access patterns per Q13), or the <code>volatile-*</code> variants of each, which only consider keys that have an explicit TTL set as eviction candidates, leaving keys without a TTL untouched no matter how full memory gets - useful if the same Redis instance holds both genuinely-cacheable data and something that must never be silently evicted.
+</p>
+
+<p>
+Caffeine's equivalent decision is made at build time rather than as a runtime policy switch: <code>maximumSize</code> bounds the cache by entry count, while <code>maximumWeight</code> combined with a custom <code>Weigher</code> bounds it by a computed "weight" per entry (letting a 10KB entry count for more of the budget than a 10-byte one), which matters when cached values vary significantly in size and a flat entry-count limit would let a few huge entries dominate the cache's actual memory footprint disproportionately.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>System</th>
+<th>Mechanism</th>
+<th>Common choice for "it's a cache"</th>
+</tr>
+
+<tr>
+<td>Redis</td>
+<td>maxmemory-policy (runtime config)</td>
+<td>allkeys-lru or allkeys-lfu (never noeviction)</td>
+</tr>
+
+<tr>
+<td>Caffeine</td>
+<td>maximumSize or maximumWeight + Weigher (build-time)</td>
+<td>maximumWeight when entry sizes vary significantly</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming `noeviction` specifically as the dangerous default, and being able to say precisely why - "writes start failing outright instead of evicting" - is one of the highest-signal single facts in this whole chapter, precisely because it's the kind of thing that's easy to overlook until a cache actually fills up in production and starts rejecting writes instead of gracefully evicting.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q53">
+Q53. Compression to Reduce Cache Memory Footprint
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Once working-set size and per-entry overhead (Q50, Q51) still leave a cache too large or too expensive for available memory, compressing values before storing them is a lever that trades CPU time for memory - and, for a cache that's paying for expensive Redis memory or constrained JVM heap, that trade is often clearly worth it.
+</p>
+
+<p>
+The trade-off is genuinely two-sided and worth stating precisely rather than treating compression as a free win: it reduces memory footprint (often substantially for text-heavy or repetitive payloads like JSON) and can reduce network transfer time for large values, but it costs CPU on every write (to compress) and every read (to decompress), and it makes the stored bytes opaque - you lose the ability to inspect a cached value directly in Redis with a simple `GET` for debugging without decompressing it first, which is a real (if minor) operational cost.
+</p>
+
+<p>
+The practical judgment call is to compress selectively rather than universally: it's usually worth it for larger, text-heavy payloads (a rendered HTML fragment, a large JSON blob) where the memory savings are substantial and the values are read far less often than the CPU cost would suggest, and usually not worth it for small values, where the fixed overhead of compression can exceed any memory saved, or for extremely hot keys being read thousands of times per second, where the added CPU cost per read compounds into a real latency and throughput cost across that volume.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Enabling compression uniformly across an entire cache "for safety" without measuring the actual CPU cost against the actual memory savings for that specific workload. The senior habit is treating this as a data-driven decision per data type, the same way TTL choice (Q36) is - not a single global switch.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h17">SECTION 14 - CACHING SYSTEM DESIGN SCENARIOS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q54">
+Q54. Design a Cache for a Product Catalog Page
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High (System Design)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is one of the most common caching system-design prompts precisely because a good answer has to pull together nearly everything in this chapter into one coherent design, rather than reciting patterns in isolation.
+</p>
+
+<p>
+The access pattern: read-heavy, highly skewed toward a small set of popular products (Q50's working set), price and stock change more often than descriptions and images, and staleness of a few seconds to a couple of minutes is generally acceptable for a catalog page (unlike, say, a checkout total). That points toward a multi-level design (Q11): an L1 Caffeine cache per instance for the hottest products with a short TTL, backed by an L2 Redis cache shared across the fleet with a longer TTL, backed by the database. Cache-aside (Q2) populates both levels lazily. Different fields get different TTL treatment per Q36 - a coarse-grained "everything expires in 5 minutes" is worse than splitting cache entries so that price/stock have a short TTL while description/images (which change far less often) can have a much longer one, or are versioned (Q32) rather than TTL'd at all.
+</p>
+
+<p>
+Layering in the rest of the chapter: TTL jitter and request coalescing (Q9) to avoid a stampede when a popular product's entry expires; negative caching (Q33) for invalid/deleted product IDs; a CDN in front of everything (Q25) for the fully-rendered page or its static assets, since much of a catalog page doesn't vary per user at all; and a circuit breaker with a database fallback (Q46) so a Redis blip degrades to slower-but-correct instead of an outage. The strongest answers explicitly justify each choice against the specific access pattern rather than applying every pattern reflexively "because this is the caching chapter."
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Structure the answer as: access pattern first, then which patterns that pattern implies, not "here are all the caching patterns I know." Interviewers running this as a system-design prompt are explicitly testing whether you can select and justify a subset rather than list everything you've memorized.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q55">
+Q55. Design a Cache for a Real-Time Leaderboard
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High (System Design)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A leaderboard's access pattern is different enough from a catalog page that it deserves its own reasoning rather than reusing the same design by default: scores update very frequently (every game/match/action), and the read requirement isn't "fetch one item by id," it's "give me the top N, in order, right now," and often also "give me this specific user's current rank," both of which need efficient ordered access, not just key-value lookups.
+</p>
+
+<p>
+This is exactly the shape Redis's sorted set (ZSet, from Q7) was built for: a single `ZADD` updates a player's score in O(log N), `ZREVRANGE` fetches the top N in ranked order directly, and `ZREVRANK` gets a specific member's current rank - all without the application maintaining its own sort order or scanning anything. Because the score itself lives directly in Redis as the source of truth for ranking purposes (rather than being a cached copy of a value computed elsewhere), this leans toward write-through in spirit: every score change goes directly into the ZSet as part of the write path, and there's no separate "cache miss, recompute" step for reads at all, since reading the top N or a rank is always just querying the live ZSet.
+</p>
+
+<p>
+For extreme read volume (a leaderboard on a high-traffic public homepage), the top-N result itself can additionally be cached with a very short TTL (a few seconds) in front of the ZSet, since "exactly real-time to the millisecond" is rarely a real requirement for a leaderboard - a few seconds of staleness on the top-10 display is an easy, low-risk trade for absorbing enormous read volume without hitting the ZSet on every single page view. This is a good example of a design where the "cache" being discussed is layered on top of a Redis data structure that is itself already fast and already the source of truth, rather than in front of a slower database.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The insight worth stating explicitly: "the interesting design decision here isn't cache-aside vs write-through in the abstract, it's recognizing that a sorted set turns 'give me the ranked top N' from an application-level sorting problem into a single Redis command - the caching layer and the correct data structure choice are the same decision for this access pattern."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q56">
+Q56. Designing a Redis-Backed Rate Limiter End to End
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High (System Design)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Q22 covered the algorithmic options for Redis-based rate limiting; a full system-design answer needs to also address where the limiter sits, how it fails, and how it scales, which is what actually distinguishes a strong answer from a correct-but-incomplete one.
+</p>
+
+<p>
+Placement: rate limiting almost always belongs at the API Gateway / edge layer rather than duplicated inside every individual backend service, both to enforce limits before wasted work happens downstream and to have one consistent, centrally-configurable policy rather than N slightly-different implementations. Algorithm choice from Q22 depends on the specific requirement - a hard cap with simple semantics favors fixed window with jitter-tolerant limits, a need to allow legitimate bursts favors token bucket, and precise fairness favors a sliding window - and should be a deliberate choice tied to the actual product requirement, not a default.
+</p>
+
+<p>
+Failure mode is the part candidates most often skip: what happens to every request if the Redis instance backing the limiter is itself unavailable? Failing closed (reject all requests) turns a cache/limiter outage into a full outage of the entire API, which is rarely the right trade for a rate limiter specifically, since its job is abuse prevention, not core functionality. Failing open (allow all requests through when the limiter is unreachable) is the far more common choice - it means a brief window of unenforced rate limits during a Redis blip, which is a much smaller risk than an outright outage, paired with a circuit breaker (Q46) so requests fail fast to that open behavior rather than each one waiting out a timeout against a dead Redis. Scaling the limiter itself for very high request volume benefits from the pipelining and Lua-script atomicity from Q18/Q19, and, if it becomes a bottleneck, from partitioning limiter keys the same way a hot key would be split (Q48), since a globally popular endpoint's rate-limit key is itself a hot key by definition.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The fail-open-vs-fail-closed decision is the single highest-signal part of this answer. Stating it explicitly - "for a rate limiter specifically, I'd fail open, because the limiter's job is to protect against abuse, and an outage of the abuse-prevention layer shouldn't become an outage of the product itself" - shows the kind of risk-weighing senior interviewers are actually screening for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q57">
+Q57. Caching a Third-Party API You Don't Control
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Caching your own database is fully within your control: you know exactly when data changes, because your own write path is what changes it, so explicit invalidation (Q4) is always available. Caching a third-party API response is different in one important way: you have no write path to hook into and no reliable signal for exactly when the upstream data changed, so the cache has to lean much harder on time-based and header-driven strategies rather than explicit invalidation.
+</p>
+
+<p>
+The first thing to check is whether the third-party API itself sends standard HTTP caching headers (Q26, Q27) - `Cache-Control` with a `max-age`, or an `ETag` supporting conditional requests. If it does, respecting those headers directly (rather than inventing your own arbitrary TTL) is both the most correct approach and the one least likely to violate the provider's terms of service or rate limits, since it's exactly the mechanism the provider designed for this. If the API gives no caching guidance at all, the fallback is a TTL chosen conservatively based on how often you've empirically observed the data to change and how costly staleness is for your use case - erring toward a shorter TTL than you might for internal data, precisely because you have no invalidation escape hatch if you guess wrong and the underlying data changes sooner than expected.
+</p>
+
+<p>
+Two additional considerations specific to third-party APIs: negative caching (Q33) matters even more here, since a slow or rate-limited third-party API makes every uncached "not found" or error response disproportionately expensive, and a stampede-prevention strategy (Q9) is often mandatory rather than optional, because many third-party APIs enforce hard rate limits, and a cache-miss stampede against an external API can mean your own service getting rate-limited or blocked entirely, not just extra latency.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The framing to lead with: "without a write path into the third-party data, I've lost explicit invalidation as an option, so I lean on whatever caching headers the API actually provides, and treat rate-limit protection and stampede prevention as first-class requirements rather than nice-to-haves, since a badly-cached third-party integration can get your own service blocked." That reframes the whole problem correctly instead of defaulting to "just add a TTL."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q58">
+Q58. When NOT to Cache at All
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High (Senior Favorite)
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This chapter has spent a lot of time on how to cache well, which makes it easy to forget that reflexively adding a cache to every slow-looking read path is itself a mistake interviewers specifically probe for - the strongest closing signal in this whole topic is knowing when the honest answer is "don't."
+</p>
+
+<p>
+Caching is a poor fit when data changes on essentially every read and staleness of even a few seconds causes real harm - a live account balance mid-transaction, an inventory count during the final seconds of a flash sale, anything where "the value I show is definitely current" is itself the requirement, not merely a preference. It's also often not worth it when the underlying read is already fast and cheap: caching adds real complexity (an extra failure mode, an extra thing to invalidate correctly, an extra piece of infrastructure to run and monitor) and that complexity needs to be justified by an actual latency, load, or cost problem it solves - caching a query that already takes two milliseconds and is rarely called adds risk for no measurable benefit. And it's the wrong tool when correctness must be strict and auditable (financial ledger entries, anything subject to regulatory audit trails) where "eventually consistent, wrong for a bounded window" - the honest description of what every caching strategy in this chapter actually provides - is not an acceptable characterization of the system's behavior at all.
+</p>
+
+<p>
+The senior instinct, consistent with how this chapter opened in Q1, is to add a cache deliberately in response to a measured problem (an actual latency budget being missed, an actual database struggling under real load, an actual cost line item worth reducing), and to be equally willing to say a read path doesn't need one. Reaching for Redis or Caffeine by default, everywhere, "because caching is generally good," is exactly the reflexive behavior the opening question of this chapter warned against.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Close with the same framing this chapter opened with: "I add a cache to solve a measured latency, load, or cost problem, and I'm equally comfortable saying a given read path doesn't have one of those problems and doesn't need a cache." That full-circle answer - deliberate adoption, not reflexive adoption - is consistently one of the strongest signals in this entire topic area.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h18">PART 2 COMPLETE</h1>
+
+<p>
+Next Part:
+* Quick revision sheet covering every pattern in this chapter
+
+That closes out the caching strategies handbook - from the core cache-aside/write-through fundamentals through Redis internals, HTTP/CDN layering, consistency races, production incidents, and full system-design scenarios.
+</p>
+
+<hr>
+
+<h1 id="h19">QUICK REVISION SHEET</h1>
 
 <hr>
 
@@ -1102,6 +3259,30 @@ Tie the metrics back to business impact rather than reciting them: "cache metric
 <li>LRU = cheap default, fooled by scans | LFU = protects hot keys, slower to adapt | FIFO = simplest, no notion of "hot" at all</li>
 
 <li>Monitor hit ratio, eviction rate, and memory-vs-max; alert on a falling hit ratio or eviction spike, since both are early warnings for the source of truth</li>
+
+<li>Redis Cluster shards via 16384 fixed hash slots (CRC16(key) mod 16384); multi-key ops need a hash tag ({user:123}) to force co-location on one node</li>
+
+<li>Replication is asynchronous (replica reads can lag); Sentinel automates failover via quorum but doesn't prevent losing unreplicated writes; pipelining collapses N round trips into 1 (not atomic); Lua/EVAL is atomic (use it for safe check-then-act, e.g. lock release)</li>
+
+<li>Redis beyond caching: SET NX PX for locks (Redlock raises confidence but Kleppmann's critique says use fencing tokens for hard correctness); ZSET/Lua for rate limiting; Pub/Sub is fire-and-forget; Streams add persistence + consumer groups but aren't a Kafka/RabbitMQ replacement at scale</li>
+
+<li>CDN caches whole HTTP responses at the edge, in front of app-level Redis/Caffeine; Cache-Control (no-cache = revalidate, no-store = never cache), ETag + conditional requests (304), and Vary (fragments the cache key) govern that layer</li>
+
+<li>Read-through delegates miss-handling to the cache itself via a loader (Caffeine's get(key, loader), @Cacheable); cache-aside means the application writes that logic by hand at every call site</li>
+
+<li>Namespace cache keys ({service}:{entity}:{id}:{variant}) to avoid collisions on a shared Redis; version keys on schema change; cache "not found" too (negative caching) to stop enumeration/retry storms from bypassing the cache entirely; warm hot keys before a deploy/flush to avoid a cold-cache stampede</li>
+
+<li>Choose TTL per data type: long for rarely-changing reference data, short for price/stock, explicit invalidation (not TTL) for auth/permissions</li>
+
+<li>Session storage often *is* the source of truth, not a copy - weigh durability accordingly; externalized stores (Spring Session + Redis) beat sticky sessions for auto-scaling/rolling deploys at the cost of a network hop and a new availability dependency</li>
+
+<li>Write DB-then-delete-cache narrows (not eliminates) the stale-read race; delayed double-delete catches most of what's left; write-through across a distributed cache still needs versioning/serialization to stay ordered under concurrent writers; read-repair/reconciliation jobs detect drift prevention misses</li>
+
+<li>A cache outage should degrade to slower-but-correct (DB fallback + circuit breaker + short timeout), never cascade into a full outage; hot keys are a distribution problem (fix with local caching or key-splitting), distinct from a stampede's timing problem</li>
+
+<li>Size a cache for the working set implied by your access distribution and target hit ratio, not the full dataset; measure real per-entry memory overhead rather than estimating from value size alone; never leave Redis on maxmemory-policy noeviction for an actual cache</li>
+
+<li>The best senior answer is knowing when *not* to cache: never for data where any staleness is unacceptable (balances, strict audit trails) or for reads that are already fast and rarely called - add a cache to solve a measured latency/load/cost problem, not by reflex</li>
 
 </ul>
 

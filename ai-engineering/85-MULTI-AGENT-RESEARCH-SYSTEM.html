@@ -654,6 +654,539 @@ This project has a genuinely larger security surface than most single-agent chap
 <p>Unbounded recursive delegation makes cost, latency, and even correctness unbounded by construction — a single deep lead could silently spawn dozens of downstream agents, blow through budget, and take arbitrarily long, with failures becoming harder to trace across a growing tree rather than a flat fan-out. To allow it safely: cap maximum recursion depth and total agent count for the entire request (not per level), propagate a shared, decrementing token/cost budget down through the tree so children cannot collectively exceed the parent's allotment, require each spawning decision to be justified in structured output (so it is auditable), and preserve the full tree in the task graph store for tracing and post-hoc cost attribution. Strategically, recursive delegation should be treated as an advanced, opt-in capability gated by policy per use case, not the default execution mode, given how much harder it makes cost forecasting and debugging.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">MID</span>Q9. How does the lead agent decide whether a user query even needs decomposition into subagents, versus being answered directly?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>The planning step should classify query complexity before committing to the multi-agent path: single-fact lookups ("what is X's current stock price") should be answered with one direct tool call or a single agent, while genuinely multi-faceted or comparative questions ("compare the regulatory approaches of three countries to X") justify decomposition. A cheap classification pass (or explicit reasoning in the planning prompt itself) that estimates the number of independent facets the question has is the deciding signal — routing every query through full decomposition wastes cost and latency on the majority of simple questions.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">MID</span>Q10. Give an example of a poorly decomposed research plan and explain why it fails.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A poor decomposition for "what caused the 2008 financial crisis" might split into "subagent 1: research causes, subagent 2: research effects, subagent 3: research causes and effects" — the sub-tasks overlap (two agents researching "causes") and are not independently useful (an "effects" agent may need context the "causes" agent is generating, so they aren't actually parallelizable). A good decomposition instead splits along genuinely orthogonal, non-overlapping facets (e.g., mortgage-market causes, regulatory-policy causes, ratings-agency causes) that each a subagent can answer with no dependency on the others' output.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">MID</span>Q11. How do you handle a user query that is ambiguous before you decompose it into subagent tasks?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Decomposing an ambiguous query wastes an entire parallel research pass on the wrong interpretation, so ambiguity should be resolved before dispatch, not after. Cheap approaches: have the lead agent state its interpretation of the query and the scope it intends to research as part of the plan (shown to the user, or logged), and only ask a clarifying question back to the user when the interpretations meaningfully diverge in what sources or scope would be needed — for a synchronous chat UX, a brief clarifying turn is far cheaper than an expensive wrong research pass.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">SENIOR</span>Q12. Should subagent task descriptions be handed down verbatim from the lead agent's plan, or should each subagent re-derive its own scope?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Verbatim, with enough self-contained context that the subagent does not need to see the rest of the plan or the original conversation. Each subagent's context should include the sub-task objective, any constraints (date range, source types to prefer/avoid), and the format its findings must be returned in — but not the full original conversation or the other sub-tasks, since that would reintroduce the context-pollution problem isolation was meant to solve. The lead agent, not the subagent, owns scoping decisions; letting subagents freelance on scope reintroduces the redundant-research and inconsistent-boundary problems decomposition exists to prevent.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">SENIOR</span>Q13. How do you prevent decomposition from producing a sub-task that is too broad for a single subagent to complete within a bounded number of tool calls?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Give the planning prompt an explicit sizing heuristic and a hard budget to plan against — e.g., "each sub-task should be answerable within roughly 5-10 search/fetch calls" — and give each subagent a hard tool-call ceiling as a runtime guardrail regardless of what the plan intended. When a subagent hits its ceiling without converging, it should return its partial findings plus an explicit "scope too broad, needs further decomposition" signal rather than silently truncating its research; the orchestrator can then split that sub-task further in a second pass if the budget allows, rather than the subagent quietly producing a shallow answer.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">MID</span>Q14. Should the intermediate research plan be shown to the end user before subagents are dispatched?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>For most consumer deep-research UX, yes — showing a short bulleted plan ("I'll look into: A, B, C") both sets expectations for a multi-minute wait and gives the user a cheap opportunity to redirect before expensive parallel work begins. It also serves as useful debugging/audit surface: when a report goes wrong, the plan tells you whether the failure was in decomposition or in a downstream subagent, which matters for triaging where to fix the system.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">SENIOR</span>Q15. How would you handle a multi-hop research question where sub-task B genuinely depends on the result of sub-task A?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Not every question decomposes into an embarrassingly-parallel set of independent sub-tasks — true dependencies should be represented as a DAG rather than forced into a flat fan-out. The orchestrator runs A first (or the independent, non-dependent sub-tasks in parallel with A), then dispatches B once A's output is available, injecting A's relevant findings into B's task context. This costs latency versus full parallelism, so the planning step should only introduce a dependency edge when the sub-task genuinely cannot proceed without the other's output, not as a default structure.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Note that a naive multi-agent implementation that assumes full independence between subagents will silently produce wrong answers on dependent multi-hop questions — flagging this failure mode unprompted signals you've thought past the common case.</div>
+
+<div class="question" id="q16"><span class="level">STAFF</span>Q16. When should the lead agent re-plan mid-research based on early subagent findings, rather than sticking to the original decomposition?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at senior/staff level</p>
+<div class="answer">
+<p>Re-planning is justified when an early finding invalidates an assumption the original plan was built on — e.g., a sub-task discovers the premise of the user's question is wrong, or surfaces a new facet clearly more important than one of the originally planned sub-tasks. Re-planning should be bounded (at most one or two revision passes) and gated behind a real signal, not triggered speculatively on every partial result, since checking after every subagent completion for whether to re-plan adds latency and cost to the common case where the original plan was fine. A pragmatic middle ground is a single checkpoint after the first wave of results, before committing to synthesis.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">SENIOR</span>Q17. What does the lead agent's synthesis prompt need to include to avoid simply concatenating subagent outputs into an unreadable report?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The synthesis prompt needs the original user question (so it can organize around answering it, not around the subagent boundaries), explicit instructions to restructure findings by theme rather than by which subagent produced them, instructions on how to handle contradiction and gaps, a target format/length, and the citation requirement (only assert what a returned finding supports, with its source attached). Without the original question re-anchoring the synthesis, the report tends to read as a sequence of disconnected mini-reports rather than a single coherent answer.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">MID</span>Q18. How do you handle synthesis when subagents return wildly different volumes of findings — one comes back with two facts, another with twenty?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Volume of findings is not a proxy for importance to the final report, so the synthesis prompt should explicitly instruct the model to weight sub-topics by relevance to the user's question rather than by how much material was returned — otherwise a sparse-but-important sub-topic gets underrepresented and a verbose-but-tangential one dominates. If a sub-task returns unusually little, that is itself worth surfacing ("limited information was found on X") rather than padding it artificially to match the others' length.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">SENIOR</span>Q19. Should the synthesis step be a single large LLM call, or should it itself be decomposed?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>For most research jobs, a single well-structured synthesis call is preferable — the whole point of synthesis is producing one coherent narrative, and splitting it risks reintroducing the same context-fragmentation problem decomposition solved for research. The exception is when total findings volume would overflow even a large context window (very broad reports with many subagents); then a two-stage synthesis is reasonable — first synthesize within thematic clusters, then a final pass merges the cluster-level summaries — but this should be the exception path, triggered by an actual token-count check, not the default architecture.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">SENIOR</span>Q20. What state does the orchestrator need to track across the lifetime of a research job?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<ul>
+<li>The task graph: sub-tasks, their dependencies, and current status (pending/running/done/failed/timed-out).</li>
+<li>Per-subagent findings, each tagged with its source citations.</li>
+<li>Running cost/token/tool-call counters against the job's budget.</li>
+<li>A job-level status for streaming to the client (planning / researching / synthesizing / done).</li>
+<li>Enough of the original request (user query, any clarified scope) to re-anchor synthesis at the end.</li>
+</ul>
+<p>This state needs to be persisted outside any single agent's context, typically in a database or durable store keyed by job ID, both so the client can poll/reconnect mid-job and so a crashed orchestrator process can resume rather than losing an in-flight multi-minute job.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">STAFF</span>Q21. How would you design the task-graph representation for subagents and their dependencies?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Model it as a DAG of nodes, each carrying a unique task ID, its scope/instructions, its dependency edges (which task IDs must complete first), its status, its assigned agent/model tier, and a pointer to its result once complete. Most research jobs in practice are a flat fan-out (no edges) plus an optional final synthesis node depending on all of them, so the representation should optimize for that common shallow-and-wide case while still allowing the rare deeper dependency chain from a multi-hop decomposition. Persisting this graph (not just holding it in a single process's memory) is what enables progress streaming, crash recovery, and post-hoc debugging of exactly which sub-task produced a given claim.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">MID</span>Q22. How do you avoid the lead agent hallucinating a synthesis when subagent results come back sparse or largely empty?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The synthesis prompt should be explicit that "insufficient information was found" is an acceptable and expected output for a sub-topic, and that filling gaps with the model's own background knowledge (uncited) is not permitted for a system whose core promise is verifiable claims. Making this instruction concrete and repeated (not just a generic "don't hallucinate" line) matters because models under pressure to produce a comprehensive-sounding report will otherwise default to smoothing over gaps with plausible but unsourced text.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">JUNIOR</span>Q23. What tools does a researcher subagent need at minimum to do useful work?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>At minimum: a web-search tool (query in, ranked results with URL/title/snippet out) and a page-fetch tool (URL in, extracted readable content out). Most production systems add a "return findings" structured-output step as the subagent's terminal action rather than free-form prose, so its output is directly consumable by the synthesis step. Optional but common additions: a targeted site-search or academic-search tool for domains where general web search is weak, and access to any internal/proprietary document store the product needs to research over alongside the public web.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. How do you decide how many search-tool calls to allow a single subagent before it must stop and report?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Set a hard per-subagent tool-call ceiling (a common production pattern caps this in the single-digit-to-low-teens range) sized to the sub-task granularity the planner is instructed to produce, and instruct the subagent's own prompt to self-assess convergence — stopping early once it judges it has enough to answer its assigned scope, rather than mechanically using its full budget every time. The ceiling exists as a backstop against agents that get stuck in unproductive search-refine loops, not as a target to always hit; a subagent that converges in two calls should stop in two calls.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. How do you handle a web search returning several near-duplicate results (e.g., the same story syndicated across five outlets)?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Deduplicate at the URL/domain level before spending a fetch call on near-identical content — a simple heuristic (same headline or first-paragraph similarity above a threshold) catches most syndicated-copy cases cheaply. Where the content genuinely is the same wire-service story, prefer fetching the original/primary source over a syndication copy when identifiable, since that also improves citation quality — citing the originating outlet is more defensible than citing a secondary aggregator.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. How would a subagent prioritize which search results to actually fetch, given fetching every result is too slow/expensive?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Use the search engine's own relevance ranking as a first-pass filter, then have the subagent apply a cheap relevance/authority judgment using only title and snippet before committing a fetch call — deprioritizing snippets that look off-topic, low-authority, or clearly promotional/SEO content. This snippet-triage step is what keeps the fetch budget spent on high-value pages rather than burned working through a search results list in raw order.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">SENIOR</span>Q27. Should a subagent work off of search-result snippets, or should it always fetch the full page before citing a claim?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Snippets are useful for triage (deciding what's worth fetching) but should never be the basis for an asserted, cited claim — snippets are often truncated or algorithmically excerpted out of context, and citing "a source says X" based only on a snippet risks misrepresenting what the page actually says. For any claim that ends up in the final report, the subagent should have fetched and read the actual page content the citation points to; this is a specific, testable rule to enforce in the subagent's system prompt and to check for in citation-verification evals.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">SENIOR</span>Q28. How do you handle rate limits from search/fetch APIs when dozens of subagents are hitting them in parallel?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Put a shared rate-limiting/queueing layer between all subagents and the external search/fetch providers rather than letting each subagent call out independently — this both respects provider limits and gives you a single place to apply backoff, provider fallback, and per-job fairness (so one large job can't starve concurrent jobs of search capacity). Subagents should treat a rate-limit response as a retryable condition with backoff, not a hard failure of their sub-task, and the orchestrator should track aggregate external-API usage as its own budget dimension alongside token cost.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. What's the risk of a subagent getting stuck in an unproductive search-refine loop, and how do you bound it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Without a bound, a subagent that isn't finding good results can keep issuing slightly reworded queries indefinitely, burning cost and latency with no guarantee of ever converging. Bound it with the hard tool-call ceiling (Q24) as a backstop, plus a self-check the subagent's prompt is instructed to run after a few unproductive calls ("have my last N searches surfaced meaningfully new information?") that triggers an early "insufficient information found" exit rather than continuing to churn.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">STAFF</span>Q30. How would you integrate an internal/proprietary document store alongside public web search for a subagent?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Expose it as an additional retrieval tool with the same shape as web search (query in, ranked results with a citable locator out) so the subagent's reasoning loop treats it uniformly, but keep the two source pools distinguishable in returned findings — internal documents typically carry different trust/freshness/access-control properties than public web pages, and the synthesis and citation layers need to know which is which (e.g., to render an internal-doc citation differently, or to enforce that internal content only appears in reports for users with matching access). The planning step should also be able to bias which pool a given sub-task should prefer, since some sub-questions are answerable only internally and others only from public sources.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">SENIOR</span>Q31. What data structure should a "finding" carry to guarantee the final report's claims are traceable to real sources?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>A finding should be a structured object, not free text: the claim itself, the exact source URL/locator, a short supporting excerpt or quote from the actual fetched content (not a paraphrase — this is what a verification pass checks against), a confidence/certainty signal, and metadata like retrieval timestamp and source type. Requiring the subagent to produce this structure at the point of finding (immediately after reading the source), rather than reconstructing citations later from memory during synthesis, is what makes the traceability guarantee actually hold rather than being aspirational.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">SENIOR</span>Q32. How do you handle a source that changes or disappears after it was cited in a report?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Snapshot or archive the fetched content (or at minimum the specific excerpt used) at citation time rather than relying on the live URL to always reflect what was read — web pages get edited, taken down, or paywalled after the fact, and a citation link that no longer supports the claim it's attached to undermines the whole verifiability guarantee. For reports users may revisit, store the excerpt alongside the citation so verification doesn't depend on the source still being live and unchanged.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">SENIOR</span>Q33. How do you detect when a subagent has asserted a claim that isn't actually supported by the source it cited?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Run an automated citation-verification pass — a separate model call (or the subagent itself, as a self-check step) given only the claim and the source excerpt, asked to judge whether the excerpt actually entails the claim, distinct from and after the generation that produced the claim, so it isn't just re-confirming its own reasoning. Track the pass/fail rate as a first-class production metric across reports and treat a rising failure rate as a regression alarm, since this is the failure mode that most directly threatens user trust in the product.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Distinguish two failure types worth naming separately: unsupported claims (the source doesn't say this at all) versus misattributed claims (the source says something related but the claim overstates or distorts it) — a strong verifier should catch both, and they often need different fixes upstream.</div>
+
+<div class="question" id="q34"><span class="level">MID</span>Q34. Should citations be inserted into the report by the subagent, or attached later by the synthesis step?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The citation-to-source binding should be created once, by the subagent, at the moment it produces a structured finding — the subagent is the only stage that has actually read the source. Synthesis should never invent or re-derive citations; it should only select and rephrase among the findings it was handed, carrying each claim's existing citation forward unchanged, since re-deriving citations during synthesis reintroduces exactly the hallucination risk structured findings were meant to eliminate.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. How would you present citations in the UI so users can verify claims quickly without leaving the report?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Inline numbered or superscript markers next to each claim, resolving to a source panel/footnote with the outlet name, a link, and ideally the exact excerpt that supports the claim shown on hover or click — surfacing the excerpt directly is what turns citation from a "trust us" link into something a user can verify in seconds without leaving the page. Grouping citations by claim rather than dumping an undifferentiated source list at the end makes the traceability the product promises actually usable.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">SENIOR</span>Q36. What's the risk of citing a technically real but unreliable source (e.g., an SEO content farm or a known-biased outlet), and how do you mitigate it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A citation being real and accurately quoted doesn't make the underlying claim true if the source itself is unreliable — this is a distinct failure mode from fabrication, and citation-verification alone won't catch it since the excerpt genuinely does say what's claimed. Mitigate with a source-quality signal fed into ranking/selection (domain reputation heuristics, or a maintained allow/deny list for known low-quality domains), and by having the synthesis step prefer corroboration from multiple independent higher-quality sources over a single low-quality one for any claim that's contestable or consequential.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">MID</span>Q37. How do you handle multiple sources supporting the same claim — cite one, or all of them?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Cite the strongest one or two (by authority/recency) rather than every source that happens to agree — a wall of redundant citations doesn't add verifiability, it adds noise. The exception is when corroboration itself is the point being communicated (a contested or surprising claim), where explicitly noting "multiple independent sources confirm X" with two or three citations is informative rather than redundant.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">STAFF</span>Q38. Design an automated evaluation that scores citation precision and recall for generated research reports.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at senior/staff level</p>
+<div class="answer">
+<p>Precision: for every claim-citation pair in the report, verify (via the automated entailment check from Q33) whether the cited excerpt actually supports the claim — precision is the fraction that pass. Recall is harder since there's no single ground truth, but a workable proxy is: for a curated golden set of research questions with known key facts, check whether those key facts appear in the generated report with a valid citation, and measure what fraction do. Track both over time per model/prompt version, and treat precision as the harder gate (a hallucinated citation is worse than an incomplete report) — a reasonable policy is to block a release on precision regressions but treat recall regressions as a quality-improvement backlog item rather than a launch blocker.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">SENIOR</span>Q39. How do you prevent a model from fabricating a plausible-looking URL or citation that was never actually retrieved?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Structurally, not just through prompting: citations should only ever be populated from the tool-call results the system actually recorded (the structured findings pipeline from Q31), never generated as free text by an LLM call — if the synthesis or report-writing step is only ever selecting from a fixed set of pre-recorded, tool-retrieved sources rather than writing URLs itself, fabrication becomes structurally impossible rather than merely discouraged. Any code path that lets a model free-type a citation string is the actual root cause of fabricated-citation incidents, and should be treated as a bug, not a prompting problem to iterate on.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">SENIOR</span>Q40. What's your policy when no source can be found for a claim the user clearly wants an answer to?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Say so explicitly in the report rather than either omitting the topic silently or filling the gap with an uncited, model-generated answer — both alternatives erode trust, the first by seeming incomplete without explanation and the second by violating the product's core verifiability promise. "Available public sources did not address X as of this research" is a legitimate and honest output, and the synthesis prompt should treat it as an acceptable answer, not a failure to be papered over.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">SENIOR</span>Q41. How should the system handle two credible sources that directly contradict each other on a factual point?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The report should surface the disagreement rather than silently picking one side — something like "sources disagree on X: [source A] reports Y, while [source B] reports Z" — because presenting one figure as settled fact when it's actually contested is a subtler but real form of misleading the user. The synthesis prompt needs an explicit instruction for this case, since a model left to its own devices under pressure to sound authoritative will tend to just pick whichever claim it saw more often or last, rather than flagging genuine disagreement.</p>
+</div>
+
+<div class="question" id="q42"><span class="level">SENIOR</span>Q42. How do you detect contradiction across subagent findings before the synthesis step runs?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A lightweight pre-synthesis pass can group findings by sub-topic/entity and flag pairs that make incompatible factual assertions about the same thing (different numbers for the same statistic, opposite claims about the same event) — this can be a rule-based numeric/entity check for simple cases, or a dedicated model call for more nuanced contradictions. Flagging contradictions as structured metadata before synthesis, rather than expecting the single synthesis call to notice and handle them inline, produces more reliable handling than hoping one large prompt does everything at once.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. Should the final report ever present unresolved disagreement to the user rather than picking a "winner" between conflicting sources?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Yes, whenever the disagreement isn't resolvable from the retrieved evidence itself — forcing a false resolution when the underlying sources genuinely disagree produces a confidently wrong-sounding report. The exception is when one source is clearly more authoritative/recent/primary for the specific fact in question (e.g., an official statistics agency versus a blog repeating an old number), in which case the report can state the authoritative figure while still noting that other sources reported differently.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">SENIOR</span>Q44. How do you weigh source recency and authority when reconciling conflicting claims?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Build explicit signals into the finding metadata (publication/retrieval date, source type — primary/official vs. secondary/aggregator vs. opinion) and give the synthesis prompt a rule of thumb: for facts that can change over time, prefer the more recent source; for facts about an entity's own data or statements, prefer the primary/official source over secondary reporting. This should be a documented heuristic the synthesis prompt applies, not an implicit judgment left entirely to model discretion, both so it's debuggable when the report gets it wrong and so it's consistent across reports.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">SENIOR</span>Q45. How would you handle a case where the user's question rests on a premise that multiple sources indicate is factually wrong?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The report should correct the premise rather than research the wrong question faithfully — e.g., a user asking "why did company X's revenue fall in 2024" when revenue actually rose should get told the premise is incorrect, with the actual figures cited, rather than an agent inventing plausible-sounding explanations for a decline that never happened. This is a case where the lead agent's synthesis step needs explicit permission to override the literal framing of the user's question when the evidence contradicts it, since a research agent overly deferential to the question's framing will otherwise happily fabricate a narrative to match a false premise.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">STAFF</span>Q46. What's the risk of the lead agent silently smoothing over contradictions during synthesis, and how would you catch it in production?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>An LLM optimizing for a fluent, confident-sounding report has a natural incentive to resolve tension between findings into one clean narrative, even when the underlying evidence doesn't actually support a single resolved answer — this is a subtle failure because the output reads as high-quality while quietly discarding real uncertainty the user should know about. Catch it with an automated check that compares the set of distinct claims in the pre-synthesis findings against the final report for a sample of contested topics, flagging cases where multiple incompatible finding-level claims collapsed into one unqualified report-level claim; this is a good candidate for periodic human spot-review rather than a fully automatable check, since judging "was this smoothing legitimate consensus-building or illegitimate erasure of real disagreement" is itself nuanced.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">JUNIOR</span>Q47. Why is progress streaming particularly important for a deep-research product, more so than for a typical single-turn chat response?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>A research job can take minutes rather than seconds, and a blank loading state for that long reads as broken or hung, driving users to abandon the request. Streaming what the system is actually doing (which sub-topics it's researching, what it's found so far) converts idle waiting into a sense of visible progress and gives the user confidence the system understood their question correctly early, rather than discovering a misinterpretation only after the full wait.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">MID</span>Q48. What events should stream to the client during a research job, end to end?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<ul>
+<li>Plan created: the decomposed sub-tasks, so the user sees what will be researched.</li>
+<li>Per-subagent status transitions: started, key intermediate actions (searching for..., reading...), completed/failed.</li>
+<li>A running count or preview of findings discovered, if the UX wants finer granularity than a status label.</li>
+<li>Synthesis started, then the final report — ideally token-streamed like a normal chat response once synthesis begins.</li>
+</ul>
+<p>These events are typically delivered over a persistent connection (SSE or WebSocket) tied to the job ID, decoupled from the underlying orchestration so a client can disconnect and reconnect mid-job without losing state, since the job state itself lives in the durable store described in Q20, not in the connection.</p>
+</div>
+
+<div class="question" id="q49"><span class="level">MID</span>Q49. How do you show parallel subagent progress to a user without overwhelming them with detail?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Default to a summarized view — a short label per sub-task ("researching regulatory approach in the EU... done") rather than streaming every individual tool call — with an optional expandable "show details" affordance for users who want the raw trace of searches and fetches. The right default granularity is the level that answers "is this making progress on what I asked" without requiring the user to parse agent-internal mechanics they didn't ask to see.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">SENIOR</span>Q50. How would you handle a user who wants to cancel a research job mid-flight?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Cancellation needs to propagate down through the whole task graph, not just stop streaming to the client — in-flight subagent LLM calls and tool calls should be aborted (or at minimum, their results discarded and billing stopped) rather than left running to completion wastefully in the background after the user has walked away. This means every layer (orchestrator, subagent runtime, tool-call layer) needs to check a cancellation flag tied to the job ID, which is an argument for building job cancellation into the orchestration framework from the start rather than retrofitting it later.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">MID</span>Q51. What's the tradeoff between streaming granular subagent tool calls versus higher-level status summaries?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Granular streaming (every search query, every URL fetched) is maximally transparent and great for debugging/power users, but is noisy for a typical consumer who just wants reassurance that progress is happening — it also couples the UI tightly to internal agent implementation details, making it harder to change subagent internals later without breaking the UI contract. Higher-level status summaries are cleaner UX and a more stable interface, at the cost of hiding detail a curious or skeptical user might want. Many products default to summaries with an opt-in detailed trace, which serves both audiences without picking one at the expense of the other.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">SENIOR</span>Q52. How do you keep the UI responsive and informative if the orchestrator is blocked waiting on one unusually slow subagent?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Stream per-subagent status independently rather than only emitting a single job-level status, so the client can show "4 of 5 topics complete, still researching: X" instead of an undifferentiated "researching..." that gives no signal about which part is slow. Combined with the per-subagent timeout from the failure-handling design (Q5), this also gives the UI a natural moment to communicate "this part is taking longer than expected" rather than leaving the user guessing whether the whole job has stalled.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">STAFF</span>Q53. Should users be able to steer research mid-flight — e.g., tell the system to drop or add a research angle while subagents are still running?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>It's a genuine UX enhancement but adds real orchestration complexity: the system needs to accept a mid-job instruction, map it onto the live task graph (cancel a running sub-task, or dispatch a new one), and handle the case where the instruction arrives after synthesis has already started. A pragmatic staged approach is to first ship read-only visibility into the plan with cancellation of the whole job as the only control, then add "drop this angle" as a lower-risk steering primitive (it only ever removes work), before attempting "add this angle" (which requires safely injecting new work into an in-flight job) — since the failure modes of adding scope mid-flight are more complex than removing it.</p>
+</div>
+
+<div class="question" id="q54"><span class="level">MID</span>Q54. How would you design the UI to distinguish "found nothing on this sub-topic" from "still looking"?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>These need genuinely distinct status states in the streamed event model, not just an absence of updates that the client has to interpret — "still researching" should keep showing an active/in-progress indicator, while a completed sub-task that came back empty should transition to an explicit "no results found" terminal state. Conflating them (e.g., both just going quiet) leaves the user unable to tell a slow-but-working system apart from one that silently failed to find anything, which is exactly the ambiguity that erodes trust in a long-running background process.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">MID</span>Q55. Why should the final report stream token-by-token even though the research phase before it already took minutes?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>By the time synthesis starts, the user has typically already waited through the longer research phase, so an additional silent pause while the full report generates (which can itself take tens of seconds for a long report) feels disproportionately bad relative to its actual duration — token streaming during synthesis keeps the experience feeling continuously alive rather than introducing one more unexplained wait right at the end. It's a small implementation detail but disproportionately affects perceived quality for this product's characteristic long-running flow.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">SENIOR</span>Q56. How do you handle a client that disconnects and reconnects in the middle of a multi-minute research job?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The job must continue running server-side independent of any particular client connection — orchestration state lives in the durable job store (Q20), not in the streaming connection itself — and on reconnect, the client should be able to fetch the current job state (plan, completed sub-tasks, partial findings) and resume the event stream from wherever it left off, rather than the job restarting or the user losing all visibility into work already done. This is a strong argument for treating the research job as a durable, resumable server-side entity from day one rather than something coupled to a single request/response or WebSocket lifecycle.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">MID</span>Q57. How do you set a token/cost budget for an entire research job upfront?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Budget as a function of the plan's shape, not a flat number per job: estimate cost from the number of sub-tasks the planner produced times a per-subagent budget (system prompt + tool-call allowance + expected findings size), plus a fixed cost for planning and synthesis. Set this as a hard ceiling the orchestrator enforces during dispatch (e.g., capping subagent count if the plan would exceed budget), and expose the estimate to product/pricing decisions, since it's the direct lever for a tiered product (e.g., "quick" vs. "deep" research modes mapping to different subagent-count/budget ceilings).</p>
+</div>
+
+<div class="question" id="q58"><span class="level">SENIOR</span>Q58. What's your strategy when a research job is trending over budget mid-execution?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Track cumulative spend against budget as subagents complete, and when a threshold is crossed (e.g., 80% of budget with sub-tasks still pending), degrade gracefully rather than failing hard: skip lower-priority remaining sub-tasks, cap remaining subagents to a smaller tool-call allowance, or move straight to synthesis with whatever's been gathered — and always disclose the degradation in the report ("research on X was limited due to time/scope constraints") rather than silently producing a thinner report than the plan promised.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. How do you decide which model tier (larger/more capable vs. smaller/cheaper) to use for which role in the system?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Match model capability to the reasoning difficulty of the role, not uniformly to the most capable model everywhere: the lead agent's planning and synthesis steps benefit most from a strong model since decomposition quality and coherent, well-hedged writing are hard to get right and directly determine report quality, while individual subagents doing search-and-extract work over retrieved text are often well served by a smaller/cheaper/faster model, since the task per subagent is narrower and there are many of them running in parallel — the cost multiplier from Q3 makes subagent-tier model choice the highest-leverage cost lever in the whole system.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">SENIOR</span>Q60. How would you cache across research jobs to reduce redundant cost?
+</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Cache at the tool-call layer, not the report layer — search results and fetched-page content for a given query/URL are reusable across unrelated jobs and users within a reasonable freshness window (e.g., minutes to hours depending on how time-sensitive the domain is), which can meaningfully cut redundant search/fetch cost and latency for popular or overlapping topics. Caching whole reports is far riskier since it reintroduces staleness risk for a product whose value proposition is current, verified information — cache the expensive raw ingredients, not the finished synthesis.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">MID</span>Q61. What's the latency budget breakdown for a target 5-minute research job across planning, dispatch, research, and synthesis?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Roughly: planning/decomposition should be fast (seconds, a single small-to-medium LLM call), research is the dominant cost since it's bounded by the slowest subagent's search-fetch-reason loop across however many tool-call rounds it needs (this is where parallelism matters most — five subagents running for two minutes each in parallel costs two minutes wall-clock, not ten), and synthesis is a single call whose latency scales with total findings volume and target report length. The overall SLA is therefore mostly a function of per-subagent tool-call ceiling and round-trip latency to search/fetch providers, which is why bounding subagent tool-call budgets (Q24) is as much a latency lever as a cost lever.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. How do you parallelize research without overwhelming downstream rate limits on search/fetch providers?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>This is the same shared rate-limiting/queueing layer from Q28 viewed from the capacity-planning side: cap the effective concurrency of outbound search/fetch calls system-wide (not just per job), so that a single job with many subagents, or many concurrent jobs, can't individually or collectively exceed provider limits. When the queue backs up, subagents should experience it as added latency on individual tool calls rather than errors, with the per-subagent tool-call budget and overall job SLA absorbing that added latency gracefully rather than the system failing outright under load.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">MID</span>Q63. Would you ever short-circuit a research job early if partial results already answer the query well?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes, for narrow factual questions that got decomposed more broadly than necessary — if an early-completing subagent's finding directly and completely answers the user's question, it's wasteful to wait out the full budget on other sub-tasks that turn out to be less relevant. This requires a cheap "does this already answer the question" check after each sub-task completes, which is a genuine engineering investment (false positives cut research short prematurely) — a reasonable middle ground is only short-circuiting for the narrow-query case identified at planning time (Q9), where the plan itself signals low expected complexity, rather than attempting it universally.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">STAFF</span>Q64. How do you handle cost attribution and billing to an end user or customer for a research job with inherently variable cost?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Variable actual cost per job makes flat per-query pricing risky at the margins (a broad five-subagent job costs meaningfully more than a narrow single-lookup one), so common approaches are either tiered product modes with fixed subagent-count/budget ceilings per tier (predictable pricing, bounded cost per tier) or metered usage billing tied to actual token/tool-call consumption for enterprise customers who want to pay for what they use. Either way, the budget-tracking infrastructure from Q57 needs to double as the metering source of truth, so cost attribution isn't a separate system that can drift from what actually happened during the job.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. What's the risk of prompt and tool-schema overhead multiplying across many subagents, and how do you mitigate it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Every subagent pays its full system prompt and tool-schema token cost on its first call regardless of how small its actual sub-task is, so for a job with many narrow sub-tasks, fixed per-subagent overhead can become a larger fraction of total cost than the actual research content — this is the concrete mechanism behind the "n times the overhead" cost multiplier from Q3. Mitigate by keeping subagent system prompts and tool schemas as lean as possible (only the tools that role actually needs), by using prompt caching for the shared static portion of the subagent prompt across the parallel fan-out, and by not over-decomposing simple queries into more subagents than the question actually needs (Q9, Q13).</p>
+</div>
+
+<div class="question" id="q66"><span class="level">STAFF</span>Q66. How would you define SLOs for this product, and what would you actually measure to track them?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<ul>
+<li>Latency: end-to-end job completion time (p50/p95), and time-to-first-plan-shown (matters more for perceived responsiveness than total time).</li>
+<li>Quality: citation precision from the automated verifier (Q33), and periodic human/LLM-judge scores on a rubric (Q72).</li>
+<li>Reliability: job failure/timeout rate, and rate of jobs that degrade gracefully under budget pressure (Q58) versus fail outright.</li>
+<li>Cost: actual spend per job versus estimated budget, tracked for drift.</li>
+</ul>
+<p>The distinguishing point for this product versus a typical API SLO set is that quality can't be reduced to a single latency/error-rate pair — citation precision specifically needs to be a tracked, alertable SLO in its own right, since it's the metric most directly tied to whether users can trust the product's core promise.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">MID</span>Q67. How do you deduplicate near-identical findings that different subagents phrase differently?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Exact-string matching won't catch paraphrased duplicates, so this needs semantic comparison — either embedding-similarity clustering of findings' claim text above a threshold, or a dedicated LLM pass over the pooled findings that groups semantically equivalent claims before synthesis. The key is doing this as an explicit pre-synthesis step with visible output (a deduped, clustered finding set) rather than hoping the single synthesis call implicitly notices and merges duplicates while also handling everything else — an explicit step is both more reliable and separately debuggable.</p>
+</div>
+
+<div class="question" id="q68"><span class="level">MID</span>Q68. Should deduplication happen before synthesis as a separate pass, or be handled implicitly during the synthesis call itself?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>As a separate, explicit pass before synthesis, for the same reason structured findings exist at all: giving the synthesis call one clear job (write a coherent report from a clean, deduplicated, thematically-clustered finding set) produces more reliable output than giving it three jobs at once (deduplicate, resolve contradictions, and write well) inside a single prompt. Separating these concerns also makes each one independently testable — you can evaluate deduplication quality and synthesis quality as distinct metrics rather than only being able to judge the combined end-to-end output.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. How do you avoid over-counting corroboration when multiple subagents happen to cite the exact same underlying source?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Track the underlying source URL/locator, not just the claim text, when deduplicating and when the synthesis step reasons about how well-corroborated a claim is — three subagents independently finding and citing the same single article is one source's worth of evidence, not three, and a synthesis prompt that (or a downstream reader who) treats it as three independent confirmations is being misled about actual evidentiary strength. This matters specifically because parallel subagents with overlapping search queries commonly do converge on the same popular source, so this isn't an edge case to dismiss.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">MID</span>Q70. Give an approach for clustering findings by sub-topic before writing the final report.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Simplest approach: since the original decomposition already assigned each finding to a sub-task with a known topic, group by originating sub-task as a first pass — this is cheap and usually reasonably coherent. Where findings within a sub-task still span meaningfully distinct themes, or where the report's ideal structure cuts across the original sub-task boundaries (common when decomposition was source-oriented but the report should be theme-oriented), an embedding-based or LLM-driven clustering pass over the finding set produces a better report structure than assuming sub-task boundaries equal ideal report sections.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. Why can't you use exact-match, ROUGE, or BLEU-style metrics to evaluate a generated research report?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>These metrics assume there's a single correct reference text to compare against and reward surface-level lexical overlap with it — neither holds for an open-ended research report, where many differently-worded reports can be equally correct and comprehensive, and where the properties that actually matter (citation accuracy, completeness of coverage, appropriate handling of contradiction) aren't measurable by n-gram overlap at all. This product's evaluation needs to be rubric- and claim-level (does each assertion hold up, is coverage adequate), not reference-text-similarity based — closer to how the Evaluation chapters approach open-ended LLM output generally, applied specifically to citation and coverage properties here.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">SENIOR</span>Q72. What would an LLM-as-judge rubric for scoring a research report look like?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<ul>
+<li>Citation accuracy: does each cited claim hold up against its source (can reuse the automated verifier from Q33 as one rubric dimension).</li>
+<li>Coverage/completeness: does the report address the key facets a good answer to this question should cover.</li>
+<li>Handling of uncertainty: does it appropriately flag gaps and contradictions rather than papering over them (Q41, Q46).</li>
+<li>Coherence/readability: is it organized around the question rather than reading as concatenated fragments (Q17).</li>
+<li>Faithfulness to scope: does it avoid drifting into unrequested tangents or omitting clearly relevant, requested facets.</li>
+</ul>
+<p>Score each dimension separately rather than one overall number, since a report can be well-written but citation-unreliable, or perfectly cited but incomplete — a single blended score would hide which specific failure mode to fix.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">STAFF</span>Q73. How would you build a golden evaluation set for this product given that "correct" research answers are open-ended, not single ground-truth strings?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Instead of a single reference answer per question, curate a small set of key facts/claims each golden question's answer should cover (derived by a human researcher actually researching the question well), plus known-tricky properties to test for (a question with genuinely contradictory sources, a question with a false premise, a question where good sources are scarce). Score generated reports against that fact checklist (did it surface each key fact, with a valid citation) rather than against reference-text similarity, and deliberately include the tricky cases in the golden set specifically because they're the ones default synthesis behavior tends to get wrong (Q41, Q45, Q46) — a golden set of only easy, well-covered questions won't catch the failure modes that matter most for this product.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">MID</span>Q74. How do you detect regressions in report quality when you change the orchestrator's decomposition or synthesis prompt?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Run both prompt versions against the same golden question set and same (or matched) retrieved evidence where possible, then compare on the rubric dimensions from Q72 plus the citation-precision metric from Q33 — the "same retrieved evidence" control matters because without it, a quality difference could come from search results varying between runs rather than from the prompt change itself, which is a common false signal in ad hoc before/after comparisons. Treat this as a required gate before shipping orchestrator/synthesis prompt changes, the same way you'd gate a model or retrieval change in a RAG system.</p>
+</div>
+
+<div class="question" id="q75"><span class="level">SENIOR</span>Q75. What human-evaluation process would you run before shipping a change to the orchestrator's core prompts?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Automated rubric/LLM-judge scoring should be the first, cheap filter run on every change, but a sample of reports (weighted toward the tricky golden-set cases — contradiction, false premise, sparse sources) should get human review before a prompt change touching synthesis or citation handling ships, since these are exactly the judgment calls (was smoothing over disagreement appropriate, was a premise correction handled gracefully) that automated judges are least reliable at scoring. Track inter-rater agreement on this human review over time — if it's low, the rubric itself needs tightening before the review process is trustworthy.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">SENIOR</span>Q76. How would you measure "completeness" of a research report given there's no single ground truth for what a complete answer looks like?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Approximate it with the golden-set key-facts-checklist approach from Q73 for a fixed evaluation set, and for production monitoring at scale (where you can't hand-curate a checklist per live query), use an LLM-judge prompted specifically to identify facets of the user's actual question that the report doesn't address, given the question and report alone — this catches a report that answered a narrower question than what was actually asked, which is the most common practical form completeness failures take, even without a true reference answer to compare against.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">MID</span>Q77. What automated checks would you run on every generated report before showing it to a user, as opposed to periodic offline evaluation?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Anything cheap enough to run inline without materially adding latency: a citation-format check (every claim has a resolvable citation, no dangling or malformed ones), a check that every cited URL actually corresponds to a source the system retrieved during this job (catching the fabrication failure mode structurally, per Q39), and possibly a lightweight version of the entailment check from Q33 on a sample of claims if latency allows. Full rubric scoring and human review are too slow/expensive to run synchronously per-report and belong in the offline evaluation pipeline instead — the online checks are a cheap safety net, not a replacement for the deeper offline evaluation.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">MID</span>Q78. How should a subagent handle hitting a paywalled article mid-research?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Treat it as a normal, expected outcome rather than an error: record that the source exists and appeared relevant based on its snippet/headline, but that its full content wasn't accessible, and move on to other sources rather than getting stuck retrying or waiting. Critically, the subagent must not cite a specific claim as coming from a paywalled article based only on the snippet — per Q27, an unfetched source can't support a specific asserted claim, so a paywall effectively removes that source from the citable evidence pool for this job even though it may be mentioned as "further reading not accessible."</p>
+</div>
+
+<div class="question" id="q79"><span class="level">MID</span>Q79. What do you do when a source that looks highly relevant can't be fetched at all — robots.txt disallow, geo-block, bot detection?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Respect the block (don't attempt to circumvent robots.txt or bot detection — this is both a legal/ethical line and a reliability one, since attempts to work around it are fragile and create operational risk) and fall back to the next-best accessible source instead. If no accessible source adequately covers that specific point, this becomes a legitimate coverage gap the report should disclose (Q40) rather than something to route around by any means available.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">SENIOR</span>Q80. Should the report ever cite a source it could not actually access, based only on search-result snippet text?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High</p>
+<div class="answer">
+<p>No — this is a direct violation of the traceability guarantee (Q27, Q31), even though it's tempting when a snippet strongly implies a specific fact and fetching failed. The correct handling is to either find the same fact corroborated by an accessible source, or omit the specific claim while optionally still mentioning the inaccessible source's existence in a non-cited "for further reading" note — never attach a specific citation marker to content the system never actually read in full, since that's indistinguishable from fabrication from the user's perspective if the underlying page turns out not to say what the snippet implied.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">MID</span>Q81. How do you handle sources requiring login/authentication that the system doesn't have credentials for?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Functionally the same handling as a paywall (Q78) — treat the fetch as inaccessible, don't attempt credential workarounds, and let the subagent continue with accessible alternatives. The one addition worth building for enterprise/internal-document use cases is that if the product legitimately has been granted the user's own credentials or access scope to a specific system (e.g., a connected internal wiki), that's a distinct, deliberately-provisioned access path — not something a general web-research subagent should ever attempt on its own initiative against arbitrary public sites.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">STAFF</span>Q82. Design a deep-research product end to end: sketch the architecture from a user's query to a final cited report.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior/staff level</p>
+<div class="answer">
+<p>At a high level: (1) intake — receive the query, optionally resolve ambiguity (Q11), create a job record in durable storage; (2) planning — a lead agent decomposes the query into a bounded, sized set of independent (or DAG-dependent, per Q15) sub-tasks, sized against the job's cost/latency budget; (3) dispatch — subagents run in parallel (respecting shared rate limits, Q28/Q62), each equipped with search/fetch tools, each producing structured, cited findings (Q31), with per-subagent timeouts and graceful degradation on failure (Q5); (4) aggregation — deduplicate and cluster findings across subagents (Q67, Q70), detect contradictions (Q42); (5) synthesis — a single lead-agent call (or staged for very large jobs, Q19) produces the final report from the clean finding set, citing only what findings support; (6) verification — an automated citation-precision check runs before or alongside delivery (Q33, Q77); (7) delivery — the report streams to the client, with progress events streamed throughout steps 2-5 (Q48). Cross-cutting: a durable job store backing steps 1-7 for resumability, and a budget tracker enforcing cost/latency ceilings throughout.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">STAFF</span>Q83. How would you hit a 5-minute SLA target for typical queries while keeping cost bounded?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Latency and cost pull in the same direction here more than they trade off: bounding subagent count and per-subagent tool-call ceilings (Q13, Q24) caps both the wall-clock time of the slowest parallel branch and total token spend simultaneously, and using a cheaper/faster model tier for subagents (Q59) helps both dimensions too. Where they do trade off is model quality for planning/synthesis (a stronger, slightly slower model there improves report quality) — this is a smaller latency cost than the research phase, so it's usually worth paying for. The 5-minute figure should be validated against the realistic p95 case (an unusually broad query with a slow subagent or two, Q52), not just the median case, with graceful degradation (Q58) as the safety valve when a specific job would otherwise blow the SLA.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">SENIOR</span>Q84. Walk through what happens, system-wide, from the moment a user submits a research query to seeing the final report.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Query received and a job record created; the client opens a streaming connection keyed to the job ID; the lead agent plans and the plan streams to the client; subagents dispatch in parallel behind a shared rate limiter, each streaming coarse-grained status while running its own search-fetch-reason loop and emitting structured findings on completion (or a failure/timeout status); once all sub-tasks resolve (or budget/timeout forces early stop), findings are deduplicated and contradiction-checked; the lead agent synthesizes a report from the clean finding set, token-streaming it to the client as it's generated; an automated citation check runs and, depending on the product's policy, either gates delivery or runs as a background quality signal; the completed report and its citation metadata persist to the job record so the user can revisit or the team can audit it later.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">STAFF</span>Q85. How would you version and roll out changes to the orchestrator's decomposition or synthesis prompts safely?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Treat prompt changes with the same rigor as a code deploy: version the prompts explicitly, run the offline golden-set evaluation (Q73, Q74) as a required gate, then roll out via canary/percentage-based traffic split rather than a hard cutover, comparing the automated quality metrics (citation precision, rubric scores) between old and new versions on live traffic before ramping to 100%. Log which prompt version produced each report in the job record, so a quality regression noticed after rollout can be traced back to a specific version and rolled back cleanly, and so any A/B comparison has clean attribution.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">SENIOR</span>Q86. How would you support a "follow-up question" on an already-completed research report without re-running the entire research job?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Classify the follow-up first: if it's answerable from findings already gathered in the original job (the full finding set, not just what made it into the final report, should be retained), answer directly from that existing evidence with no new research needed — cheap and fast. If it asks about something genuinely outside the original job's scope, it needs its own smaller research pass (potentially just one or two new subagents rather than a full new decomposition), which can reuse the original job's context as background. This is a strong argument for retaining the full finding set (not discarding what didn't make the final report) as part of the job record, since it directly enables cheap follow-ups.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">STAFF</span>Q87. What observability would you build specifically for this product, beyond generic LLM-application observability (traces, token counts, latency)?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<ul>
+<li>Citation precision/recall as a continuously tracked, alertable metric (Q33, Q38), not just spot-checked.</li>
+<li>Task-graph-level tracing: which sub-task produced which finding, which finding fed which report claim — full lineage from final claim back to the original source, so a bad report is debuggable to its root cause rather than only visible as a bad final output.</li>
+<li>Degradation-rate tracking: how often jobs hit budget/timeout limits and degrade (Q58), as a leading indicator of the budget being miscalibrated against real query complexity.</li>
+<li>Contradiction/gap disclosure rate: how often reports flag disagreement or missing information, which is a healthy signal, not a failure metric, and worth watching for the opposite anomaly — a sudden drop, suggesting synthesis has started silently smoothing over genuine uncertainty (Q46).</li>
+</ul>
+<p>The unifying theme is that generic LLM observability tells you the system is running; this product specifically needs observability that tells you whether its verifiability promise is holding.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">SENIOR</span>Q88. How would you test this system end-to-end given that both the research content and the model's output are non-deterministic?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Separate what needs to be deterministic from what doesn't: orchestration mechanics (task-graph construction, budget enforcement, timeout/failure handling, citation-structure validity) should be unit- and integration-testable deterministically using mocked search/fetch tools with fixed canned responses, independent of any live model call. Actual output quality (does the report read well, are citations accurate) can't be asserted with exact-match tests and instead relies on the golden-set rubric evaluation (Q73) run regularly, with acceptable-range thresholds rather than exact expected outputs. Mixing these two — trying to assert exact report text in a unit test, or trying to unit-test orchestration logic only through slow live-model runs — produces either flaky tests or slow, expensive ones; keeping them separate keeps both fast and meaningful.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">STAFF</span>Q89. What's your incident-response plan if the system starts producing reports with fabricated citations in production?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>This is a trust-critical incident, not an ordinary quality bug — treat it with a severity matching a correctness/safety incident. Immediate: check whether the citation-verification metric (Q33) shows a step-change, correlate against recent deploys (prompt, model, or tool-layer changes) using the version logging from Q85, and if a specific recent change correlates, roll it back rather than attempting a forward-fix under pressure. Structurally, this is also the moment to double check that citations are actually constrained to only ever be selected from tool-retrieved results (Q39) rather than free-generated — if fabrication is occurring despite that structural constraint, that itself is a more serious finding (a bypass or bug in the constraint) than a normal prompt-quality regression, and warrants pausing the affected code path rather than only tuning prompts.</p>
+</div>
+
+<div class="question" id="q90"><span class="level">STAFF</span>Q90. How would you scale this system from handling 10 concurrent research jobs to 10,000?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>The bottlenecks shift as scale grows: at low scale, per-job orchestration logic and model API latency dominate; at high scale, shared external dependencies become the constraint — search/fetch provider rate limits (Q28, Q62) become a hard ceiling requiring either provider-side capacity negotiation or a multi-provider fallback strategy, the durable job store needs to handle high write throughput for streaming status updates without becoming a bottleneck itself, and the orchestrator/subagent compute layer needs to scale horizontally (stateless workers pulling from a job queue, with all actual state in the durable store, not in worker process memory) rather than assuming a single orchestrator process per job. Caching shared search/fetch results across jobs (Q60) also becomes proportionally more valuable at scale, since popular topics get researched redundantly by many concurrent users.</p>
+</div>
+
+<div class="question" id="q91"><span class="level">STAFF</span>Q91. If forced to cut this system's cost by 50% while preserving as much quality as possible, what would you cut first?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>In rough order: first, tighten subagent model tier and per-subagent tool-call ceilings (Q59, Q24) — this is usually the single largest cost lever with the least quality impact, since subagent search-and-extract work tolerates a cheaper model better than planning/synthesis does. Second, invest in cross-job caching of search/fetch results (Q60), which reduces cost without touching output quality at all for repeated/overlapping topics. Third, tighten the query-complexity classifier (Q9) so simple queries reliably skip full decomposition rather than defaulting to it. What to protect last: synthesis-step model quality and the citation-verification pass — these most directly determine whether reports read well and whether the fabrication-prevention guarantee holds, and degrading them saves comparatively little (they're a small fraction of total per-job cost, per Q3) while risking the product's core trust proposition.</p>
+</div>
+
 </div>
 
 <hr>

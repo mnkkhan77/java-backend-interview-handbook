@@ -672,6 +672,533 @@ Unlike some topics in this volume, metadata filtering has an unusually large and
 <p>Start by over-provisioning the metadata schema relative to immediate needs — capture tenancy, access level, document type, source system, and timestamps at ingestion even if early filters only use one or two of them, because retrofitting metadata onto an already-embedded corpus is expensive. As tenant count and corpus heterogeneity grow, measure real filter selectivity in production and migrate hot, highly selective filter dimensions (especially tenancy) toward index-per-tenant or filtered-ANN-capable stores rather than continuing to rely on post-filtering, which degrades exactly as scale increases. Centralize predicate-building in one reusable component (an Advisor or dedicated retrieval service) so that access-control logic is defined once and audited once, not reimplemented per feature team as the number of RAG-powered features grows. Finally, treat metadata schema changes as governed, versioned changes — since multiple teams will eventually depend on specific field names and semantics — with a deprecation path for renamed or restructured fields rather than silent breaking changes that cause other teams' filters to start silently matching nothing.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. What is an inverted index, and why does a vector store typically need one alongside the vector index to support metadata filtering?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>An inverted index maps a field value (e.g., <code>doc_type = "runbook"</code>) to the set of vector IDs having that value, the same structure text search engines use to map a term to the documents containing it. Vector stores maintain one of these (or a similar B-tree-like structure) per filterable metadata field because the vector index itself — an HNSW graph or IVF cluster list — is organized purely around vector-space geometry and has no efficient way to answer "which vectors have tenant_id = X" on its own.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. List the metadata fields you would typically attach to a document chunk in an enterprise RAG system, and briefly say what each is for.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>Common fields: <code>tenant_id</code> (multi-tenant isolation), <code>access_level</code> (authorization), <code>doc_type</code> (taxonomy, e.g., runbook vs. policy), <code>publish_date</code>/<code>expiry_date</code> (recency and validity windows), <code>source_system</code> (provenance, e.g., Confluence vs. Jira), <code>language</code> (locale filtering), and often a <code>document_id</code>/<code>chunk_index</code> pair for deduplication and citation. Which subset you need depends entirely on your domain, but tenancy and access level are almost always mandatory, not optional.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">JUNIOR</span>Q11. What's the difference between a categorical filter and a range filter? Give one example of each.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A categorical filter matches discrete, exact values from a fixed or open set — e.g., <code>doc_type = "runbook"</code> or <code>language IN ("en", "fr")</code>. A range filter matches a continuous or ordered field against a lower and/or upper bound — e.g., <code>publish_date >= "2025-01-01"</code>. Categorical filters are typically cheaper to index (a straightforward inverted index), while range filters usually need a sorted structure like a B-tree to answer "everything above this threshold" efficiently.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. Why can't you usually add a brand-new filterable metadata field to a vector store the same way you'd add a nullable column to a SQL table?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Most vector stores treat metadata as an opaque payload attached per vector at upsert time rather than as a first-class relational schema, so a "new column" often means re-upserting every existing vector's metadata (or the vector itself) to populate the new field, plus building a fresh auxiliary index for it. In a relational database, `ALTER TABLE ... ADD COLUMN` with a default is close to free; the vector-store equivalent can mean touching every row in the corpus.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">MID</span>Q13. How does an "access_level IN (...)" filter typically get combined with tenant filtering in a real query?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p>They're AND-ed together as two separate mandatory clauses of the same base predicate: <code>tenant_id = caller_tenant AND access_level IN (roles_the_caller_holds)</code>. Tenant scoping answers "whose data is this," while access level answers "is this caller's role high enough to see it" — they're independent axes, and conflating them into a single field usually produces an explosion of combined enum values that's harder to reason about and audit.</p>
+</div>
+
+<div class="question" id="q14"><span class="level">MID</span>Q14. Why do frameworks like Spring AI introduce a store-agnostic filter expression DSL instead of letting application code write native filter syntax for each vector store?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A native filter syntax (a Pinecone metadata filter JSON shape, a Qdrant filter payload, a raw SQL <code>WHERE</code> clause) ties your business logic to one vendor's query language, making it expensive to swap vector stores or run against multiple stores in different environments. A store-agnostic expression tree — comparisons, AND/OR/NOT, IN-lists — lets application code build the predicate once and have the framework translate it into whatever native syntax the configured store expects, exactly mirroring how <code>ChatModel</code> abstracts away provider-specific request formats.</p>
+</div>
+
+<div class="question" id="q15"><span class="level">MID</span>Q15. Why can filter negation (a NOT clause) be more expensive to evaluate than an equivalent positive predicate in some vector store implementations?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A positive predicate like <code>doc_type = "runbook"</code> can usually be answered directly from an inverted index by looking up one posting list. A negation like <code>doc_type != "runbook"</code> often can't be answered from the same structure directly — the engine may need to materialize "everything," subtract the matching posting list, or fall back to scanning, none of which is as cheap as a direct index lookup, especially against a high-cardinality field.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Point out the practical workaround: where possible, rephrase a negation as a positive predicate over the complementary set (e.g., <code>access_level IN ("public","internal")</code> instead of <code>access_level != "restricted"</code>) — this is usually both faster and clearer about intent.
+</div>
+
+<div class="question" id="q16"><span class="level">MID</span>Q16. What is a "denormalized" or "materialized" metadata field, and why might you compute one at ingestion time rather than deriving it at query time?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A denormalized field is one you precompute and store directly on the vector's metadata even though it could in principle be derived from other fields or an external lookup — for example, storing a resolved <code>is_expired</code> boolean rather than requiring every query to compare <code>expiry_date</code> against "now," or storing a flattened <code>team_and_product</code> composite key for a filter combination your application issues constantly. You do this because metadata filters are typically limited to simple comparisons the store can index efficiently; precomputing at ingestion trades a small amount of ingestion-time work for cheaper, simpler, and more indexable filters at query time.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">MID</span>Q17. How would you filter on a multi-value field, such as a document tagged with several categories at once?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Most vector stores support an array-typed metadata field with a "contains" or "any of" operator — e.g., <code>categories CONTAINS "billing"</code>, or an IN-style match that succeeds if any element of the stored array matches any element of the query list. Under the hood this is usually implemented the same way a multi-valued inverted index handles a document with several terms: one posting-list entry per array element, so the vector still surfaces if any one of its tags matches.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">MID</span>Q18. What's the risk of using inconsistent free-text values for a filterable field, such as "Product Team", "product-team", and "ProductTeam" all meaning the same thing?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Metadata filters are almost always exact-match or range comparisons, not fuzzy text matches — so three spellings of the same logical value are three distinct, non-matching filter values as far as the index is concerned. A query filtering for <code>team = "product-team"</code> will silently miss every document ingested with <code>"Product Team"</code>, producing an empty or incomplete result set that looks like a retrieval bug but is really a data-hygiene bug introduced at ingestion time.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">MID</span>Q19. Can combining a similarity-score threshold with a metadata filter cause a query to return zero results even when relevant, in-scope documents exist in the corpus?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Yes. A score threshold and a metadata filter are two independent ways to exclude candidates, and their effects compound: even a correct, non-under-returning filtered search might surface k eligible nearest neighbors whose similarity scores all fall just below your threshold, especially for a selective filter where the "nearest" eligible documents simply aren't that close semantically. This is a common source of confusing empty-result bugs and is worth testing explicitly with realistic threshold values rather than assuming filter correctness alone guarantees non-empty output.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">MID</span>Q20. Why does chunk-level metadata sometimes need to differ from document-level metadata for the same underlying source document?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A single source document is typically split into many chunks (Chapter 15), and while most metadata (tenant, access level, doc type) is inherited unchanged from the parent document, some fields are genuinely chunk-specific — a chunk containing a table might get a <code>content_type = "table"</code> tag a neighboring prose chunk doesn't have, or a chunk within a larger contract might inherit a clause-level sensitivity tag different from the document's overall classification. Designing metadata purely at the document level and assuming uniform inheritance across every chunk can miss these legitimate sub-document distinctions.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">MID</span>Q21. What production signal would tell you that your filtered retrieval strategy is under-returning results for some queries?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Track and alert on the distribution of "results returned vs. k requested" per query, broken down by filter shape or tenant — a healthy system should return close to k results for the overwhelming majority of filtered queries whenever the corpus actually contains that many matches. A rising rate of queries returning far fewer than k, especially concentrated among small tenants or rare filter combinations, is the signature of Section 5.1's post-filtering under-return failure mode showing up in production rather than in theory.</p>
+</div>
+
+<div class="question" id="q22"><span class="level">MID</span>Q22. Why might you store tenant_id as a physical partition/shard key at the storage layer, in addition to having it as a queryable metadata field?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A metadata field lets you filter within a shared index, but a physical partition key routes each tenant's data to its own physical segment or shard entirely, so that a query for tenant A never even scans tenant B's vectors at the storage layer — turning tenancy from "a filter that must be applied correctly every time" into "a routing decision enforced by infrastructure." This trades operational complexity (more shards to manage) for a much stronger isolation guarantee than filtering alone provides, especially valuable when tenancy is your single most security-critical dimension.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Note that this is the same idea as sharding a multi-tenant relational database by tenant_id — physical isolation is a stronger guarantee than logical isolation, at the cost of needing cross-shard fan-out for any genuinely cross-tenant admin query.
+</div>
+
+<div class="question" id="q23"><span class="level">MID</span>Q23. What is "filter pushdown," and why does it matter for combining vector search with structured predicates?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Filter pushdown means evaluating the metadata predicate as early and as close to the storage/index layer as possible — inside the index traversal itself — rather than fetching a broad candidate set into the application layer and filtering there. Pushing the filter down is what makes pre-filtering and filtered-ANN (Section 5) possible at all; without pushdown, every filter degenerates into the naive post-filtering pattern regardless of how the store markets its capabilities.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. How should a system handle a document whose access level changes after it has already been indexed — say, a document gets downgraded from "internal" to "restricted"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The metadata update needs to propagate to the vector store as an in-place metadata upsert (most stores support updating a vector's payload without re-embedding it) so that subsequent filtered queries immediately respect the new access level. This must be treated as part of the same change-management path as the source-of-truth permission change — if the vector store's copy of <code>access_level</code> lags behind the authoritative system, retrieval will keep surfacing content a user is no longer authorized to see, silently, until the vectors are refreshed.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. What is a bitmap (or roaring bitmap) index, and how does it help evaluate a metadata predicate quickly?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A bitmap index represents "which vector IDs satisfy this value" as a bit per vector (1 = matches), and combining two predicates (AND/OR) becomes a fast bitwise operation between two bitmaps rather than a set intersection over arbitrary lists. Roaring bitmaps compress these efficiently for large, sparse ID spaces, which is exactly the shape of a selective filter's matching set — this is one of the concrete data structures underlying "resolve the eligible ID set" in pre-filtering (Section 5.2).</p>
+</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. Why is it good practice to keep the number of distinct filterable fields on a hot query path deliberately small, even if the underlying data model has many attributes?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Every filterable field typically costs its own auxiliary index (memory and ingestion-time maintenance), and combining many predicates in one query (deep AND chains) can itself add per-query evaluation overhead even when each individual field is cheap. Restricting the hot path to a small, well-chosen set of fields — the ones access control and the most common product filters actually need — keeps both index footprint and query latency predictable as the schema grows.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">SENIOR</span>Q27. Why does an IVF (inverted file index) ANN structure interact differently with metadata filters than an HNSW graph does?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>IVF partitions the vector space into clusters (via k-means or similar) and, at query time, only searches the clusters nearest the query vector — this cluster-list structure is comparatively easy to combine with a metadata predicate because you can restrict which vectors within selected clusters are scored, without breaking the coarse routing step. HNSW, by contrast, relies on a single navigable graph whose shortcut edges assume the traversal can hop to any node; restricting eligible nodes mid-traversal can break those shortcuts and force a much less efficient walk, which is why HNSW-based stores need more specialized "filtered ANN" engineering (Section 5.3) to filter well, while IVF-based stores often get reasonable pre-filtering almost for free.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">SENIOR</span>Q28. Your vector store advertises pre-filter support, but you observe latency spikes for certain filter combinations in production. What would you investigate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at senior level</p>
+<div class="answer">
+<p>First, measure actual selectivity for the slow filter combinations — a filter that's cheap in aggregate but occasionally matches a huge eligible set (e.g., "all public documents") can trigger the store's brute-force or large-subset fallback path described in Section 5.2, which is far slower than either a small pre-filtered set or an unfiltered ANN search. Second, check whether the auxiliary metadata index for the fields in that combination actually exists and is being used — a missing or stale index on one of the AND-ed fields can silently force a full metadata scan. Third, look at whether the query is combining several low-selectivity fields whose intersection the engine computes inefficiently (e.g., resolving a huge bitmap per field before intersecting) rather than pushing the combined predicate down as a single evaluation.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Mention correlating the latency spikes with corpus growth over time for that specific filter combination — a filter that was cheap at last year's data volume can silently cross a selectivity threshold as the corpus grows, without any code change to explain the regression.
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. How would you design metadata to support "soft delete" of a document without immediately removing its vector from the index?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Add a boolean <code>deleted</code> (or <code>is_active</code>) field to the metadata schema, set it at soft-delete time via an in-place metadata update, and make it a mandatory part of the base security predicate alongside tenant and access level — every retrieval query implicitly AND-s <code>deleted = false</code>. This lets you defer physical vector removal (batched, off-peak) while guaranteeing soft-deleted content is immediately unretrievable, the same pattern relational systems use for soft-deleted rows.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">MID</span>Q30. Does quantizing vectors (e.g., product quantization or scalar quantization) change how metadata filtering behaves, or are the two concerns independent?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>They're mostly independent — quantization compresses the vector representation to save memory and speed up distance computation, while metadata filtering restricts eligibility, and neither directly depends on the other's implementation. However, they interact indirectly: quantization already introduces some approximation error into distance computation, and if a selective filter also forces a deeper or wider search to find k eligible results (Section 6.2), the combined approximation-plus-filtering effect can compound recall loss more than either would alone, which is worth validating empirically rather than assuming the two error sources are simply additive and small.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">SENIOR</span>Q31. Design a metadata filtering approach for a compliance requirement where certain documents must never be served to a query originating outside a specific geographic region.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Tag every document with a <code>data_residency_region</code> field at ingestion, and derive the caller's authorized region(s) server-side (from the deployment's region, the tenant's contractual residency requirement, or the authenticated user's session) — never from a client-supplied header. Fold this into the mandatory base predicate alongside tenant and access level, so residency becomes an access-control axis exactly like tenancy. For the strictest compliance postures, don't rely on filtering alone within a single global index: physically deploy separate vector store instances per region and route each tenant's ingestion and queries to the instance matching their contractual region, so residency is enforced by infrastructure topology, not only by a predicate that a bug could bypass.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. What does a "point-in-time" or "as-of" retrieval requirement mean, and how would metadata typically support it?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It means a query should retrieve the corpus as it existed at some specified past moment, not the corpus as it exists right now — useful for audits, reproducing a past incident's context, or regulatory reconstructions. Metadata support usually means storing an <code>effective_from</code>/<code>effective_to</code> validity window per chunk version rather than mutating a chunk's content in place, and adding a range filter (<code>effective_from <= as_of_date < effective_to</code>) to the query's predicate — effectively treating document history as append-only, versioned rows rather than overwritten state.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. How would you verify that a given filter predicate is actually being pushed down into index traversal, rather than silently falling back to post-filtering?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>For a relational-backed store like pgvector, use <code>EXPLAIN ANALYZE</code> to see whether the planner used the metadata's B-tree index before or in combination with the vector distance operation, rather than a sequential scan after the fact. For purpose-built vector databases, run a controlled experiment: construct a highly selective filter you know matches very few documents, request a k larger than the true match count, and confirm the store returns exactly the true match count rather than an under-count — a store correctly pushing the filter down will find all of them; one silently post-filtering will often return fewer.</p>
+</div>
+
+<div class="question" id="q34"><span class="level">SENIOR</span>Q34. At a high level, how would you combine metadata filtering with hybrid (sparse+dense) search in a single retrieval call?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Metadata filtering and hybrid search are largely orthogonal and composable: the eligibility predicate is evaluated the same way regardless of whether the underlying candidate scoring is pure dense similarity, pure sparse/BM25-style scoring, or a fused combination of both (Chapter 48's territory). The practical pattern is to apply the filter identically to both the dense and sparse retrieval legs before fusion — e.g., "run filtered dense top-N and filtered sparse top-N, then fuse via reciprocal rank fusion or a learned weighting" — so that eligibility is decided once at the source and never contaminates the relevance-fusion step, mirroring the same "bouncer before judge" separation from Section 4.1.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Flag the failure mode of filtering only one leg (e.g., filtering the dense results but not the sparse ones before fusion) — this reintroduces a partial-leak version of the post-filtering under-return problem, just split across two retrieval paths instead of one.
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. Why should filterable fields be allow-listed rather than accepting an arbitrary filter expression tree constructed directly from client input?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>An arbitrary client-supplied expression tree could reference fields never intended to be user-facing — including the very fields (tenant_id, access_level) that enforce security — and a client crafting a filter like <code>tenant_id = "other-tenant" OR true</code> could otherwise bypass isolation entirely. An allow-list constrains which fields and operators a client may specify at all, so the security-critical fragments of the predicate remain exclusively server-derived and structurally impossible for client input to touch, regardless of how creatively a request is crafted.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">MID</span>Q36. What's a practical difference in how you'd index and query an enum-like field (doc_type) versus a continuous numeric range field (recency)?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>An enum-like field is naturally served by an inverted/hash index — each distinct value maps to a posting list of matching vector IDs, and lookup is O(1)-ish per value. A continuous range field needs a sorted structure (a B-tree or similar) so the engine can efficiently answer "everything above/below/between these bounds" without scanning every distinct value individually; treating a range field as if it were a small enum (indexing each exact timestamp separately) wastes index space and doesn't actually support efficient range queries.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">SENIOR</span>Q37. How do you decide the right granularity for an access_level enum, and what goes wrong if it's too coarse or too fine?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Too coarse (e.g., only "public" vs. "internal") forces every internal document into one bucket regardless of real sensitivity, meaning any authorized internal user sees everything internal — you can't express finer distinctions like "internal, but not this specific sensitive project" without further schema changes. Too fine (a bespoke access level per team, per project, per document) creates an enum that grows unbounded, becomes hard for engineers building new features to reason about, and turns "does this role satisfy this access level" into its own small authorization-mapping problem rather than a simple filter. The right granularity usually mirrors your organization's actual role/permission model one level removed — few enough values that a filter's `IN (...)` list stays small and auditable, granular enough to express the real distinctions your compliance and product requirements actually demand; when finer distinctions are needed, model them as a separate field (e.g., <code>project_id</code>) rather than inflating the access_level enum itself.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. What role can metadata play in deduplicating near-duplicate chunks at retrieval time?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Storing a stable <code>document_id</code> (and sometimes a content checksum) as metadata lets a retrieval service post-process the top-k results and collapse multiple chunks that trace back to the same source document (or byte-identical content re-ingested from two source systems) before they reach the prompt — otherwise near-duplicate chunks can consume multiple context-window slots with redundant information, crowding out genuinely distinct relevant content. This is a light, application-level use of metadata rather than a filter predicate per se, but it depends on the same disciplined metadata capture at ingestion.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">MID</span>Q39. Can metadata filtering help reduce the amount of irrelevant content competing for space in a long context window, and how does that relate to broader retrieval-strategy decisions?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Yes — a well-scoped filter narrows the candidate pool before similarity ranking even runs, meaning the top-k the system retrieves is already restricted to genuinely eligible, on-topic content rather than diluted by irrelevant matches that happen to score well globally. This is a real but partial contribution to overall context quality; how many stages a pipeline should have and how to balance dense/sparse/rerank/context-assembly decisions holistically is the broader question Chapter 51 (Retrieval Strategies) addresses — metadata filtering is one input to that design, not a complete answer by itself.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. What would you monitor to catch a metadata schema drift issue — for example, a new ingestion pipeline accidentally writing "tenantId" instead of "tenant_id"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Track the distribution of metadata field names actually present across recently ingested vectors (a lightweight schema-conformance check run periodically or on every batch ingest) and alert when a new, unexpected field name appears or an expected mandatory field is missing on a nontrivial fraction of new documents. Complementing this, monitor filtered-query result rates per ingestion source — a sudden change in the "results returned vs. k requested" ratio for documents from one particular pipeline is a strong signal that its metadata no longer matches what downstream filters expect.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">SENIOR</span>Q41. What's the trade-off between storing filter values as human-readable strings versus mapping them to internal integer IDs?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>String values are self-describing, easier to debug and log, and require no separate lookup table to interpret — but they cost more memory per vector, are slower to compare and index at very large cardinality, and are more prone to the free-text inconsistency problem (Q18) if not tightly validated. Internal integer IDs are compact and fast to compare/index, but require maintaining a mapping table, add an indirection layer to every debugging session, and risk becoming stale or inconsistent if the mapping table and the vector store's stored IDs ever drift apart. In practice, most teams use readable strings for low-to-moderate cardinality fields (doc_type, language) where readability and low bug-risk matter more, and reserve ID mapping for genuinely huge, high-cardinality dimensions (e.g., millions of tenant IDs) where the storage and comparison savings are material.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Note that whichever you choose, the mapping (or lack of one) must be treated as part of the schema contract — renaming or renumbering values later has the same blast radius as a breaking schema migration.
+</div>
+
+<div class="question" id="q42"><span class="level">SENIOR</span>Q42. How would you approach migrating millions of already-embedded vectors to add a brand-new required metadata field, such as a data-classification tag?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Run the migration as a background batch job that reads each existing vector's ID, resolves the new field's value from the source-of-truth system (or a classifier if the value must be inferred rather than looked up), and issues an in-place metadata upsert — most vector stores support updating payload metadata without re-embedding, which avoids the cost of recomputing vectors. Roll it out in phases: first backfill with a safe default (e.g., the most restrictive classification) so no query can accidentally treat unclassified documents as more permissive than intended, then progressively correct values as the batch job processes the corpus, and only make the field mandatory in query-side filter logic once backfill coverage is verified complete — flipping the enforcement switch before backfill finishes would incorrectly exclude legitimate, not-yet-tagged documents from every query.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. If a retrieval service supports several optional, user-facing filters at once (doc_type, date range, product), how should it combine them with the mandatory security predicate?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Build each optional filter as an independent, allow-listed predicate fragment, AND every supplied fragment together, and AND the entire result with the mandatory base security predicate last (or first — the order of AND doesn't change semantics, only that it must always be present) — never let the optional-filter-combination logic have any path that produces an expression without the base predicate attached. Keeping fragment construction separate from combination logic also makes it easy to unit test each piece independently: does this fragment alone produce the right sub-expression, and does the combining step always retain the base predicate regardless of which optional filters are present.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">SENIOR</span>Q44. What operator categories would you expect a production-grade vector store's filter DSL to support at minimum?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>At minimum: equality and inequality (<code>=</code>, <code>!=</code>) for exact-match fields; range comparisons (<code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, <code>&lt;=</code>) for numeric and date fields; set membership (<code>IN</code>, and ideally <code>NOT IN</code>) for enum-like categorical fields; existence checks (<code>IS NULL</code> / <code>IS NOT NULL</code>) since optional fields are common; array/multi-value containment for tag-like fields; and boolean composition (<code>AND</code>, <code>OR</code>, <code>NOT</code>) to combine fragments into arbitrarily nested expressions. A store missing boolean composition, in particular, forces awkward application-side workarounds like issuing multiple queries and merging results client-side.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">MID</span>Q45. Why might a metadata filter, specifically, force you to increase an ANN search-depth parameter like HNSW's ef_search, independent of overall corpus growth?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A filtered-ANN traversal (Section 5.3) must keep expanding its search frontier until it finds k <em>eligible</em> results, not merely k geometrically close ones — so for a selective filter, the search may need to visit many more candidate nodes than an unfiltered query would to accumulate the same k eligible matches, even though the total corpus size hasn't changed. Increasing ef_search (or the equivalent depth/breadth parameter for your engine) gives the traversal more room to keep searching before giving up, directly trading latency for the completeness of filtered results.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">SENIOR</span>Q46. How would you handle a user who legitimately has access to multiple tenants or scopes at once — for example, a manager who can see three teams' data?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Resolve the caller's full set of authorized scopes server-side (from their role assignments, never from a client-supplied list), and express the base predicate as <code>tenant_id IN (authorized_scope_list)</code> rather than a single equality — this is the natural generalization of single-tenant filtering to a bounded, server-resolved OR across scopes. The key discipline is that the OR happens only within the server-derived authorized set, never as an OR the client can widen; the client can still narrow (e.g., "only show me team A's results right now") by intersecting a user-facing filter with the authorized set, but never expand beyond it.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">MID</span>Q47. What's the practical benefit of "index-aware" filtering — baking the predicate into the traversal — over applying it as a clearly separate step, even a fast one?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A separate step, however fast, is still a fixed-size gate: it evaluates a predicate against a bounded candidate set (post-filtering) or a bounded eligible set the ANN structure then has to somehow restrict itself to (naive pre-filtering) — both have a ceiling on how they respond when the true matches are sparse or scattered. Index-aware filtering removes that ceiling by letting the traversal dynamically keep exploring — "not enough eligible matches yet, keep walking the graph" — which is precisely what guarantees k results are found when they exist, rather than depending on a fixed candidate-set size having been guessed large enough in advance.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">SENIOR</span>Q48. What caching strategy could help amortize the cost of building the same security-derived base filter across many requests from the same authenticated session?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Cache the resolved base predicate (tenant ID plus the current role-derived access-level set) keyed by session or a short-lived token, invalidated on role change, permission update, or session expiry — since resolving roles often means a call to an identity or authorization service, and that resolution doesn't need to be repeated for every single retrieval call within one session's lifetime. The cache must be invalidated promptly on any permission change, and it should only ever cache the resolved values, never let the cache itself become a place where client input can inject or override the base predicate.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Flag the staleness risk explicitly: a cached, overly permissive base predicate surviving past a permission downgrade is functionally the same bug as trusting client input — cache invalidation on permission change is a hard security requirement, not a nice-to-have.
+</div>
+
+<div class="question" id="q49"><span class="level">MID</span>Q49. How do you decide whether a piece of information belongs in filterable metadata versus embedded directly into the chunk's text?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>If you need to reliably exclude or include documents based on the value as a hard boolean/enumerable predicate — tenancy, access level, document type, a date cutoff — it belongs in structured metadata, because embedding text only participates in fuzzy semantic similarity and can never guarantee exact exclusion. If the information is something the model should reason about or that helps semantic matching (e.g., mentioning "Q3 2025" inside the prose so a query about that quarter scores it as more relevant), it can live in the text — and often should live in both places at once: structured for filtering, and mentioned in text for semantic relevance, since the two mechanisms serve genuinely different purposes.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">SENIOR</span>Q50. In a pipeline that applies metadata filtering, then hybrid search fusion, then reranking, where should an access-control filter be enforced, and why there specifically?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>The access-control filter must be enforced at the very first stage — before either the dense or sparse retrieval legs run — never deferred to fusion or reranking. Enforcing it later means an ineligible document has already been scored, potentially fetched into application memory, and possibly logged before being discarded, which both wastes compute and creates exactly the kind of "sensitive content briefly touched the pipeline" exposure Section 13 warns about. Reranking, in particular, must never be relied upon as a safety net for eligibility — a cross-encoder reranker has no concept of authorization and will happily rank an ineligible document highly if it's semantically relevant; its only job is ordering among documents that were already guaranteed eligible upstream.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. Why is it good practice to store timestamp metadata in a normalized, sortable format (ISO-8601 or epoch) rather than a locale-specific human-readable string?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Range filters on dates depend on the underlying values sorting correctly as strings or numbers for a B-tree-style index to answer "greater than," "less than," or "between" efficiently — a locale-specific format like "March 3, 2025" or "03/04/2025" doesn't sort correctly lexicographically and is ambiguous across locales (day-first vs. month-first). ISO-8601 strings sort correctly as plain strings, and epoch integers sort correctly as numbers, so either lets the store's range-filtering machinery work without any special-cased date-parsing logic at query time.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">MID</span>Q52. Why might testing empty-result-set behavior matter more for metadata filtering than for plain, unfiltered similarity search?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Unfiltered similarity search over a non-trivial corpus essentially always returns something, since it's just ranking every vector by distance — an empty result is rare and usually signals an obvious bug (empty index, broken embedding call). A filtered query can legitimately return few or zero results for two very different reasons — genuinely no matching documents exist, or the filtering strategy under-returned despite matches existing (Section 5.1) — and these two cases require completely different responses (correct behavior vs. a real bug), which is precisely why explicit tests distinguishing them are worth writing.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">SENIOR</span>Q53. How would you design metadata filtering to support both "must never see" hard security exclusions and "prefer not to see" soft ranking demotions as genuinely distinct mechanisms?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Hard exclusions belong exclusively in the metadata filter predicate — evaluated before similarity ranking, incapable of being overridden by score, exactly the access-control boundary Section 3 describes. Soft preferences (e.g., "deprioritize documents older than a year, but still show them if nothing better exists") should not be implemented as a filter at all, because a filter either includes or excludes a candidate absolutely; instead, implement soft preference as a scoring adjustment applied after retrieval — a recency-decay multiplier on the similarity score, or a boost/penalty term the reranker incorporates. Keeping these as architecturally distinct mechanisms prevents a common bug where someone implements a "soft" business preference as a hard filter and later discovers it was silently excluding relevant results a user genuinely needed, or worse, implements a hard security requirement as a mere scoring penalty that a good-enough semantic match can simply outrank.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Tie this back to Section 4.1's bouncer-and-judge analogy explicitly — hard exclusions are the bouncer's job, soft preferences are the judge's, and the two must never be implemented by the same code path.
+</div>
+
+<div class="question" id="q54"><span class="level">MID</span>Q54. What's the relationship between metadata schema design and chunking strategy decisions (Chapter 15) made earlier in the ingestion pipeline?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Both decisions are made at the same point in the pipeline — chunk creation time — and both are expensive to change retroactively across an already-embedded corpus, so they're naturally part of the same architectural conversation rather than separate concerns. Chunking strategy also directly determines what metadata is even available to attach: if chunks are split without preserving a pointer back to their source document and section, you lose the ability to later attach or filter on section-level metadata (e.g., "only search the troubleshooting sections of runbooks") without re-chunking the entire corpus.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">SENIOR</span>Q55. Explain how a highly selective filter can effectively defeat the benefit of an ANN index, and when brute-force search becomes the better choice.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>An ANN index earns its speed by avoiding exhaustive comparison across the full corpus, relying on the assumption that most of the corpus is a legitimate candidate for most queries. When a filter is highly selective (say, 0.1% of the corpus), the effective search space collapses to a few hundred or thousand vectors — small enough that computing exact distances against every one of them directly is often faster than trying to force an approximate graph or cluster structure (built and tuned for millions of vectors) to restrict itself to that tiny, scattered subset. This is exactly why pre-filtering (Section 5.2) explicitly falls back to brute-force exact search when the eligible set is small: at that scale, "approximate" stops being a speed advantage and starts being unnecessary complexity.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">MID</span>Q56. Why is it useful to think of the metadata schema as something multiple teams eventually depend on, rather than as internal implementation detail of one retrieval service?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Once several product features or teams build filters against specific field names and value conventions (doc_type's exact enum values, the tenant_id format), those become an implicit contract — renaming a field or changing its accepted values silently breaks every filter built against the old convention, without necessarily throwing any error (a filter for a value that no longer exists just quietly matches nothing). Treating schema changes as versioned, communicated changes with a deprecation path — the same discipline applied to a shared API contract — avoids the class of "why did my feature's retrieval suddenly return nothing" incidents that a purely internal, undocumented schema invites.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. How would you instrument a retrieval service to distinguish "the filter correctly found nothing" from "the filter is broken and always returns nothing"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Maintain an independent way to know the true match count for a given predicate — either a periodic count query against the metadata index directly (bypassing similarity search entirely, since most vector stores support a metadata-only count/filter operation) or a cross-check against the source-of-truth system's own record count for that predicate. Compare that expected count against what filtered retrieval actually surfaces for representative sample queries; a filter that's structurally broken (wrong field name, wrong operator, a typo in an allow-listed mapping) will show a persistent, systematic gap between expected and actual matches across many queries, whereas a legitimately sparse corpus segment shows low counts on both sides consistently.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">SENIOR</span>Q58. What are the risks of allowing OR at the top level of a client-supplied filter expression, versus only allowing AND of pre-validated fragments?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A top-level OR that a client can freely construct creates a path where a single malformed or malicious clause can widen eligibility rather than narrow it — for example, <code>doc_type = "public" OR tenant_id = "target-tenant"</code> would match everything satisfying either condition, effectively bypassing whatever the AND-ed base predicate was trying to enforce if the client's OR clause is structurally allowed to sit alongside it rather than strictly nested beneath it. Restricting client input to AND-composition of individually allow-listed fragments (and only allowing OR within a server-controlled, bounded context, like the multi-scope example in Q46) keeps the combined expression monotonically narrowing relative to the base predicate — client input can only ever make the result set smaller, never larger, which is the safety property you actually need.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">MID</span>Q59. Does metadata filtering apply differently in a batch/offline evaluation pipeline compared to the online production query path?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The filtering mechanism itself is the same, but the predicate's purpose often differs: online, the filter enforces real-time access control and business scoping for a live user; offline, in an evaluation harness, the filter is frequently used deliberately to construct controlled test scenarios — e.g., restricting an evaluation run to a synthetic tenant's documents to measure retrieval quality without cross-tenant noise, or filtering by a specific document version to reproduce a historical evaluation exactly. It's worth explicitly not reusing production security-predicate-building code unchanged in an evaluation harness without review, since offline harnesses sometimes run with elevated or bypassed credentials that would be a serious bug if that same code path were ever invoked in the online path.</p>
+</div>
+
+<div class="question" id="q60"><span class="level">SENIOR</span>Q60. What's a robust way to validate, before shipping, that a code change to filter-building logic hasn't accidentally weakened tenant isolation?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Maintain a dedicated integration test suite that seeds two or more synthetic tenants with deliberately similar, semantically close content, then asserts — across a matrix of representative query types and optional filter combinations — that querying as one tenant never returns even a single chunk owned by another, regardless of how relevant it might score. Run this suite as a required, blocking check on any change that touches predicate-building, retrieval-service, or advisor code, not merely as a manual QA step; because a passing functional test (search returns relevant results) can pass even when isolation is subtly broken, isolation needs its own explicit, independent test category rather than being assumed as a side effect of correctness tests.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Suggest going further with a periodic (not just pre-merge) automated "canary" job in production-like staging that runs the same cross-tenant leakage assertions on a schedule — catching regressions introduced by data/config changes, not just code changes, which a pre-merge test alone would miss.
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. Design the metadata schema and filter strategy for a legal e-discovery RAG system, where documents must be filterable by custodian, date range, privilege status, and matter ID, with a strict audit requirement.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Schema: <code>matter_id</code> (mandatory, functions like tenant_id — a document from one legal matter must never surface in another), <code>custodian</code> (categorical, the individual the document was collected from), <code>collection_date</code> and <code>document_date</code> as separate range-filterable timestamps (when it was collected vs. when it was authored — legal review frequently needs both independently), and <code>privilege_status</code> as a small, carefully governed enum (e.g., "not_privileged", "privileged", "under_review") that functions as a hard security filter exactly like access_level — a query must never surface a privileged document to a reviewer not cleared for it. The base predicate is <code>matter_id = caller_matter AND privilege_status IN (caller_cleared_statuses)</code>, server-derived from the reviewer's assigned matter and clearance, with custodian and date range as optional, allow-listed, user-facing narrowing filters. The audit requirement means every retrieval call's resolved predicate (not the raw query text alone) must be logged immutably — including matter and clearance context — since in e-discovery litigation, being able to reconstruct exactly which documents a given search could have surfaced, and prove privileged documents were structurally excluded, is itself a legal deliverable, not just an operational nicety.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. When a vector store shards data across multiple nodes, can a filter still guarantee complete recall across shards, or does sharding introduce new correctness risk?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Sharding introduces a genuine, additional correctness dimension: if data is sharded by something unrelated to the filter (e.g., a round-robin or hash-based shard assignment), a filtered query must scatter-gather across every shard and merge results, and each shard's local filtered search must independently guarantee it doesn't under-return relative to that shard's local top-k before merging — a shard using post-filtering locally can under-return exactly as badly as an unsharded index would, just now multiplied across every shard. If data is instead sharded aligned with the filter's dominant dimension (e.g., sharded by tenant, as discussed in Q22), a single-tenant query only ever touches its own shard, sidestepping the scatter-gather correctness question entirely for that dimension — which is one more argument in favor of aligning physical partitioning with your most security-critical and most frequently filtered field.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. How would you load-test a filtered-search endpoint to characterize the selectivity-vs-latency curve for your production filter patterns?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Construct a representative sample of real (or realistically synthetic) filter predicates spanning the actual selectivity range your production traffic exhibits — from near-unselective (language = "en" in a mostly-English corpus) to highly selective (a brand-new tenant with a handful of documents) — and measure p50/p95/p99 latency and result-count-vs-k-requested for each selectivity band independently, rather than a single aggregate latency number that would mask the tail behavior. Plot latency against measured selectivity to find the inflection point where your store's strategy transitions from "cheap" to "expensive" (Section 6's `N ≥ k/s` relationship is the theoretical shape to expect), and use that inflection point to decide concrete engineering responses — index-per-tenant for the segment beyond the inflection, a larger default candidate-pool multiplier, or an SLA carve-out communicated to stakeholders for extremely selective queries.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">STAFF</span>Q64. Your organization wants a shared "Retrieval Platform" abstraction layered over multiple vector stores, each with a different filter DSL. What API design would you propose, and what would you deliberately choose not to abstract away?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Propose a store-agnostic filter expression tree — the same shape Spring AI's <code>Filter.Expression</code> takes — as the platform's public contract: composable comparison, range, membership, and boolean-composition primitives that each backing store's adapter translates into its native syntax, so product teams write filter logic once regardless of which store backs a given deployment. Deliberately do not try to abstract away each store's actual filtering <em>strategy</em> and its performance characteristics (Section 5) — hiding whether a given store does post-filtering, pre-filtering, or filtered-ANN behind a uniform interface would let teams write logically correct filters that silently behave very differently (correctness-wise and latency-wise) depending on which store happens to be configured underneath, which is a worse outcome than making that difference visible. Expose selectivity/strategy characteristics as documented, queryable platform metadata per backing store instead, so teams can make informed decisions rather than being surprised in production by a discrepancy the abstraction layer hid from them.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. What is "filter explosion," and how would you prevent your allow-list of filterable fields from growing unmanageably as more teams build features on a shared retrieval service?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Filter explosion is the pattern where every new product feature requests its own bespoke filterable field, and the allow-list (and the underlying auxiliary indexes each field requires) grows without bound, eventually degrading ingestion cost, index memory footprint, and the reviewability of what's actually security-sensitive versus merely convenient. Prevent it with an explicit governance gate — a lightweight review before a new field is added to the shared schema, checking whether an existing field (or a denormalized combination) can already express the need, requiring the requesting team to justify the added index cost, and periodically auditing for filterable fields that see near-zero actual query volume and could be deprecated.</p>
+</div>
+
+<div class="question" id="q66"><span class="level">SENIOR</span>Q66. How should schema/versioning metadata be handled when you upgrade your embedding model and old and new vectors temporarily coexist in the same index?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Attach an <code>embedding_model_version</code> (or similar) field to every vector at ingestion, and during the migration window, add it as a mandatory part of query-time filtering — a query embedded with the new model should generally be filtered to only compare against vectors embedded with the same model version, since distances computed between embeddings from two different models are not meaningful (different models place semantically similar content at different points in different, incompatible vector spaces). Once re-embedding of the full corpus under the new model completes, this becomes a straightforward cleanup: drop the version filter (or narrow it permanently to the new version) and, if storage allows, retire the old vectors — but skipping the version filter during the transition window risks silently mixing incomparable distance scores into a single ranked result list.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. Why is "AND-ing the server-derived security predicate" necessary but not sufficient on its own — what additional check should exist as defense in depth?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>AND-ing the security predicate correctly prevents the vector store from ever returning ineligible documents — but it assumes the predicate-building code itself is always invoked, always correct, and never bypassed by a new or refactored call site, which a single missed code path (Section 2.2's "isolation enforced only by convention" lesson) can violate. A second, independent layer — an application-level assertion or audit check that inspects every document a retrieval call actually returns and verifies its tenant_id/access_level genuinely matches the caller's authorized scope before it's ever placed into a prompt — catches the case where the primary filter was somehow skipped or misconfigured, functioning as a last-line safety net rather than the sole enforcement mechanism.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Compare this explicitly to defense-in-depth in conventional application security — a firewall rule and an application-level authorization check both independently enforcing the same boundary is standard practice precisely because either one, alone, has historically been the single point of failure in a real breach.
+</div>
+
+<div class="question" id="q68"><span class="level">SENIOR</span>Q68. How would metadata filtering need to change to support a "search only within a folder/workspace hierarchy" feature, where folders can be nested arbitrarily deep?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>A naive <code>folder_id = X</code> equality filter only matches documents directly in folder X, not documents nested in its descendant subfolders, so it doesn't express "search this whole subtree" on its own. The common solution is to materialize a <code>folder_path</code> (or ancestor list) as metadata at ingestion time — either a delimited path string enabling a prefix-range filter, or an array of every ancestor folder ID enabling an array-contains filter for the target folder — so "search subtree rooted at X" becomes a single indexable predicate rather than requiring the query engine to walk the folder hierarchy at query time. The trade-off is that moving a folder (re-parenting it) requires updating the materialized path/ancestor metadata on every document beneath it, which is exactly the same "denormalization for query speed vs. update cost" trade-off discussed in Q16, just applied to a hierarchical structure.</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. Can a document become queryable via metadata filter before its vector embedding has actually finished indexing in a streaming ingestion pipeline, and why does that matter?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>In some architectures, metadata and vectors are written through separate paths with different latency characteristics — a metadata record could conceivably be visible to a metadata-only query before its corresponding vector has finished being embedded and inserted into the ANN index, especially under load or during a backlog. This matters because a filtered similarity search (which needs both the metadata index and the vector index to agree on what exists) could either miss a just-ingested document entirely (if the vector index lags) or, in a worse failure mode, reference a metadata entry with no vector behind it. The safe design keeps metadata and vector writes in the same atomic upsert operation wherever the store supports it, and where it doesn't, treats "fully indexed and queryable" as a distinct state a document must reach before it's surfaced to any query path at all — not the moment its ingestion job merely started.</p>
+</div>
+
+<div class="question" id="q70"><span class="level">SENIOR</span>Q70. What's a reasonable way to tune the candidate-pool multiplier (how many raw candidates to request before filtering/reranking) once you know a filter's approximate selectivity for a given query pattern?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Section 6.2's inequality (<code>N ≥ k/s</code>) gives a starting point: if measured selectivity for a filter pattern is <code>s</code> and you want k results, request at least k/s raw candidates before filtering, with a safety margin above that since real-world relevance isn't uniformly distributed the way the back-of-envelope model assumes. In practice, this should be tuned empirically and per filter-pattern class rather than as one global constant — track actual survivor counts against the requested N in production, and adjust the multiplier upward for filter patterns whose survivor counts run persistently lower than expected, while keeping it conservative for near-unselective filters where a large multiplier only adds unnecessary latency and reranking cost (Section 12) for no recall benefit.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">STAFF</span>Q71. How would you design a metrics dashboard for a platform-wide retrieval service to catch filter-selectivity-driven latency or recall regressions before customers notice them?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Track, per filter-pattern class (grouped by which fields are combined, not per literal predicate value) rather than in aggregate: measured selectivity over time, p50/p95/p99 latency, and the "results returned vs. k requested" ratio — with each broken down further by tenant-size bucket, since small tenants are structurally where selectivity-driven regressions surface first. Alert on trend changes rather than only absolute thresholds — a filter pattern whose selectivity is slowly drifting downward as a tenant's corpus share shrinks relative to the whole, or whose survivor ratio is slowly degrading as overall corpus size grows, will cross a bad-behavior threshold eventually even with zero code changes, and catching the trend early gives time to migrate that filter pattern (e.g., to index-per-tenant) before it becomes a customer-visible incident rather than after.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">SENIOR</span>Q72. Give an example of when a "prefer not to see" ranking-level demotion is more appropriate than a hard metadata exclusion filter.</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Deprioritizing stale documentation — content older than, say, eighteen months — is a good fit for a soft demotion rather than a hard filter, because an old document is still potentially the best or only available answer to a niche question; excluding it entirely via a hard <code>publish_date >= X</code> filter risks returning zero results for exactly the long-tail queries where old content is all that exists. A recency-weighted score penalty applied after retrieval lets fresher content win when both old and new candidates are relevant, while still surfacing the old document rather than nothing when it's the only match — the outcome a hard exclusion filter cannot provide.</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. Why can encrypting metadata values at rest complicate filter evaluation, and how do systems typically resolve that tension?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Most filter evaluation strategies (inverted indexes, bitmaps, B-trees) require the underlying values to be directly comparable in plaintext — if <code>tenant_id</code> is stored fully encrypted, the store can no longer build or use an efficient index over it without decrypting on every comparison, defeating the performance purpose of indexing the field at all. Systems typically resolve this by encrypting values considered sensitive for storage/display purposes (e.g., a customer's actual company name) while keeping the fields actually used as filter predicates in a non-reversible but comparison-preserving form — a deterministic hash or an internal, non-sensitive ID that maps to the sensitive value only through a separately-secured lookup table — so the vector store's index only ever sees and compares an opaque token, never the underlying sensitive value.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">STAFF</span>Q74. Walk through how you'd design and roll out a change that tightens access_level semantics — splitting "internal" into "internal-general" and "internal-restricted" — across a live production RAG platform without breaking existing queries.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>First, backfill every existing document currently tagged "internal" with a conservative default of the new, more restrictive value ("internal-restricted") rather than guessing which documents qualify for the more permissive tier — defaulting to more restrictive prevents any window where a document is under-protected relative to its actual sensitivity. In parallel, update role-to-access-level mappings so that roles previously granted "internal" access are granted both new values (preserving existing behavior for everyone) while a data classification effort — automated where possible, manual review where not — identifies and re-tags documents that genuinely belong in the more open "internal-general" tier. Only after that reclassification effort reaches acceptable coverage should any role's grant be narrowed to just "internal-general," and this narrowing should be rolled out gradually, role by role, with monitoring for a spike in "results returned vs. requested" shortfalls that would indicate real content is being over-restricted. Throughout, keep the old "internal" value queryable as a deprecated alias (mapped internally to the union of both new values) for any code path not yet migrated, removing it only once every consumer has migrated to the new, more precise values — the same staged-deprecation discipline you'd apply to any breaking API contract change.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Emphasize that "default to more restrictive" during backfill is the single detail that separates a safe migration from a security incident — defaulting new, ambiguous data to the more permissive tier during a transition window is a subtle but real way this kind of migration goes wrong.
+</div>
+
+<div class="question" id="q75"><span class="level">SENIOR</span>Q75. What's the cost trade-off between adding more filterable metadata fields versus running more, smaller per-tenant or per-scope indexes?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>More filterable fields on a shared index scale their cost roughly with corpus size (each field's auxiliary index grows with the number of vectors), while more, smaller indexes scale their cost with the number of partitions (fixed per-index overhead — memory baseline, connection/monitoring overhead — multiplied by however many indexes you run), regardless of how small each one is. For a platform with many small tenants, a shared index with a modest number of well-chosen filterable fields is usually the more cost-efficient path; for a platform with a small number of very large, security- or compliance-critical tenants, the fixed per-index overhead of dedicated indexes is comparatively small relative to the isolation and performance benefit each large tenant gets — which is exactly the reasoning behind the hybrid recommendation from Q7 (shared index for the long tail, dedicated indexes for the largest or most sensitive tenants).</p>
+</div>
+
+<div class="question" id="q76"><span class="level">STAFF</span>Q76. Describe how you'd design an internal chargeback or observability system that attributes vector-store query cost and latency back to specific filter patterns or teams on a shared multi-tenant retrieval platform.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Tag every retrieval request, at the point the predicate is built, with the requesting team/feature identity and a normalized descriptor of the filter shape being used (which fields are combined, not the literal values, to keep cardinality manageable) — then propagate that tag through to the vector store call so its measured latency, candidate-set size, and estimated compute cost can be attributed back to that team and filter pattern in aggregate. Surface this as a self-service dashboard so teams can see their own filter patterns' cost and latency footprint directly, which both creates accountability for filter design choices (a team requesting an expensive, low-selectivity combined filter sees the cost land on their own dashboard) and gives the platform team the data needed to prioritize which filter patterns most need optimization or migration to a different strategy.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">STAFF</span>Q77. What's the danger of "fail open" behavior in a filtering layer — if the security-predicate-building service errors out, does the query proceed unfiltered? How should this be designed instead?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Fail-open behavior means a transient error in identity/role resolution — a downstream auth service timeout, a malformed session — results in the retrieval query proceeding either with no filter at all or with an overly permissive default, silently turning an infrastructure hiccup into a data breach. The predicate-building path must fail closed: if the caller's identity or authorized scope cannot be resolved with confidence, the retrieval call must not execute at all — return an error to the caller rather than a result set — because an unauthenticated or unauthorized "successful" response with real document content is a far worse outcome than a visible, debuggable error. This should be enforced structurally (the retrieval service's API should have no code path that constructs a <code>SearchRequest</code> without a resolved, non-default predicate), not merely as a coding convention that a future change could accidentally violate.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">SENIOR</span>Q78. What's the relationship between metadata filtering and explainability/audit — how would you show a compliance auditor exactly why a given document was or wasn't eligible for a specific past query?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Log the fully resolved filter predicate (not just the raw user query text) for every retrieval call, along with the resolved identity/role context it was derived from, in an immutable, queryable audit log — this lets you reconstruct, after the fact, exactly which predicate was in force for a specific historical query and evaluate it against the document's metadata at that point in time to explain eligibility precisely. This is a strong argument for versioned metadata (Q32's point-in-time discussion) as well: if a document's access_level changed between the audited query and today, you need the metadata as it existed at query time, not its current value, to give the auditor an accurate answer.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">SENIOR</span>Q79. How would you validate, as part of CI/CD, that a change to filter-building logic doesn't accidentally weaken security guarantees, beyond the integration tests discussed earlier?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Beyond functional integration tests (Q60), add a static-analysis or code-review gate specifically for the predicate-building module — flagging any new code path that constructs a <code>Filter.Expression</code> or <code>SearchRequest</code> without visibly passing through the shared security-predicate-building component, since a well-intentioned refactor or a new call site added under time pressure is exactly how isolation bugs get introduced in practice. Treat any diff touching that module as requiring security-focused review with the same rigor as a change to an authentication or authorization module, precisely because — as Section 13 states directly — that is functionally what it is.</p>
+</div>
+
+<div class="question" id="q80"><span class="level">STAFF</span>Q80. A staff engineer proposes deprecating post-filtering entirely across the company's retrieval platform, mandating filtered-ANN or pre-filtering everywhere. What arguments would you make for and against a blanket rule like that?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>For: post-filtering's under-return failure mode (Section 5.1) is a genuine, recurring source of production incidents, and a blanket rule removes an entire class of bug from the platform's surface area, simplifying the mental model every team building on the platform needs to hold. Against: not every backing store supports filtered-ANN, and forcing pre-filtering everywhere can itself introduce a latency regression for large eligible sets on stores whose ANN structure can't efficiently restrict traversal (Section 5.2's caveat) — and for near-unselective filters, post-filtering is genuinely fine and cheap, so mandating a more complex strategy everywhere adds engineering cost without a corresponding correctness benefit for that large class of low-risk filters. The better staff-level position is usually not a blanket ban but a selectivity-aware policy: require filtered-ANN or pre-filtering specifically for filter patterns whose measured selectivity falls below an empirically chosen threshold (Section 6's math gives the quantitative basis), while allowing post-filtering to remain the simpler, cheaper default for filters known to be consistently unselective — turning a binary policy debate into a data-driven one.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> This question rewards pushing back constructively on an absolute rule rather than agreeing outright — interviewers at the staff level are often specifically testing whether a candidate can hold two valid engineering concerns in tension and propose a policy that's actually implementable, not just philosophically appealing.
+</div>
+
+<div class="question" id="q81"><span class="level">STAFF</span>Q81. How does metadata filtering strategy change for a RAG system that must support GDPR "right to be forgotten" erasure requests with an SLA?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>An erasure request typically must result in the affected content being provably unretrievable within the SLA window, which is a stronger requirement than the soft-delete pattern from Q29 alone — a boolean <code>deleted</code> flag that's part of the base filter satisfies "unretrievable" immediately (as soon as the flag propagates), but true erasure eventually requires physical removal of the vector and its metadata from the store, not merely its exclusion from query results, since the underlying data still technically exists and could in principle be exposed by a bug that skips the flag. The practical design is two-phase: an immediate, fast metadata-flag update that satisfies "unretrievable" the moment the request is processed (meeting a tight SLA), followed by a guaranteed, tracked, asynchronous physical-deletion job that removes the actual vector and metadata within a longer but still bounded window — with monitoring that verifies every flagged-for-deletion record is confirmed physically removed before its deadline, since an erasure request that's merely flagged but never actually purged is a compliance gap waiting to be discovered in an audit.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">STAFF</span>Q82. Design an approach for supporting time-travel queries — "what would retrieval have returned as of last Tuesday" — in a system whose vector store does not natively version documents.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Since the store has no native versioning, model it explicitly in the metadata schema: never overwrite a chunk's content or metadata in place on update — instead insert a new versioned vector/metadata record with an <code>effective_from</code> timestamp, and set the previous version's <code>effective_to</code> to the same timestamp, so the corpus becomes an append-only history of versions rather than mutable current state (the same pattern outlined in Q32). A time-travel query then becomes an ordinary range filter — <code>effective_from <= as_of_timestamp AND (effective_to IS NULL OR effective_to > as_of_timestamp)</code> — layered on top of whatever other filters the query needs, with no special query-engine support required beyond a standard range predicate. The engineering cost is real and ongoing: corpus size grows with every update rather than staying proportional to live document count, so this pattern needs an explicit retention/archival policy for old versions once your time-travel window requirement (a legal retention period, typically) has been satisfied.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">STAFF</span>Q83. How would you decide, for a new product line, whether to reuse an existing shared vector index with new metadata fields, or provision an entirely separate vector store instance?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Reuse the shared index when the new product line's access-control model, compliance requirements, and expected filter selectivity are compatible with the existing schema's assumptions — adding a <code>product_line</code> field as one more filterable dimension is cheap and keeps operational overhead flat. Provision a separate instance when any of those assumptions actually diverge in a way that matters: a materially different compliance regime (data residency, retention rules that conflict with the existing corpus's policy), an access-control model that doesn't map cleanly onto the existing access_level enum without distorting its semantics for everyone else (Q37's granularity problem), or an expected query pattern whose selectivity characteristics would degrade shared-index performance for other product lines already using it (the noisy-neighbor risk from Section 12). The decision should be driven by these concrete divergence criteria, not by organizational convenience or a default preference for either "always share" or "always isolate."</p>
+</div>
+
+<div class="question" id="q84"><span class="level">STAFF</span>Q84. How would you approach capacity planning for metadata/auxiliary indexes as an organization's number of filterable fields and tenants both grow over several years?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium at staff level</p>
+<div class="answer">
+<p>Model auxiliary-index memory and maintenance cost as a function of two independent, multiplicative growth drivers — corpus size (which grows the size of every existing field's index) and field count (which grows the number of indexes maintained per vector) — and project both forward using actual historical growth rates rather than assuming either stays flat. Build the governance gate from Q65 (reviewing new field additions) into the capacity-planning process itself, so that adding a new filterable field is evaluated not just for immediate query-pattern value but against its multi-year projected cost at expected corpus and tenant growth, and periodically re-evaluate whether any existing field's actual query volume still justifies its ongoing index maintenance cost, retiring genuinely unused ones.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">SENIOR</span>Q85. A newly onboarded large enterprise customer wants a custom, deeply nested boolean filter capability that your allow-list-based filter API doesn't support. How do you respond, from a platform-governance standpoint?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>Resist implementing arbitrary, unbounded client-constructed boolean nesting even for a large customer, since that's precisely the risk the allow-list discipline (Q35, Q58) exists to prevent — a five-level-deep client-authored boolean expression is far harder to statically verify never escapes the base security predicate than a small, reviewed set of fragment combinations. Instead, work with the customer to understand the actual use cases behind the request, and extend the allow-list with a small number of new, specifically reviewed and tested predicate fragments or combination patterns that satisfy the real need — treating this as "add carefully reviewed capability to the platform for everyone" rather than "grant one customer an unreviewed escape hatch," which keeps the security review burden proportional and shared rather than growing unboundedly per customer request.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">STAFF</span>Q86. Summarize, as you would to a VP of Engineering evaluating vendor vector databases, the single most important question to ask about metadata filtering capability before selecting a vendor at enterprise scale.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Ask which filtering strategy — post-filtering, pre-filtering, or filtered-ANN — the vendor actually implements for your expected selectivity range, and demand it be demonstrated empirically against a realistic, selective filter pattern rather than taken from marketing material, because that single implementation detail determines whether the product will silently under-return results for your smallest tenants as your platform scales, long after the initial evaluation with a small, friendly demo corpus looked perfectly fine. Every other consideration — raw ANN throughput, pricing, managed-service convenience — matters less than this one, because a vendor that gets filtering wrong at your actual scale isn't a performance problem you can tune away; it's a correctness and security problem baked into the product's architecture.</p>
+</div>
+
+<div class="question" id="q87"><span class="level">STAFF</span>Q87. What's the biggest philosophical shift metadata filtering requires from a team used to thinking of RAG retrieval purely as a similarity-ranking problem?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>The shift is from treating retrieval as "one function that scores and orders everything" to treating it as two structurally separate concerns computed by different mechanisms and enforced at different points — eligibility (a hard, binary, often security-critical boolean predicate) and ranking (a soft, graded, semantic similarity score) — and never letting the second stand in for the first. Teams that internalize this early build retrieval services where the base security predicate lives in one centralized, heavily-tested component that every call site must pass through; teams that don't tend to discover the distinction only after a cross-tenant leak or an audit finding forces the realization retroactively, at a much higher cost than designing for it from the start.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> This is a strong closing question to answer by connecting back to Section 4.1's bouncer-and-judge framing explicitly — naming the mental model by name signals the candidate isn't just reciting mechanics but has internalized the chapter's central organizing idea.
+</div>
+
+<div class="question" id="q88"><span class="level">STAFF</span>Q88. If you had to redesign a RAG platform's retrieval layer from scratch knowing everything this chapter covers, what would you build first — the vector index integration, or the metadata filtering and access-control layer?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at staff level</p>
+<div class="answer">
+<p>Build the metadata schema and the security-predicate-building layer first, before optimizing vector index choice or retrieval quality — because every other decision (which vector store, which ANN parameters, how aggressive your candidate-pool multiplier is) can be revisited and tuned later without touching application code, while metadata schema decisions made poorly at the start are the expensive, hard-to-retrofit ones (Section 4.2), and a security boundary bolted on after the fact is far more likely to have gaps than one designed in from day one. In practice this means: define your tenancy and access-control fields, build and test the centralized predicate-building component, and only then wire in a specific vector store's filtered-search API — treating the choice of vector store as a pluggable implementation detail behind an abstraction that already assumes filtering is mandatory, not optional.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">SENIOR</span>Q89. How would you design fallback behavior when the metadata/auxiliary index is temporarily unavailable but the core vector index is healthy?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High at senior level</p>
+<div class="answer">
+<p>This must fail closed, exactly like the identity-resolution failure discussed in Q77: if the store cannot currently evaluate the security-relevant portion of the predicate, the query must not silently fall back to unfiltered similarity search, because that would return results across every tenant and access level indiscriminately — a worse outcome by far than a temporary service degradation. The correct fallback is to return a clear, monitored error (or, if the architecture allows, serve from a warm standby replica of the metadata index) rather than ever letting "the filter couldn't be evaluated" silently degrade into "no filter was applied."</p>
+</div>
+
+<div class="question" id="q90"><span class="level">SENIOR</span>Q90. How would you communicate the trade-offs of a chosen metadata filtering strategy to a non-technical stakeholder who's asking why a new small customer's search results seem sparse?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium at senior level</p>
+<div class="answer">
+<p>Frame it around the concrete mechanism without jargon: the search engine narrows down to only that customer's own documents before ranking them by relevance, and because that customer currently has relatively few documents in the system, there's simply a smaller pool for the "best match" to be selected from — the system isn't broken, it's correctly reflecting that this particular customer hasn't uploaded much content yet. If the underlying strategy genuinely is under-returning (a real bug, not just a small corpus), be precise that it's a different, fixable issue — the search is failing to find matches that do exist — and give a concrete timeline for the fix, rather than blending the two explanations together in a way that obscures which one is actually happening.</p>
+</div>
+
+<div class="question" id="q91"><span class="level">STAFF</span>Q91. Once metadata filtering is part of the pipeline, what does "recall@k" mean as a retrieval quality metric, and how should teams measure it correctly?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>Without filtering, recall@k is usually measured against the whole corpus's true nearest neighbors — but once eligibility filtering is part of the pipeline, the meaningful denominator changes to the true nearest neighbors <em>among eligible documents only</em>, because a document that's semantically closer but ineligible was never a candidate the system was supposed to surface in the first place. Measuring recall against the unfiltered ground truth would unfairly penalize a correctly-filtered system for "missing" documents it was never supposed to return, while measuring it only against eligible ground truth correctly isolates whether the filtering-plus-ranking pipeline is finding the right answers within the scope it's actually supposed to search. Teams building evaluation harnesses for filtered retrieval need per-filter-scenario ground truth (the true eligible nearest neighbors for a specific tenant/predicate combination), not a single global ground-truth set, or their quality metrics will misrepresent a correctly-functioning filtered system as underperforming.</p>
+</div>
+
+<div class="question" id="q92"><span class="level">STAFF</span>Q92. In one sentence each, what are the correctness risk, the performance risk, and the security risk that metadata filtering exists to manage — and how does a mature production system address all three simultaneously?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level — strong closing/summary question</p>
+<div class="answer">
+<p>The correctness risk is under-returning results when a selective filter and a naive strategy (post-filtering) combine, addressed by choosing pre-filtering or filtered-ANN once selectivity demands it (Sections 5–6); the performance risk is that filtering can either be bolted on as an expensive brute-force step or, if done well, add negligible overhead relative to unfiltered ANN search, addressed by measuring real selectivity and choosing index strategy and partitioning accordingly (Section 12); and the security risk is that a missed or bypassable filter becomes a cross-tenant or unauthorized-access data leak, addressed by deriving the security-relevant predicate exclusively server-side, centralizing its construction, and testing isolation explicitly and continuously (Section 13, Q60). A mature production system treats all three as one integrated design discipline rather than three separate afterthoughts — metadata schema, filtering strategy, and access-control enforcement decided together, at ingestion-time architecture discussions, not bolted on individually as each problem surfaces in production.</p>
+</div>
 
 </div>
 

@@ -110,6 +110,22 @@ They usually continue with deeper questions on data modelling, consistency and h
 <li>Indexes In MongoDB</li>
 <li>The Aggregation Pipeline</li>
 <li>Replica Sets, Sharding, Transactions And Spring Data MongoDB</li>
+<li>Cassandra Partition Key vs Clustering Key Design</li>
+<li>Tunable Consistency - Quorum Reads And Writes</li>
+<li>Why Cassandra Writes Are Cheap And Deletes (Tombstones) Are Tricky</li>
+<li>Redis As A Primary Database vs A Cache</li>
+<li>When A Graph Database (Neo4j) Genuinely Beats Relational/Document</li>
+<li>Compound Index Field Order - The ESR Rule</li>
+<li>Covered Queries, TTL, Partial And Wildcard Indexes</li>
+<li>Schema Design Patterns - Bucket, Subset, Computed, Polymorphic</li>
+<li>Multi-Document Transaction Cost And When You Actually Need Them</li>
+<li>Change Streams</li>
+<li>Shard Key Selection And The Hot-Shard Pitfall</li>
+<li>Migrating A Struggling Relational Schema To MongoDB</li>
+<li>Advanced Aggregation - $facet, $graphLookup, $merge</li>
+<li>Multi-Tenancy And Soft-Delete Modeling Patterns</li>
+<li>MongoDB Operations - Backup, Monitoring, Capacity Planning</li>
+<li>Spring Data MongoDB In Depth - MongoTemplate, Auditing, Testcontainers</li>
 
 </ol>
 
@@ -981,7 +997,1913 @@ Tie it together: "Replica sets give me availability, sharding gives me scale, wr
 
 <hr>
 
-<h1 id="h9">QUICK REVISION SHEET</h1>
+<h1 id="h9">SECTION 7 - WIDE-COLUMN, KEY-VALUE &amp; GRAPH DATABASES DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q17">
+Q17. How Do You Design Partition Keys vs Clustering Keys In Cassandra?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Cassandra's primary key splits into two very different jobs. The <b>partition key</b> decides <i>which node(s)</i> own the data - it is hashed to a token, and the token ring determines placement. The <b>clustering key</b> decides the <i>sort order of rows within a partition</i> - it has nothing to do with distribution, only with how rows are physically ordered on disk inside that one partition.
+</p>
+
+<pre>
+CREATE TABLE sensor_readings (
+    sensor_id   text,
+    reading_time timestamp,
+    temperature double,
+    PRIMARY KEY ((sensor_id), reading_time)
+) WITH CLUSTERING ORDER BY (reading_time DESC);
+</pre>
+
+<p>
+Here <code>sensor_id</code> is the partition key - all readings for one sensor land on the same node(s), and <code>reading_time</code> is the clustering key - readings are stored pre-sorted, newest first, so "give me the last 100 readings for sensor X" is a cheap sequential read.
+</p>
+
+<p>
+Cassandra is query-first, more strictly than MongoDB even: it has no ad-hoc secondary filtering (without <code>ALLOW FILTERING</code>, which is an anti-pattern at scale), so every query must supply the full partition key. This forces you to design one table per query shape, sometimes duplicating the same data into several tables keyed differently.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Picking a partition key with too little cardinality (e.g. just <code>country</code>) creates a "wide partition" - one node ends up holding a huge, slow-to-compact slice of data. If a natural key is too coarse, add a bucketing component, e.g. <code>PRIMARY KEY ((sensor_id, day), reading_time)</code>, to keep partitions bounded in size.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q18">
+Q18. What Is Tunable Consistency In Cassandra (Quorum Reads/Writes)?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Cassandra lets you choose a <b>consistency level</b> per query, independent of the replication factor (RF) configured on the keyspace. Common levels: <code>ONE</code>, <code>QUORUM</code> (majority of replicas: <code>floor(RF/2)+1</code>), <code>LOCAL_QUORUM</code> (quorum within the local datacenter only), and <code>ALL</code>.
+</p>
+
+<p>
+The classic strong-consistency guarantee is: if <b>R + W &gt; RF</b> (R = replicas contacted on read, W = replicas contacted on write), then every read is guaranteed to see the most recent write, because the read and write sets must overlap on at least one up-to-date replica. With RF=3, <code>QUORUM</code> writes (W=2) plus <code>QUORUM</code> reads (R=2) gives 2+2=4 &gt; 3, so you get strong consistency without waiting on every single replica.
+</p>
+
+<p>
+In a multi-datacenter deployment, <code>LOCAL_QUORUM</code> is the practical default - it avoids the latency of waiting on a quorum that spans a cross-continent link, at the cost of only guaranteeing consistency within that DC.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+This is the wide-column analogue of MongoDB's write concern / read preference (Q16 and Q41) - both let you dial where a specific operation sits between "fast and eventually consistent" and "slow and strongly consistent". Drawing that parallel across two different databases is a strong senior signal.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q19">
+Q19. Why Are Cassandra Writes Cheap But Reads And Deletes (Tombstones) Tricky?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Cassandra's storage engine is an <b>LSM-tree (log-structured merge-tree)</b>. A write is appended to a commit log (for durability) and to an in-memory memtable - there is no read-before-write, no in-place update, no random disk seek. That is what makes writes extremely cheap and fast, even at huge sustained volume: it is a sequential append, full stop.
+</p>
+
+<p>
+Memtables periodically flush to immutable files on disk called <b>SSTables</b>. Over time, one logical row's data can be spread across many SSTables (written at different times). A read has to check the memtable <i>and</i> potentially several SSTables, merging what it finds - this is read amplification, mitigated by bloom filters (skip SSTables that can't contain the key) and background <b>compaction</b> (merging SSTables together).
+</p>
+
+<p>
+Deletes make this worse before it gets better: a delete does not remove data in place (it can't - SSTables are immutable), it writes a <b>tombstone</b> marker recording "this data is deleted as of time T". Reads must still scan past tombstones until compaction physically purges them (after <code>gc_grace_seconds</code>, default 10 days, to give time for the delete to replicate everywhere before it is permanently forgotten). A delete-heavy workload can accumulate so many tombstones that range scans start failing outright ("tombstone overwhelm").
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The one-liner interviewers want: "in Cassandra, a delete is actually a special kind of write, and it makes future reads more expensive until compaction cleans it up." That single sentence shows you understand the LSM-tree trade-off, not just the CQL syntax.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q20">
+Q20. When Does Redis Make Sense As A Primary Database, Not Just A Cache?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Redis is usually introduced as "the cache", but it is a full key-value database with persistence (RDB snapshots and/or an AOF - append-only file - log), replication, and a clustered mode (hash-slot based sharding) - and it supports far more than strings: Lists, Sets, Sorted Sets, Hashes, Streams, HyperLogLog and Bitmaps, plus modules like RedisJSON and RediSearch.
+</p>
+
+<p>
+Good primary-store use cases: real-time leaderboards (sorted sets give O(log N) ranked inserts and range queries for free), rate limiters and counters, distributed locks (RedLock), lightweight pub/sub or Streams-based event processing, and session state where Redis <i>is</i> the source of truth rather than a cache in front of something else.
+</p>
+
+<p>
+The caveat that keeps it from being a general-purpose primary database: your data set needs to fit comfortably in RAM (or you pay a lot for it), and its durability model (AOF fsync policy trade-offs) is weaker than a WAL-backed disk store like MongoDB or Postgres. Financial ledgers and anything needing rich ad-hoc queries still belong in an ACID store.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming "Redis = cache" is a permanent architectural fact rather than the most common use case. If the access pattern is simple (key/structure-based) and latency is paramount, Redis-as-database is a legitimate, common production choice - the caching material in the System Design chapter covers the cache-in-front-of-a-database pattern specifically; this question is about Redis owning the data outright.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q21">
+Q21. When Does A Graph Database (Neo4j) Genuinely Beat Relational/Document?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A graph database earns its place when the core value of the feature is <b>deep, multi-hop traversal where the number of hops is unbounded or unknown ahead of time</b> - fraud rings connected through shared devices/cards/addresses three or four hops out, "people you may know" (friends of friends, not already connected), recommendation paths, knowledge graphs.
+</p>
+
+<p>
+In SQL, an N-hop traversal needs N self-joins (or a recursive CTE), and cost grows badly as both N and the data volume grow. In Neo4j, relationships are stored as physical pointers directly on the node - "index-free adjacency" - so walking to a neighbor is a pointer hop whose cost depends on the size of the local neighborhood you explore, not on the size of the whole database.
+</p>
+
+<p>
+The nuance interviewers are checking for: most relationships in a normal application (an order belongs to a customer) are one hop, and a plain foreign key/reference (relational or Mongo) handles that perfectly well - reaching for a graph database "because the data has relationships" is a common overreach. Reach for it specifically when unbounded-depth traversal <i>is</i> the primary access pattern, not an occasional nice-to-have.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+MongoDB's <code>$graphLookup</code> aggregation stage (Q45) gives you a lightweight recursive traversal inside a document database for moderate-depth hierarchies (org charts, comment threads) - mentioning that you'd reach for that before standing up an entire separate graph database, unless the traversal is genuinely the product's core feature, shows calibrated judgement rather than reflexively naming the "correct-sounding" database for every relationship.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q22">
+Q22. Wide-Column vs Document - How Do You Choose Between Two NoSQL Types That Both Seem To Fit?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Both families can store large volumes of semi-structured records, but they diverge sharply on query flexibility versus write scale.
+</p>
+
+<table border="1">
+<tr><th>Dimension</th><th>Wide-Column (Cassandra)</th><th>Document (MongoDB)</th></tr>
+<tr><td>Query flexibility</td><td>Low - one table per query shape, modeled up front</td><td>High - secondary indexes, ad-hoc queries, aggregation framework</td></tr>
+<tr><td>Write scale</td><td>Extremely high (LSM-tree, linear scale-out, multi-DC)</td><td>High, but joins/aggregations cost more under load</td></tr>
+<tr><td>Nesting</td><td>Flat rows, dynamic columns</td><td>Rich nested objects/arrays</td></tr>
+<tr><td>Best fit</td><td>Time-series, IoT ingestion, messaging - known, few query shapes</td><td>Catalogs, content, evolving query patterns</td></tr>
+</table>
+
+<p>
+Choose Cassandra when the workload is extremely write-heavy, needs to scale linearly across many nodes and datacenters, and the query patterns are known, few, and stable - you are willing to denormalize the same data into several purpose-built tables. Choose MongoDB when query patterns are varied or still evolving, documents are naturally nested, and you need secondary indexes or aggregations without pre-modeling every access path as a dedicated table.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+A concrete framing that lands well: "if I can enumerate every query my product needs today, Cassandra's query-first modeling is a strength, not a limitation. If my product team is still figuring out what the UI needs to show, MongoDB's flexibility to add a secondary index or an aggregation later is worth more than Cassandra's raw write throughput."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h10">SECTION 8 - MONGODB INDEXING DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q23">
+Q23. What Is The ESR Rule For Compound Index Field Order?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+ESR stands for <b>Equality, Sort, Range</b> - the recommended order for fields in a compound index, matched against how your query actually filters/sorts/ranges.
+</p>
+
+<ul>
+<li><b>Equality</b> fields first - fields matched with an exact value. These let MongoDB seek directly to the relevant slice of the index.</li>
+<li><b>Sort</b> fields next - if the query sorts on a field, putting it next in the index means MongoDB can return results already in that order, avoiding an expensive in-memory sort.</li>
+<li><b>Range</b> fields last - fields matched with <code>$gt</code>/<code>$lt</code>/<code>$in</code> etc. Once the index starts ranging over a field, the ordering guarantee for any fields after it is lost, so ranges must come after equality and sort fields, not before.</li>
+</ul>
+
+<p>
+Example: filter <code>{ status: "COMPLETED" }</code>, sort by <code>{ createdAt: -1 }</code>, range on <code>{ total: { $gt: 100 } }</code> &rarr; the ideal index is:
+</p>
+
+<pre>
+db.orders.createIndex({ status: 1, createdAt: -1, total: 1 })
+</pre>
+
+<p>
+Get the order wrong (say, range before sort) and MongoDB falls back to an in-memory sort, which is capped at 32MB by default and is a very common production performance cliff once a collection grows.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+ESR is the MongoDB-specific version of a general truth about B-tree indexes: exact-match filters narrow the range fastest, sort order should come from the index whenever possible, and open-ended ranges should be applied last since they can't preserve ordering for subsequent fields. Framing it that way shows you understand the mechanism, not just a mnemonic.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q24">
+Q24. What Is A Covered Query?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A query is <b>covered</b> when every field it needs - the filter, the projection, and any sort - is present in the index itself, so MongoDB can answer entirely from the index without ever fetching the actual document. That means no <code>FETCH</code> stage in the query plan, just an <code>IXSCAN</code>.
+</p>
+
+<pre>
+db.users.createIndex({ city: 1, name: 1 })
+
+db.users.find(
+  { city: "Pune" },
+  { city: 1, name: 1, _id: 0 }
+)
+</pre>
+
+<p>
+Because the query only asks for <code>city</code> and <code>name</code> (and explicitly excludes <code>_id</code>, which is not part of this index), the index alone can satisfy it. In <code>explain("executionStats")</code>, a covered query shows <code>totalDocsExamined: 0</code> - that field is the tell-tale sign.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Leaving <code>_id</code> in the projection by accident is the single most common reason a query that "should" be covered isn't - <code>_id</code> is always indexed on its own, but that doesn't make it part of <i>this</i> compound index, so it forces a document fetch. Always exclude it explicitly when chasing a covered query.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q25">
+Q25. What Are Text Indexes In MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A text index is a special index type built for full-text search across string fields - it supports <code>$text</code> queries with stemming, stop-word removal, and relevance scoring via <code>{ $meta: "textScore" }</code>.
+</p>
+
+<pre>
+db.articles.createIndex({ title: "text", body: "text" })
+
+db.articles.find(
+  { $text: { $search: "mongodb aggregation" } },
+  { score: { $meta: "textScore" } }
+).sort({ score: { $meta: "textScore" } })
+</pre>
+
+<p>
+A collection can have only one text index (though it can be compound across several fields, with per-field weights to bias relevance). Text indexes are fine for basic in-app search, but they lack fuzzy matching, faceting, and the relevance tuning of a dedicated search engine or MongoDB Atlas Search (Q49).
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q26">
+Q26. What Are TTL Indexes And When Do You Use Them?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A <b>TTL (time-to-live) index</b> is a single-field index on a Date field with an <code>expireAfterSeconds</code> option - a background process periodically sweeps and deletes documents once they age past that threshold, with no application-level cron job required.
+</p>
+
+<pre>
+db.sessions.createIndex(
+  { lastActiveAt: 1 },
+  { expireAfterSeconds: 1800 }   // 30 minutes
+)
+</pre>
+
+<p>
+Typical uses: session data, email-verification/reset tokens, short-lived cache-like collections, and rolling log retention. Two things to keep in mind: the sweep runs on a background cycle (roughly every 60 seconds), so deletion is not instant, and TTL only works on a top-level Date field (or an array of Date values, in which case it expires once the <i>earliest</i> date passes).
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+TTL indexes are the built-in alternative to writing your own archiving/expiry job (Q53) - use them for true "this data becomes worthless after time X" cases, and use archiving instead when the data must be retained somewhere, just not in the hot collection.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q27">
+Q27. What Is The Difference Between Partial And Sparse Indexes?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Both shrink an index by excluding some documents, but they differ in flexibility.
+</p>
+
+<ul>
+<li><b>Sparse index</b> - excludes documents that do not have the indexed field at all. Saves space when a field is rare, but its interaction with sorts and certain queries (which expect every document to be represented) can be surprising.</li>
+<li><b>Partial index</b> - indexes only documents matching an arbitrary filter expression, e.g. only <code>ACTIVE</code> orders:</li>
+</ul>
+
+<pre>
+db.orders.createIndex(
+  { customerId: 1, createdAt: -1 },
+  { partialFilterExpression: { status: "ACTIVE" } }
+)
+</pre>
+
+<p>
+Partial indexes are a strict superset of what sparse indexes can do (a "field exists" filter is just one possible <code>partialFilterExpression</code>), so modern guidance is to prefer partial indexes over sparse ones in almost every case - they are smaller, keep writes faster, and can express any predicate, not just field existence.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q28">
+Q28. What Is A Wildcard Index And When Is It Useful?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A wildcard index indexes all fields (or all fields under a given subtree path) without you knowing their names in advance:
+</p>
+
+<pre>
+db.products.createIndex({ "attributes.$**": 1 })
+</pre>
+
+<p>
+This is aimed at highly variable, user-defined schemas - for example a product catalog where each category has wildly different attribute fields (screen size for phones, thread count for bedsheets) and you cannot predict which attribute a customer will filter on next.
+</p>
+
+<p>
+The trade-off: a wildcard index is larger than a targeted one, does not support covered queries, and has weaker compound-query behavior. Whenever you <i>do</i> know the shape of a common query, a specific compound index (following the ESR rule, Q23) will always outperform a wildcard index for that query.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q29">
+Q29. How Do You Read A MongoDB explain() Plan In Depth?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>explain("executionStats")</code> returns a tree with three broad sections:
+</p>
+
+<ul>
+<li><b>queryPlanner</b> - the <code>winningPlan</code> (the stage tree MongoDB actually executed) and <code>rejectedPlans</code> (other index candidates that were considered and scored lower).</li>
+<li><b>executionStats</b> - <code>nReturned</code>, <code>totalKeysExamined</code>, <code>totalDocsExamined</code>, <code>executionTimeMillis</code>, and per-stage breakdowns.</li>
+<li><b>serverInfo</b> - version/host metadata, rarely interesting for tuning.</li>
+</ul>
+
+<p>
+Key ratios to check: <code>totalKeysExamined</code> close to <code>nReturned</code> means the index is precise (little wasted scanning); <code>totalDocsExamined: 0</code> with an <code>IXSCAN</code> means the query is covered (Q24); a top-level <code>COLLSCAN</code> stage means no usable index existed at all; a <code>SORT</code> stage (as opposed to getting sorted order for free from an <code>IXSCAN</code>) means an expensive in-memory sort happened.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Senior habit worth stating out loud: always check <code>rejectedPlans</code>, not just <code>winningPlan</code>. When you add a new index and the query still isn't using it, <code>rejectedPlans</code> tells you it existed and was considered but scored worse - usually because an existing index already matched the query "well enough" from the planner's cost model, which points you toward dropping the redundant old index rather than assuming the new one is broken.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h11">SECTION 9 - MONGODB SCHEMA DESIGN PATTERNS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q30">
+Q30. What Is The Bucket Pattern And When Do You Use It?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The Bucket pattern groups many small, related time-series-style readings into one document per time "bucket" (per hour, per sensor, per day) instead of writing one document per individual data point.
+</p>
+
+<pre>
+{
+  "sensorId": "S-42",
+  "hour": ISODate("2026-09-03T10:00:00Z"),
+  "readings": [
+    { "ts": ISODate("2026-09-03T10:00:03Z"), "value": 21.4 },
+    { "ts": ISODate("2026-09-03T10:00:08Z"), "value": 21.6 }
+  ],
+  "count": 2,
+  "sum": 43.0
+}
+</pre>
+
+<p>
+This drastically cuts the number of documents (and index entries) compared to one document per reading, reducing both storage overhead and index size, while keeping range-by-time queries cheap since a bucket already groups data by time window. Precomputed <code>count</code>/<code>sum</code> fields (tying into the Computed pattern, Q32) let you answer averages without re-scanning every reading.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Modern MongoDB (5.0+) automates this exact idea with native <b>time-series collections</b> - mentioning that the Bucket pattern is what time-series collections implement under the hood for you shows you understand the mechanism, not just the feature name.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q31">
+Q31. What Is The Subset Pattern?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+When an embedded array would grow very large - thousands of reviews on a popular product - but the common-path read only ever needs the most recent or most relevant few, the Subset pattern keeps only that small subset embedded in the parent document, and moves the full collection to a separate, independently-queried collection referenced by the parent's <code>_id</code>.
+</p>
+
+<p>
+This keeps the hot, frequently-loaded parent document small and fast, while still supporting a "see all reviews" page as a secondary, less-frequent query against the full reviews collection - the best of both embedding (fast common read) and referencing (unbounded growth handled safely).
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q32">
+Q32. What Is The Computed Pattern?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The Computed pattern precomputes and stores an expensive-to-calculate value at write time, instead of recalculating it via an aggregation on every read.
+</p>
+
+<pre>
+// on every completed order:
+db.dailyStats.updateOne(
+  { day: "2026-09-03" },
+  { $inc: { totalRevenue: order.total, orderCount: 1 } },
+  { upsert: true }
+)
+</pre>
+
+<p>
+A dashboard then reads the small <code>dailyStats</code> document directly instead of running a <code>$group</code> aggregation over the entire (potentially huge) <code>orders</code> collection on every page load.
+</p>
+
+<p>
+The trade-off is consistency risk: the computed field can drift if some update path forgets to maintain it. Mitigate with a periodic reconciliation job that recomputes and corrects the field from source data, or by driving the increment from the same write path that creates the source record (ideally in the same transaction, if the invariant is critical enough to justify one, tying back to Q34).
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q33">
+Q33. What Are Polymorphic Collections?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A polymorphic collection stores documents of different "shapes" or types together, when they are queried and displayed together, using a discriminator field to distinguish them.
+</p>
+
+<pre>
+{ "_id": 1, "userId": 9, "type": "COMMENT", "postId": 55, "text": "Nice!", "createdAt": ... }
+{ "_id": 2, "userId": 9, "type": "LIKE",    "postId": 55,                  "createdAt": ... }
+{ "_id": 3, "userId": 9, "type": "FOLLOW",  "targetUserId": 4,             "createdAt": ... }
+</pre>
+
+<p>
+All three share common fields (<code>userId</code>, <code>createdAt</code>) but carry different extra fields depending on <code>type</code>. A single query ("all notifications for this user, newest first") fetches all of them in one pass with one index - no <code>UNION</code> across separate tables the way a relational schema would need.
+</p>
+
+<p>
+In Spring Data MongoDB, model this with a common base class and <code>@TypeAlias</code>-annotated subclasses so the driver deserializes each document into the right POJO based on the discriminator field automatically.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Letting a polymorphic collection turn into an ungoverned dumping ground with no shared contract. Keep the common fields consistent and indexed, and consider <code>$jsonSchema</code> validation with a <code>oneOf</code>-style rule per <code>type</code> so the flexibility doesn't drift into chaos (Q52's schema-governance pitfall).
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h12">SECTION 10 - TRANSACTIONS, CHANGE STREAMS &amp; SHARDING DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q34">
+Q34. What Actually Happens Inside A Multi-Document Transaction, And What Does It Cost?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A multi-document transaction takes locks across every document/collection it touches, buffers its writes, and - if the collections span multiple shards - coordinates a two-phase commit across those shards. On WiredTiger it also holds a consistent snapshot of the data for the duration of the transaction, so other operations don't see partial results.
+</p>
+
+<p>
+That mechanism is not free: transactions increase latency, hold resources (and locks) longer than an equivalent single-document write, and on a sharded cluster add real cross-shard coordination overhead - meaningfully more expensive than a single-shard write. MongoDB's own guidance is to keep transactions short-lived (a 60-second default limit) and low in operation count.
+</p>
+
+<p>
+When you genuinely need one: an invariant spans two separate documents that cannot reasonably be merged into one - e.g. debiting one account document and crediting another, or decrementing inventory in one collection while creating an order in another, where "half-done" would corrupt business state.
+</p>
+
+<p>
+When to avoid one: redesign the schema first. If the invariant-holding fields can be embedded into a single document (Q10), MongoDB's built-in single-document atomicity already gives you the guarantee for free, and you never pay the transaction tax at all. A senior answer treats transactions as an escape hatch, not the default tool.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The strongest answer to "when do you use Mongo transactions" is not a list of APIs - it's "as rarely as good schema design allows, and only when the invariant truly cannot be pushed into a single document."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q35">
+Q35. What Are Change Streams And How Do They Relate To CDC?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Change streams let an application subscribe to real-time data changes - inserts, updates, deletes, replaces - on a collection, a database, or an entire deployment, without polling. They are built on top of the same oplog that replica sets already use for replication.
+</p>
+
+<pre>
+const changeStream = db.orders.watch(
+  [ { $match: { operationType: { $in: ["insert", "update"] } } } ],
+  { fullDocument: "updateLookup" }
+);
+changeStream.on("change", (event) => {
+  console.log(event.operationType, event.documentKey, event.fullDocument);
+});
+</pre>
+
+<p>
+Each change event carries the operation type and the affected document's key; adding <code>fullDocument: "updateLookup"</code> also fetches the current full document on updates. Typical uses: cache invalidation, triggering downstream workflows, real-time UI updates, and feeding changes into a message broker.
+</p>
+
+<p>
+This is conceptually MongoDB's native flavor of Change Data Capture - the source-side primitive. If those changes need to flow reliably at scale into Kafka or other downstream systems, that pipeline (connectors, delivery guarantees, ordering) is the territory the Event-Driven Architecture / CDC chapter owns; change streams are the tap you open, not the whole plumbing.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q36">
+Q36. What Criteria Determine A Good Shard Key, And What Is The Monotonic-Key Pitfall?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A good shard key needs three things: <b>high cardinality</b> (many distinct values, so data can actually spread across many shards), <b>even distribution</b> of both data volume and load (a field can be high-cardinality yet still skewed - e.g. "country" has many values, but 80% of traffic is one country), and it should <b>match your dominant query pattern</b> so most queries can be routed to one shard instead of scattered to all of them.
+</p>
+
+<p>
+The classic pitfall is choosing a <b>monotonically increasing</b> field - an auto-incrementing id, or a plain insertion timestamp - as the shard key. Every new insert then has the current highest value, which always routes to the same shard (the one owning the current top of the range), creating a permanent hot shard and defeating the entire point of sharding. This is the same underlying problem as the ObjectId hotspot from Q8, just one layer up - at the collection-sharding level instead of the single-node index level.
+</p>
+
+<pre>
+// mitigation: hash the otherwise-monotonic field
+db.events.createIndex({ createdAt: "hashed" })
+db.adminCommand({ shardCollection: "app.events", key: { createdAt: "hashed" } })
+</pre>
+
+<p>
+Alternative mitigations: a hashed shard key (spreads writes evenly at the cost of losing range-query locality) or a compound shard key combining a coarse, evenly-distributed bucket with the monotonic field.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q37">
+Q37. What Roles Do Chunk Splitting/Balancing And mongos Play In A Sharded Cluster?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A sharded collection's key range is divided into <b>chunks</b>. When a chunk grows past a size threshold, MongoDB automatically splits it into two smaller chunks. A background <b>balancer</b> process then migrates chunks between shards so data (and, in recent versions, actual disk usage) stays roughly even across the cluster.
+</p>
+
+<p>
+<code>mongos</code> is the stateless query router applications actually talk to - it is not a data-holding node itself. It consults the config servers for the current chunk-to-shard mapping, routes a query to the specific shard(s) that can answer it (or, if the query doesn't include the shard key, to <i>every</i> shard - a "scatter-gather" query, which is why matching the shard key to your dominant query pattern, Q36, matters so much), and merges the results back into a single response. Application code never talks to an individual shard directly.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Forgetting that a query without the shard key becomes scatter-gather across every shard - it still works, but throws away the entire performance benefit of sharding for that query. If a query pattern regularly needs to scatter-gather, that's a signal the shard key choice (or the schema) needs revisiting, not that you should just accept the cost.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h13">SECTION 11 - CONSISTENCY TUNING &amp; OPERATIONS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q38">
+Q38. How Do You Combine Write Concern And Read Preference For A Specific Consistency-vs-Availability Trade-off?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Write concern and read preference are per-operation (or per-collection) knobs, not one global setting - the senior move is choosing the combination that fits what that specific piece of data actually needs.
+</p>
+
+<table border="1">
+<tr><th>Combination</th><th>Behaviour</th><th>Use For</th></tr>
+<tr><td>w: "majority" + read preference primary (or readConcern "majority")</td><td>Strongest consistency, higher latency, less read scalability</td><td>Payments, inventory holds, anything that must never be stale</td></tr>
+<tr><td>w: 1 + read preference secondaryPreferred</td><td>Maximum throughput/availability, eventual consistency, some rollback risk on failover</td><td>View counts, activity feeds, analytics</td></tr>
+<tr><td>w: "majority" write, then immediate readConcern "majority" read</td><td>"Read your own write" - guarantees you see what you just wrote</td><td>User updates their profile and the UI re-reads it immediately</td></tr>
+</table>
+
+<p>
+The mistake to avoid is treating this as one deployment-wide decision. A single application legitimately uses strong settings for its order-total field and relaxed settings for its "last seen" timestamp on the very same document, because the two fields have entirely different staleness tolerances.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q39">
+Q39. How Does Connection Pooling Work In Spring Data MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The underlying <code>MongoClient</code> maintains a connection pool (default max pool size of 100) shared across the whole application; Spring Data MongoDB's repositories and <code>MongoTemplate</code> both just ride on that one client and its pool.
+</p>
+
+<pre>
+spring.data.mongodb.uri=mongodb://host:27017/app?maxPoolSize=200&amp;minPoolSize=10&amp;maxIdleTimeMS=60000
+</pre>
+
+<p>
+Under load, pool exhaustion shows up as "waiting for a connection" timeouts rather than database-level errors - tune <code>maxPoolSize</code>/<code>minPoolSize</code>/<code>maxConnectionIdleTime</code> relative to how many app instances you run and how many total connections your MongoDB deployment allows. This is the exact same category of concern as sizing a HikariCP pool for JDBC - the mental model transfers directly from the Spring Data JPA material.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q40">
+Q40. How Do You Use The Database Profiler To Find Slow Queries?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The profiler records operations exceeding a slow-op threshold into the <code>system.profile</code> collection. It has three levels: <code>0</code> (off), <code>1</code> (log only slow ops), <code>2</code> (log every operation - useful for local debugging, far too heavy for production).
+</p>
+
+<pre>
+db.setProfilingLevel(1, { slowms: 50 })
+
+db.system.profile.find({ millis: { $gt: 100 } })
+      .sort({ ts: -1 })
+      .limit(20)
+</pre>
+
+<p>
+In production, level 1 with a sane <code>slowms</code> threshold (plus mongod's own slow-query log line, which gives you the same information without the extra write overhead level 2 adds to every operation) is the practical default. On MongoDB Atlas, the Performance Advisor and built-in Profiler UI surface this without needing to query <code>system.profile</code> by hand.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q41">
+Q41. What Are The Most Common MongoDB Schema/Query Anti-Patterns?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A short list interviewers listen for:
+</p>
+
+<ul>
+<li><b>Unbounded arrays</b> - embedding comments/log entries/audit trail directly with no cap, causing constant document growth and eventually hitting the 16MB limit (Q10, Q11).</li>
+<li><b>Deeply nested documents</b> (5+ levels) - hard to query, index, or update; positional update operators (<code>$</code>, <code>$[]</code>) get awkward past one or two levels of nesting.</li>
+<li><b>Missing indexes on high-cardinality query fields</b> - the classic surprise COLLSCAN in production; always validate new query paths with <code>explain()</code> (Q29) before shipping.</li>
+<li><b>Case-sensitivity assumptions</b> - MongoDB string comparisons are case-sensitive and byte-order by default. A "case-insensitive email lookup" needs a collation or a normalized lowercase duplicate field, not a bare <code>$regex</code> with the <code>i</code> flag, which cannot use a standard index efficiently.</li>
+</ul>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+All four of these anti-patterns share one root cause: designing the document shape without first pinning down the actual read/write pattern (Q12). Every fix above is really just "go back and match the schema to the query" in a different guise.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h14">PART 1 COMPLETE</h1>
+
+<p>
+
+Next Part:
+
+* Migrating A Relational Schema To MongoDB
+* Common Migration Pitfalls And Polyglot Persistence
+* Advanced Aggregation - $facet, $bucket, $graphLookup, $merge
+* Multikey Indexes And $lookup Performance
+* Data Modeling Edge Cases - Hierarchies, Multi-Tenancy, Soft Deletes
+* MongoDB Operations - Backup, Security, Capacity Planning, Monitoring
+* Spring Data MongoDB In Depth
+
+These are some of the most frequently asked NoSQL and MongoDB topics in senior interviews.
+
+</p>
+
+<hr>
+
+<h1 id="h15">SECTION 12 - REAL-WORLD MIGRATION &amp; DECISION-MAKING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q42">
+Q42. A Relational Schema Is Struggling Under A Specific Access Pattern - Walk Through Whether/How You'd Move It To MongoDB.
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is a synthesis question, and the strongest answers do not start with "yes, migrate" - they start by interrogating whether migration is even the right fix.
+</p>
+
+<ul>
+<li><b>1. Name the actual pain, with numbers.</b> Is it a schema-rigidity problem (constant migrations for new fields), a read-latency problem (a page load needs a 6-table join), a write-throughput problem (can't keep up with insert volume), or - very common - a data-modeling mistake that a targeted index or a schema change could fix <i>within</i> SQL first?</li>
+<li><b>2. Design the target document shape around the dominant read path</b> - using embed-vs-reference (Q10) and the schema patterns from this chapter (Bucket, Subset, Computed, Q30-Q32), not a literal one-table-to-one-collection port.</li>
+<li><b>3. Plan the cutover carefully</b> - dual-write to both stores, backfill the rest with an ETL/migration script, verify with shadow reads comparing old vs new results, then flip reads over gradually, keeping the old system as a fallback for a defined window.</li>
+<li><b>4. Decide what stays relational.</b> Financial ledgers, anything needing genuine multi-table joins or ad-hoc reporting, usually stays in SQL. Real migrations almost always end up polyglot (Q44), not "replace SQL wholesale".</li>
+</ul>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The signal interviewers are screening for is restraint: a senior engineer's first instinct is to ask "is this actually a NoSQL problem, or a modeling/indexing problem I could fix where the data already lives?" before reaching for a migration.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q43">
+Q43. What Are The Most Common Pitfalls When Migrating To MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The recurring mistakes when teams move to MongoDB without adjusting their mental model:
+</p>
+
+<ul>
+<li><b>Porting the normalized shape 1:1</b> - keeping the same multi-collection layout and doing app-level joins for everything ends up <i>slower</i> than the original SQL, because you lost the relational query planner's join optimization without gaining Mongo's read-locality benefit.</li>
+<li><b>No schema governance</b> - flexible schema is a feature until nobody agrees what a document should look like. Use <code>$jsonSchema</code> validators or a versioned convention (Q50) so the collection doesn't drift into inconsistent shapes.</li>
+<li><b>Ignoring the 16MB document limit and array-growth limits</b> when directly porting a parent/children table pair into an embedded array without checking cardinality.</li>
+<li><b>Assuming transactions "just work" the same way</b> - multi-document ACID transactions exist (Q34) but are meant to be the exception in a well-modeled schema, not the default pattern carried over from relational habits.</li>
+</ul>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q44">
+Q44. What Does A Realistic Polyglot Persistence Architecture Look Like?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A concrete example - an e-commerce platform: <b>Postgres</b> for orders/payments/inventory (multi-table joins, strong ACID, reporting), <b>MongoDB</b> for the product catalog (variable attributes per category, read-heavy, denormalized for the product page), <b>Redis</b> for session/cart state and rate limiting, <b>Atlas Search/Elasticsearch</b> for product search, and <b>Cassandra</b> or a time-series store for clickstream/event analytics.
+</p>
+
+<p>
+The architectural discipline this requires: each service/bounded context owns its own datastore - the same database-per-service principle from the Microservices chapter - and cross-store consistency is handled through events or change streams/CDC (Q35) rather than attempting a distributed transaction across fundamentally different database technologies.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the right store for each concern, and explicitly calling out that consistency between them is eventual and event-driven (not a cross-database transaction), is what separates "I've heard of five databases" from "I've actually designed a system with five databases".
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">SECTION 13 - ADVANCED AGGREGATION &amp; QUERYING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q45">
+Q45. What Do $facet, $bucket And $graphLookup Do In The Aggregation Pipeline?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Three stages that go beyond the basic <code>$match</code>/<code>$group</code>/<code>$sort</code> toolkit from Q15:
+</p>
+
+<ul>
+<li><b>$facet</b> - runs several independent aggregation sub-pipelines against the same input in a single pass. A product listing page can get paginated results, category facet counts, and a price histogram in one round trip instead of three separate queries.</li>
+<li><b>$bucket / $bucketAuto</b> - groups documents into ranges (e.g. price bands $0-50, $50-100...), like a histogram, in one stage instead of a chain of <code>$match</code>+<code>$group</code> per bucket.</li>
+<li><b>$graphLookup</b> - performs a recursive traversal within an aggregation, e.g. "find every report under this manager, however many levels deep". It is a lightweight, in-database version of what a graph database does, useful for moderate-depth hierarchical data already living in MongoDB.</li>
+</ul>
+
+<pre>
+db.employees.aggregate([
+  { $match: { name: "Nasir" } },
+  { $graphLookup: {
+      from: "employees",
+      startWith: "$_id",
+      connectFromField: "_id",
+      connectToField: "managerId",
+      as: "allReports"
+  }}
+])
+</pre>
+
+<p>
+A genuinely graph-heavy workload (unbounded depth, high fan-out, relationship-first product) still belongs in a dedicated graph database (Q21) - <code>$graphLookup</code> is for the common case of a moderately deep tree already sitting in a document collection.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q46">
+Q46. What Is The Difference Between $out And $merge, And Why Use Them?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Both write an aggregation's output into a collection instead of returning it to the client, but they differ in how.
+</p>
+
+<ul>
+<li><b>$out</b> - replaces the entire target collection with the pipeline's output. Simple, but always a full recompute.</li>
+<li><b>$merge</b> - can insert, update, or merge into an <i>existing</i> collection, so you can incrementally refresh a materialized view rather than recomputing everything from scratch every run.</li>
+</ul>
+
+<pre>
+db.rawEvents.aggregate([
+  { $match: { day: "2026-09-03" } },
+  { $group: { _id: "$city", total: { $sum: "$amount" } } },
+  { $merge: { into: "dailyStats", whenMatched: "merge", whenNotMatched: "insert" } }
+])
+</pre>
+
+<p>
+A common pattern: a nightly or hourly aggregation of raw event data into a pre-aggregated <code>dailyStats</code> collection using <code>$merge</code> (tying directly into the Computed pattern, Q32), so dashboards query the small pre-aggregated collection instead of scanning millions of raw events on every page load.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q47">
+Q47. What Are The Rules And Gotchas Of Multikey Indexes On Arrays?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Any index on a field holding an array automatically becomes a <b>multikey index</b> - MongoDB creates one index entry per array element, so <code>find({ tags: "sale" })</code> can match any document whose <code>tags</code> array contains that value.
+</p>
+
+<p>
+The key restriction: you cannot create a compound index with more than one array field, because MongoDB would need to index every combination of elements across both arrays - a cross-product it disallows outright.
+</p>
+
+<p>
+A separate correctness gotcha: to match multiple conditions against <i>the same</i> array element (not different elements each satisfying one condition), use <code>$elemMatch</code>:
+</p>
+
+<pre>
+// WRONG - can match two different elements, one per condition
+db.products.find({ "variants.size": "L", "variants.color": "red" })
+
+// RIGHT - both conditions must hold on the same array element
+db.products.find({
+  variants: { $elemMatch: { size: "L", color: "red" } }
+})
+</pre>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Forgetting <code>$elemMatch</code> and getting silent false positives - a product with a red XL variant and a separate blue L variant will incorrectly match a naive <code>{ "variants.size": "L", "variants.color": "red" }</code> query. This is one of the most common production data bugs in array-heavy MongoDB schemas.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q48">
+Q48. When Does $lookup Become A Performance Problem, And What's The Fix?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>$lookup</code> is MongoDB's left-outer-join equivalent, and it is not free - depending on the shape of the query it can be a per-document lookup into the foreign collection, which reintroduces exactly the join cost the document model was meant to avoid, once it's on a hot, high-QPS read path.
+</p>
+
+<p>
+The idiomatic MongoDB answer to "my <code>$lookup</code> is slow" is usually not "tune the <code>$lookup</code>" - it's "should this data have been embedded or denormalized in the first place" (Q10). Reserve <code>$lookup</code> for reporting, analytics pipelines, and admin views where the query volume is low and flexibility matters more than raw speed, not for the request path a customer waits on.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q49">
+Q49. Full-Text Search - $text Index vs Atlas Search vs A Dedicated Search Engine?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<table border="1">
+<tr><th>Option</th><th>Strength</th><th>Limitation</th></tr>
+<tr><td>$text index (Q25)</td><td>Free, built-in, simple</td><td>No fuzzy matching, weak relevance tuning, no faceting</td></tr>
+<tr><td>Atlas Search</td><td>Lucene-based, fuzzy matching, autocomplete, facets, synonyms - no separate cluster to run</td><td>Only available on MongoDB Atlas</td></tr>
+<tr><td>Elasticsearch / OpenSearch</td><td>Most mature tooling, purpose-built for heavy search</td><td>Separate system to run and keep in sync (usually via CDC/change streams, Q35)</td></tr>
+</table>
+
+<p>
+Rule of thumb: start with a <code>$text</code> index for "good enough" in-app search. Reach for Atlas Search or a dedicated engine only once search becomes a primary, heavily-used product feature rather than a secondary convenience - the operational cost of a second system should be justified by how central search actually is.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h17">SECTION 14 - DATA MODELING EDGE CASES</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q50">
+Q50. How Do You Handle Schema Evolution/Versioning In MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+MongoDB doesn't enforce a schema at the engine level (unless you add <code>$jsonSchema</code> validation), so document shape drifts as the application evolves - old-shape and new-shape documents will coexist in the same collection.
+</p>
+
+<ul>
+<li>Add a <code>schemaVersion</code> field to documents and branch application logic (or a migration script) based on it.</li>
+<li>Write "tolerant reader" code that defaults missing fields rather than assuming every document matches the latest shape.</li>
+<li>Run background migration jobs that lazily upgrade documents on read or write, instead of a risky big-bang migration across a huge collection.</li>
+</ul>
+
+<p>
+Contrast with relational: a SQL <code>ALTER TABLE</code> mostly forces one consistent shape immediately (or as an online DDL operation). MongoDB's flexibility means the migration can be gradual - but that same flexibility is exactly what causes the "no schema governance" pitfall (Q43) if nobody enforces discipline around it.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q51">
+Q51. How Do You Model Hierarchical/Tree Data In MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Four common strategies, each trading off write cost against query flexibility:
+</p>
+
+<table border="1">
+<tr><th>Pattern</th><th>Stores</th><th>Good For</th><th>Weak At</th></tr>
+<tr><td>Parent references</td><td>Each node's parent _id</td><td>Cheap writes</td><td>Descendant/subtree queries need recursion ($graphLookup, Q45)</td></tr>
+<tr><td>Child references</td><td>Array of children's _ids</td><td>Immediate-children lookups</td><td>Full subtree/ancestor queries</td></tr>
+<tr><td>Materialized path</td><td>Full path string/array on each node (e.g. "root,parentId,thisId")</td><td>One prefix query returns all descendants</td><td>Moving a node means updating the whole subtree's paths</td></tr>
+<tr><td>Array of ancestors</td><td>All ancestor _ids on each node</td><td>Cheap "all descendants of X" via a multikey index</td><td>Same update cost as materialized path on a move</td></tr>
+</table>
+
+<p>
+"Array of ancestors" is a common pick for read-heavy hierarchies (comment threads, category trees) where reads vastly outnumber node moves.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q52">
+Q52. How Do You Model Multi-Tenancy In MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Three approaches, in increasing order of isolation and operational cost:
+</p>
+
+<ul>
+<li><b>Shared collection + tenantId field</b> - simplest and most efficient (one deployment, one connection pool), but <i>every single query</i> must filter by <code>tenantId</code> - enforce this at the data-access layer, and put <code>tenantId</code> first in every compound index. A missed filter here is a cross-tenant data leak, not just a bug.</li>
+<li><b>Database-per-tenant / collection-per-tenant</b> - strongest isolation, a tenant can be resized/backed-up/deleted independently, easier to meet strict compliance requirements, but operational overhead multiplies with tenant count and cross-tenant analytics gets harder.</li>
+<li><b>Hybrid</b> - shared collections for small tenants, dedicated databases for large/enterprise tenants paying for isolation - a common real-world compromise.</li>
+</ul>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior framing: multi-tenancy is a spectrum from "cheap and shared" to "isolated and expensive", and production systems often run <i>both</i> ends simultaneously segmented by tenant tier, not a single one-size-fits-all choice.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q53">
+Q53. How Do You Implement Soft Deletes And Archiving In MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<b>Soft delete</b> - add a <code>deletedAt</code>/<code>isDeleted</code> field instead of physically removing the document, keeping audit/referential history intact. Every query must exclude deleted documents - enforce this with a partial index (<code>{ partialFilterExpression: { deletedAt: { $exists: false } } }</code>, Q27) and/or a default filter in the repository layer, not by hoping every call site remembers.
+</p>
+
+<p>
+<b>Archiving</b> - periodically move old/inactive documents out of the hot collection into a cold <code>_archive</code> collection (or a cheaper storage tier), keeping the primary collection - and its indexes - small and fast, with a fallback query path to the archive collection for the rare historical lookup.
+</p>
+
+<p>
+A TTL index (Q26) is effectively the automatic version of a hard delete after a retention window; combine it with archiving first if the data must be retained somewhere, just not in the hot collection.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h18">SECTION 15 - OPERATIONS, MONITORING &amp; SECURITY</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q54">
+Q54. How Does Backup/Restore And Point-In-Time Recovery Work In MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>mongodump</code>/<code>mongorestore</code> give portable logical backups, but are slower and resource-heavy on large data sets. Filesystem or volume snapshots on a replica set give fast physical backups, consistent as long as journaling is enabled when the snapshot is taken.
+</p>
+
+<p>
+<b>Point-in-time recovery</b> restores a base snapshot, then replays the oplog (the same replication log secondaries consume) up to a specific timestamp - letting you recover to "just before the bad deploy ran a bad update", not merely to the last nightly backup.
+</p>
+
+<p>
+MongoDB Atlas automates continuous backups with point-in-time restore built in; self-managed clusters need to build this snapshot-plus-oplog-replay pipeline themselves.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q55">
+Q55. What Are The MongoDB-Specific Security Basics?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Authentication (SCRAM by default; x.509 or LDAP/Kerberos in Enterprise), role-based authorization (built-in roles like <code>read</code>, <code>readWrite</code>, <code>dbAdmin</code>, or custom roles scoped to specific actions/collections), TLS for data in transit, encryption at rest (the WiredTiger encrypted storage engine, or filesystem/volume-level encryption), and field-level (client-side) encryption for specific sensitive fields that must stay encrypted even from database administrators.
+</p>
+
+<p>
+The general security practices - least privilege, secrets management, network segmentation - are covered in depth in the Security chapter. The Mongo-specific piece is mainly operational discipline: never run with auth disabled outside local dev, and scope roles per service (a reporting service gets a read-only role, never the application's read-write credentials).
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q56">
+Q56. Why Does MongoDB Capacity Planning Center On The "Working Set"?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+MongoDB's WiredTiger storage engine performs best when the <b>working set</b> - the actively-used indexes and documents - fits in RAM. Once it doesn't, cache misses turn into disk reads and performance falls off a cliff rather than degrading gradually.
+</p>
+
+<p>
+Capacity planning therefore means sizing RAM to roughly cover your hot indexes plus hot data - not your total data set size - and watching cache eviction/page-fault metrics as <i>leading</i> indicators, so you catch the trend before you actually hit the cliff, not after.
+</p>
+
+<p>
+This is also why over-indexing (Q14, Q41) is a real cost, not just a write-latency nuisance: every additional index competes for the exact same RAM budget as your hot data, so an unnecessary index can push your genuinely important data out of cache.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q57">
+Q57. What Do You Monitor In MongoDB, And With What Tools?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>mongostat</code> gives a real-time per-second view of ops/sec (insert/query/update/delete), connections, memory, and replication lag - effectively "top" for MongoDB. <code>mongotop</code> breaks down read/write time per collection, useful for spotting a runaway collection before it becomes a full incident.
+</p>
+
+<p>
+Key metrics worth alerting on: replication lag (secondaries falling behind means stale reads and elevated failover risk), connection count approaching the pool/server limit, cache eviction rate, queued reads/writes (ticket exhaustion under WiredTiger's concurrency control), and slow-query counts surfaced by the profiler (Q40).
+</p>
+
+<p>
+On Atlas, most of this is a built-in dashboard (the Real-Time Performance Panel plus Performance Advisor's missing-index suggestions). Self-managed deployments typically wire <code>mongostat</code>/<code>mongotop</code> output and the profiler into Prometheus/Grafana, following the same observability practices covered in the Observability chapter.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h19">SECTION 16 - SPRING DATA MONGODB IN DEPTH</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q58">
+Q58. When Do You Use MongoTemplate Instead Of MongoRepository?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>MongoRepository</code> (derived query methods, just like Spring Data JPA) is enough for straightforward CRUD and simple filters - fast to write, low ceremony. <code>MongoTemplate</code> gives you the full Criteria API, the aggregation framework (<code>Aggregation.newAggregation(...)</code>), bulk operations, and direct access to update operators (<code>$inc</code>, <code>$push</code>) that don't map cleanly onto a derived method name.
+</p>
+
+<pre>
+@Repository
+public class OrderStatsRepository {
+    private final MongoTemplate template;
+    public OrderStatsRepository(MongoTemplate template) { this.template = template; }
+
+    public List&lt;RevenueByCity&gt; revenueByCity() {
+        Aggregation agg = Aggregation.newAggregation(
+            Aggregation.match(Criteria.where("status").is("COMPLETED")),
+            Aggregation.group("city").sum("total").as("totalRevenue"),
+            Aggregation.sort(Sort.Direction.DESC, "totalRevenue")
+        );
+        return template.aggregate(agg, "orders", RevenueByCity.class).getMappedResults();
+    }
+}
+</pre>
+
+<p>
+Practical pattern: use repositories for the majority of simple lookups, and inject <code>MongoTemplate</code> (or a custom repository fragment, Q59) for anything involving aggregation, dynamic/optional filters, or bulk writes.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q59">
+Q59. How Do You Write Custom Repository Implementations And Use @Query?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>@Query</code> lets you write a raw Mongo-shaped query directly on a repository method when a derived method name would be unreadable or simply impossible - for example a deeply nested field condition:
+</p>
+
+<pre>
+public interface UserRepository extends MongoRepository&lt;User, String&gt; {
+    @Query("{ 'city': ?0, 'age': { $gt: ?1 } }")
+    List&lt;User&gt; findAdultsInCity(String city, int minAge);
+}
+</pre>
+
+<p>
+For genuinely custom logic - dynamic Criteria built from optional filters, direct <code>MongoTemplate</code> access - implement a custom fragment interface and its implementation, then have the main repository extend both <code>MongoRepository</code> and that fragment:
+</p>
+
+<pre>
+public interface UserRepositoryCustom {
+    List&lt;User&gt; searchDynamic(UserSearchCriteria criteria);
+}
+
+public class UserRepositoryCustomImpl implements UserRepositoryCustom {
+    private final MongoTemplate template;
+    // build Criteria dynamically based on which fields in criteria are non-null
+}
+
+public interface UserRepository extends MongoRepository&lt;User, String&gt;, UserRepositoryCustom { }
+</pre>
+
+<p>
+Spring Data stitches the custom fragment into the repository proxy automatically - the same composition pattern used for custom Spring Data JPA repositories.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q60">
+Q60. How Do Auditing And Optimistic Locking Work In Spring Data MongoDB?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>@EnableMongoAuditing</code> plus <code>@CreatedDate</code>/<code>@LastModifiedDate</code> (and <code>@CreatedBy</code>/<code>@LastModifiedBy</code> with an <code>AuditorAware</code> bean) auto-populate timestamp and author fields on save - mirroring how JPA auditing works.
+</p>
+
+<pre>
+@Document(collection = "orders")
+public class Order {
+    @Id private String id;
+    @CreatedDate private Instant createdAt;
+    @LastModifiedDate private Instant updatedAt;
+    @Version private Long version;
+    // ...
+}
+</pre>
+
+<p>
+<code>@Version</code> on a numeric field gives optimistic locking: <code>MongoRepository.save()</code> includes the current version in its update filter and increments it on success, so a concurrent <code>save()</code> based on a stale in-memory version fails with an <code>OptimisticLockingFailureException</code> instead of silently overwriting a concurrent update - the exact same concept as JPA's <code>@Version</code>, applied to documents instead of rows.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q61">
+Q61. How Do You Test MongoDB Code With Testcontainers vs Embedded Mongo?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Testcontainers' <code>MongoDBContainer</code> spins up a real, disposable <code>mongod</code> in Docker for integration tests - the preferred approach today, because it behaves exactly like production MongoDB: correct aggregation behavior, real index behavior, and (if configured as a single-node replica set) real transaction support.
+</p>
+
+<pre>
+@Testcontainers
+class OrderRepositoryIT {
+    @Container
+    static MongoDBContainer mongo = new MongoDBContainer("mongo:7.0");
+
+    @DynamicPropertySource
+    static void mongoProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.data.mongodb.uri", mongo::getReplicaSetUrl);
+    }
+    // ...
+}
+</pre>
+
+<p>
+The older Flapdoodle "embedded Mongo" approach downloads and runs a real <code>mongod</code> binary without Docker - useful when Docker isn't available in CI, but it has historically lagged behind newer MongoDB versions and makes replica-set/transaction testing awkward.
+</p>
+
+<p>
+The gotcha that trips teams up the first time they add transaction-touching tests: transactions require replica-set mode, so a plain single-node <code>mongod</code> (the default in some setups) will reject them - the test container (or embedded instance) needs to be started in single-node replica-set mode specifically.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q62">
+Q62. How Do You Stream Large Result Sets From Spring Data MongoDB Without Running Out Of Memory?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A raw <code>find()</code> returns a cursor that fetches results in batches (the driver negotiates a batch size, commonly 101 documents for the first batch, then configurable) rather than loading the whole result set into memory at once. However, a Spring Data repository method that returns <code>List&lt;T&gt;</code> still materializes everything into memory - it just drains the cursor for you.
+</p>
+
+<pre>
+public interface EventRepository extends MongoRepository&lt;Event, String&gt; {
+    Stream&lt;Event&gt; findByDayGreaterThanEqual(LocalDate day);
+}
+
+try (Stream&lt;Event&gt; events = eventRepository.findByDayGreaterThanEqual(cutoff)) {
+    events.forEach(this::process);
+}
+</pre>
+
+<p>
+For genuinely large result sets, use a <code>Stream&lt;T&gt;</code> return type (or <code>Query.stream()</code> with <code>MongoTemplate</code>) inside a try-with-resources block, so the underlying cursor stays open only as long as you are actively consuming it, and elements are processed one at a time instead of all being held in memory.
+</p>
+
+<p>
+This mirrors the identical "don't materialize a huge List" concern from JDBC/JPA streaming (Spring Data JPA chapter) - cursor-based batching is what makes it safe to iterate millions of documents without an OutOfMemoryError, as long as the calling code actually streams rather than collects into a list.
+</p>
+
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h20">QUICK REVISION SHEET</h1>
 
 <hr>
 
@@ -1008,6 +2930,24 @@ Tie it together: "Replica sets give me availability, sharding gives me scale, wr
 <li><b>Transactions</b> - multi-document ACID since Mongo 4.0; single-document was always atomic.</li>
 <li><b>Spring Data MongoDB</b> - <code>MongoRepository</code> + derived queries; <code>MongoTemplate</code> for advanced ops.</li>
 <li><b>Breadth</b> - Redis = caching (System Design chapter), Cassandra = wide-column write-heavy.</li>
+<li><b>Cassandra</b> - partition key picks the node, clustering key sorts within it; model one table per query.</li>
+<li><b>Tunable consistency</b> - R + W &gt; RF gives strong reads in Cassandra; LOCAL_QUORUM for multi-DC.</li>
+<li><b>Cassandra writes/deletes</b> - LSM-tree makes writes cheap (append-only); deletes are tombstones, purged only at compaction.</li>
+<li><b>Redis as primary DB</b> - rich data structures + persistence/replication, but the data set must fit in RAM.</li>
+<li><b>Graph DB (Neo4j)</b> - wins when traversal depth is unbounded/unknown (index-free adjacency); overkill for one-hop relationships.</li>
+<li><b>ESR rule</b> - order compound indexes Equality, Sort, Range.</li>
+<li><b>Covered query</b> - index alone answers it; totalDocsExamined: 0 in explain().</li>
+<li><b>Partial index</b> beats sparse index in modern MongoDB; wildcard index for unpredictable field names; TTL index for auto-expiry.</li>
+<li><b>Schema patterns</b> - Bucket (time-series), Subset (large arrays), Computed (pre-aggregated), Polymorphic (discriminator field).</li>
+<li><b>Multi-doc transactions</b> - real cost (locks, cross-shard 2PC); prefer redesigning the schema to avoid needing them.</li>
+<li><b>Change streams</b> - real-time watch() on the oplog; the source-side primitive for CDC, not a replacement for the pipeline.</li>
+<li><b>Shard key</b> - high cardinality, matches the query pattern, avoid monotonic keys (hot shard); mongos routes via chunk metadata, balancer keeps chunks even.</li>
+<li><b>Migration decisions</b> - name the specific pain before moving off SQL; real systems usually end up polyglot, not "replace SQL wholesale".</li>
+<li><b>Advanced aggregation</b> - $facet (multi-view), $bucket (histogram), $graphLookup (recursive traversal), $merge (incremental materialized view).</li>
+<li><b>$lookup</b> is not free - reserve it for reporting/admin views, not high-QPS request paths; denormalize instead where it matters.</li>
+<li><b>Multi-tenancy</b> - shared collection + tenantId (indexed first) vs DB-per-tenant for isolation; soft delete + partial index over hard delete.</li>
+<li><b>MongoDB ops</b> - working set must fit RAM; mongostat/mongotop/profiler for visibility; oplog replay for point-in-time recovery.</li>
+<li><b>Spring Data MongoDB depth</b> - MongoTemplate for aggregation/bulk ops, @Version for optimistic locking, Testcontainers (replica-set mode) for transaction tests, Stream&lt;T&gt; to avoid loading huge result sets into memory.</li>
 </ul>
 
 </div>

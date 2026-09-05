@@ -118,6 +118,30 @@ Interviewers rarely stop at "what is a Mono." They want to see whether you have 
 
 <li>Reactive vs Virtual Threads (Project Loom)</li>
 
+<li>Assembly Time vs Subscription Time vs Execution Time</li>
+
+<li>Cold vs Hot Publishers, ConnectableFlux &amp; Flux.share()</li>
+
+<li>Context Propagation: Why ThreadLocal Fails and How Reactor Context Works</li>
+
+<li>The Sinks API: Sinks.Many/Sinks.One as the Modern Replacement for FluxProcessor</li>
+
+<li>Schedulers In Depth: parallel() vs boundedElastic() vs Custom Schedulers</li>
+
+<li>Retry Strategies In Depth: retryWhen, Retry.backoff() and Jitter</li>
+
+<li>Debugging Reactive Stack Traces: Hooks.onOperatorDebug() and checkpoint()</li>
+
+<li>WebClient Deep Dive: Connection Pooling, Timeouts &amp; Resilience4j</li>
+
+<li>Server-Sent Events, Streaming Responses &amp; Backpressure to an HTTP Client</li>
+
+<li>Reactive Transaction Management with R2DBC (TransactionalOperator)</li>
+
+<li>Advanced Testing: Virtual Time and TestPublisher</li>
+
+<li>Reactive vs Virtual Threads - Production Decision-Making</li>
+
 </ol>
 
 <hr>
@@ -932,7 +956,1995 @@ The nuanced take interviewers want in 2026: "Loom does not make Reactor obsolete
 
 <hr>
 
-<h1 id="h8">QUICK REVISION SHEET</h1>
+<h1 id="h8">SECTION 6 - REACTOR INTERNALS: ASSEMBLY, SUBSCRIPTION &amp; EXECUTION</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q15">
+Q15. Assembly Time vs Subscription Time vs Execution Time
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A Reactor chain has three distinct phases that are easy to conflate, and interviewers use this question specifically to see whether you actually understand the "nothing happens until subscribe()" model or just recite it. <b>Assembly time</b> is when you call operators like <code>map</code>, <code>filter</code>, <code>flatMap</code> to build the chain; each operator call wraps the previous Publisher in a new Publisher and returns immediately. No data flows and no user code inside the operators executes yet, you are only constructing an object graph, a declarative recipe describing what should happen.
+</p>
+
+<p>
+<b>Subscription time</b> begins when <code>subscribe()</code> is called (directly, or by a framework like WebFlux calling it on your returned Mono/Flux). This triggers a wave of <code>onSubscribe</code> calls that travels from the bottom of the chain (the final subscriber) up to the top (the original source), each operator's Subscriber requesting a Subscription from the operator above it. <b>Execution time</b> is when data actually flows: the source starts emitting, and each <code>onNext</code>/<code>onComplete</code>/<code>onError</code> signal travels back down from source to subscriber, running your operator lambdas (map functions, doOnNext callbacks) as it passes through each stage.
+</p>
+
+</div>
+
+<pre>
+Mono&lt;String&gt; mono = Mono.fromSupplier(() -&gt; {
+    System.out.println("side effect running"); // executes at EXECUTION time
+    return "value";
+}).map(s -&gt; s.toUpperCase());                    // built at ASSEMBLY time
+
+// nothing has printed yet - only a Publisher graph has been assembled
+System.out.println("chain built");
+
+mono.subscribe(System.out::println);
+// NOW: subscription time (onSubscribe travels bottom-up)
+// then: execution time ("side effect running" prints, then "VALUE")
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The line that shows real fluency: "assembly builds the recipe, subscription wires up the request(n) chain from the bottom up, execution runs the recipe from the top down." This model directly explains a whole class of bugs: a Mono/Flux built inside a method but never subscribed to (e.g. forgetting to return it, or assigning it to a variable and discarding the variable) silently does nothing, no exception, no log, because assembly happened but subscription never did.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q16">
+Q16. Cold vs Hot Publishers
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A <b>cold</b> publisher re-runs its entire source logic independently for every subscriber; each subscription gets its own private sequence starting from the beginning. Most Reactor sources you build with <code>Flux.just</code>, <code>Mono.fromCallable</code>, a repository query, are cold: subscribe twice and the database query (or computation) runs twice, and each subscriber sees the full sequence regardless of when it subscribed.
+</p>
+
+<p>
+A <b>hot</b> publisher runs its source once regardless of how many subscribers are attached, and broadcasts the same emissions to all of them; a subscriber that arrives late simply misses whatever was already emitted before it subscribed, unless the hot source explicitly replays history. Hot sources model things that happen whether or not anyone is listening: a live sensor feed, a shared WebSocket connection, an event bus. Getting this distinction wrong is a classic reactive bug: treating a cold Flux as if it were shared (assuming two subscribers see the same emissions, or assuming a side effect only runs once) when in fact each subscription triggers its own independent execution.
+</p>
+
+</div>
+
+<pre>
+Flux&lt;Integer&gt; cold = Flux.defer(() -&gt; {
+    System.out.println("source executed");
+    return Flux.just(1, 2, 3);
+});
+cold.subscribe(); // prints "source executed"
+cold.subscribe(); // prints "source executed" AGAIN - independent run
+
+Sinks.Many&lt;Integer&gt; hotSink = Sinks.many().multicast().onBackpressureBuffer();
+Flux&lt;Integer&gt; hot = hotSink.asFlux();
+hot.subscribe(v -&gt; System.out.println("A saw " + v));
+hotSink.tryEmitNext(1);
+hot.subscribe(v -&gt; System.out.println("B saw " + v)); // B missed 1, joins late
+hotSink.tryEmitNext(2); // both A and B see 2
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming that calling <code>.subscribe()</code> a second time on the same Mono/Flux variable reuses the first subscription's results. For a cold publisher (the overwhelming majority of what you build day to day) it does not, it reruns the whole upstream, including any database call or side effect. If you need "run once, share the result with multiple subscribers," reach for <code>cache()</code> (cold source, replays cached result) or convert to hot with <code>share()</code>/a ConnectableFlux (see Q17).
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q17">
+Q17. ConnectableFlux and Flux.share()
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>publish()</code> converts a cold Flux into a <b>ConnectableFlux</b>, a hot publisher that will not start emitting until you explicitly call <code>.connect()</code> on it, regardless of how many subscribers have already attached. This lets you gather multiple subscribers first, guaranteeing none of them misses early emissions, then start the single shared upstream execution on your own schedule. It is the tool of choice when you need precise control over exactly when a shared source begins running, for example coordinating several downstream consumers to all start from the same emission.
+</p>
+
+<p>
+<code>share()</code> is the convenience version most code actually uses: it is shorthand for <code>publish().refCount(1)</code>, meaning the upstream automatically connects as soon as the first subscriber arrives, and automatically disconnects (cancelling the upstream) when the last subscriber leaves. This gives you "multiple subscribers share one upstream execution" without manually managing a ConnectableFlux's connect/dispose lifecycle, at the cost of subscribers that arrive after the first one potentially missing emissions that already happened.
+</p>
+
+</div>
+
+<pre>
+Flux&lt;Long&gt; ticks = Flux.interval(Duration.ofSeconds(1)).share();
+// first subscriber triggers the interval to start
+ticks.subscribe(t -&gt; log.info("consumer1 {}", t));
+// second subscriber joins the SAME running interval, may miss earlier ticks
+ticks.subscribe(t -&gt; log.info("consumer2 {}", t));
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+A crisp answer: "publish() gives you a ConnectableFlux you connect manually for precise control; share() is publish().refCount(1), auto-connecting on the first subscriber and auto-disconnecting when the last one leaves." Mention replay() too if pressed further (Q18) — it is the variant that lets late subscribers catch up on some or all history instead of only seeing emissions from the moment they joined.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q18">
+Q18. Flux.publish() vs Flux.replay()
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Both turn a cold Flux into a shareable, connectable hot source, and both require an explicit <code>.connect()</code> (or an autoConnect/refCount variant) to actually start the upstream. The difference is what a late-arriving subscriber sees. With <code>publish()</code>, a subscriber only receives emissions that happen from the moment it subscribes onward; anything emitted before it joined is gone forever as far as that subscriber is concerned. With <code>replay()</code>, the ConnectableFlux buffers some or all past emissions (you can bound it by count, by time, or leave it unbounded) and replays that buffered history to every new subscriber before it starts receiving live emissions.
+</p>
+
+<p>
+<code>replay()</code> trades memory for completeness: an unbounded replay buffer on a long-lived, high-volume Flux is a memory leak waiting to happen, so in practice you almost always bound it (<code>replay(n)</code> for the last n items, or <code>replay(Duration)</code> for a time window).
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reaching for <code>replay()</code> "just in case" without bounding it. On a genuinely long-lived hot stream (an event bus running for the app's whole lifetime), an unbounded replay buffer grows without limit and eventually exhausts memory. Always bound it explicitly with a count or duration unless you can prove the stream is short-lived or low-volume.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q19">
+Q19. Why "Nothing Happens Until subscribe()" Breaks Side-Effect Assumptions
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is the single most common source of "my reactive code silently does nothing" bugs, and it directly follows from Q15's assembly/subscription/execution model. Because a Mono/Flux is a cold, lazy description of work rather than a running computation, building the chain and discarding the result (never subscribing, or never returning it to a caller like WebFlux that will subscribe on your behalf) means the described work simply never runs, with no exception thrown anywhere, because from the framework's point of view nothing went wrong: you just never asked for the result.
+</p>
+
+<p>
+This shows up constantly in code that mixes imperative habits with reactive types: calling a repository's reactive save method inside a for loop or an if-branch as a "fire and forget" statement, the way you would call a void method, without chaining it into the returned pipeline or explicitly subscribing. The save is built (assembled) but never triggered, so nothing is ever persisted, and the bug is invisible until someone notices missing data days later.
+</p>
+
+</div>
+
+<pre>
+// WRONG: builds a Mono describing a save, but never subscribes to it - nothing happens
+void badSave(Order order) {
+    repository.save(order); // return value discarded, never subscribed
+}
+
+// RIGHT: return it so the framework (or caller) subscribes, or chain/subscribe explicitly
+Mono&lt;Order&gt; goodSave(Order order) {
+    return repository.save(order);
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The rule to state explicitly: "a Mono/Flux that is built but never subscribed to, directly or by returning it to something that will subscribe, is inert; it is not a command, it is a description of a command." This is exactly why linters/IDE inspections flag "reactive type is never consumed" and why code review in a reactive codebase must specifically check that every Mono/Flux returned from a repository or client call is actually wired into the response chain.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h9">SECTION 7 - CONTEXT PROPAGATION</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q20">
+Q20. Why Doesn't ThreadLocal Work Across Reactive Async Boundaries?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+ThreadLocal works by attaching a value to whatever thread is currently executing, on the assumption that a single logical operation (a request) stays on one thread from start to finish. That assumption is exactly what a reactive pipeline breaks: a single Mono/Flux chain routinely hops across multiple threads, subscribeOn switches the source's thread, publishOn switches downstream execution, an async I/O callback resumes on a Netty event-loop thread that has nothing to do with whichever thread initiated the request. A value stashed in a ThreadLocal before a thread-hop is simply invisible after it, because a different thread is now running the rest of the chain and it has its own, unrelated ThreadLocal storage.
+</p>
+
+<p>
+This directly breaks anything that leaned on ThreadLocal in the blocking world: SLF4J's MDC for structured logging (request id, user id), Spring Security's SecurityContextHolder in its default ThreadLocal-backed strategy, and any custom per-request context object. In a reactive app these patterns need a mechanism that travels <i>with the data</i> through the chain rather than living on whichever thread happens to be executing at a given moment, which is exactly what Reactor's Context solves.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The framing that shows you understand the mechanism, not just the symptom: "ThreadLocal is a property of a thread; a reactive chain's identity is the subscription, not any one thread, since it can run on several threads over its lifetime. State needs to be attached to the subscription/signal, not the thread, which is what Reactor Context is for."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q21">
+Q21. How Does Reactor's Context / ContextView Solve This?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Reactor's <code>Context</code> is an immutable, key-value store that is attached to the <i>subscription</i>, not to any thread. Every Subscriber in the chain has access to the Context of the subscription it belongs to, and critically, Context is propagated from the bottom of the chain upward, and is visible to operators above the point where it was written, regardless of which thread ends up executing them. You write to it with <code>.contextWrite(...)</code> (placed anywhere in the chain, but only visible to operators upstream of that point) and read it inside an operator via <code>Mono.deferContextual(...)</code> / <code>Flux.deferContextual(...)</code>, or through operators that expose a <code>ContextView</code> parameter directly.
+</p>
+
+<p>
+Because Context lives on the subscription rather than the thread, it survives every subscribeOn/publishOn hop untouched, exactly the property ThreadLocal lacked. It is immutable by design, writing to it produces a new Context, so there is no risk of one part of the chain mutating state another part depends on, which also makes it inherently safe for the concurrent, multi-subscriber scenarios reactive code routinely creates.
+</p>
+
+</div>
+
+<pre>
+Mono&lt;String&gt; withCorrelationId = Mono.deferContextual(ctx -&gt;
+        callDownstream(ctx.get("correlationId")) // read: available to whatever thread runs this
+    )
+    .contextWrite(ctx -&gt; ctx.put("correlationId", UUID.randomUUID().toString()));
+    // write: visible only to operators ABOVE this point in the chain
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Expecting <code>contextWrite</code> to be visible downstream, the way a normal imperative variable assignment would be. Context propagation in Reactor flows upstream (from where it is written toward the source), which is the opposite of the data flow direction (which flows from source toward the subscriber). Placing <code>contextWrite</code> too low in the chain is a very common reason "the context value I set is null" bugs happen; it must be written at or below (closer to the subscriber than) every operator that needs to read it.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q22">
+Q22. Practical Use Case: Propagating a Correlation ID Through a Reactive Chain
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The most common real-world use of Reactor Context is distributed tracing and structured logging: a WebFlux filter extracts (or generates) a correlation/trace id from an incoming request, writes it into the Context at the top of the request-handling chain, and every downstream service call, repository query and log statement anywhere in that chain reads it back out, without needing to thread it through every method signature manually as an explicit parameter.
+</p>
+
+<p>
+Because plain SLF4J MDC is ThreadLocal-backed and therefore unreliable across reactive thread-hops, teams either bridge Reactor Context into MDC at each operator boundary (Reactor's <code>Hooks.onEachOperator</code> combined with a Context read, or libraries like <code>reactor-core</code>'s own logging integration, and Micrometer's Observation API and Micrometer Tracing now do a lot of this bridging automatically) or they simply log with the correlation id read explicitly out of the ContextView at each log statement rather than relying on MDC at all.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth naming explicitly: Micrometer Tracing (and Spring Boot 3.x's default observability stack) already automates most of this Context-to-MDC bridging for standard span/trace ids, so in a modern Spring Boot 3 app you often get correlated logs "for free" and only need to reach for manual Context read/write when propagating your own custom, business-specific correlation data.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q23">
+Q23. Common Context Pitfalls in Practice
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Beyond the upstream-only visibility rule (Q21), two other pitfalls come up constantly. First, Context is per-subscription and immutable, so a common mistake is trying to mutate a mutable object stored inside the Context (a HashMap, say) instead of writing an entirely new Context with <code>.put()</code>; mutating a stored object works but defeats the safety guarantees Context is designed to provide and can create subtle sharing bugs across concurrent subscriptions.
+</p>
+
+<p>
+Second, Context does not automatically cross a reactive-to-imperative-to-reactive boundary. If you call <code>.block()</code> partway through a pipeline, or hand off to a plain <code>CompletableFuture</code>-based library and later wrap its result back into a Mono, whatever Context existed on the original subscription is not implicitly threaded through that gap, since the imperative code in between has no notion of Reactor's Context at all. Any code path that leaves and re-enters the reactive world needs to explicitly re-attach whatever Context state it still needs.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming Context "just works" across every kind of boundary the way a ThreadLocal-based framework used to. It only works within an unbroken chain of Reactor operators on the same subscription; any drop into blocking code, a different async abstraction, or a manually created new subscription breaks the chain, and the Context must be re-threaded explicitly if it is still needed on the other side.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h10">SECTION 8 - THE SINKS API</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q24">
+Q24. What Is the Sinks API and Why Does It Replace FluxProcessor?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Before Reactor 3.4, the way to manually push values into a reactive stream (a "programmatic" source, as opposed to one derived from an existing Publisher) was to implement <code>FluxProcessor</code> directly, or implement the Reactive Streams <code>Subscriber</code>/<code>Publisher</code> interfaces yourself. Both approaches exposed far more surface area than most use cases needed, and made it easy to violate the Reactive Streams protocol by accident (calling onNext concurrently from multiple threads without synchronization, for example, which silently corrupts a Publisher's contract).
+</p>
+
+<p>
+The <b>Sinks</b> API (<code>Sinks.Many</code>, <code>Sinks.One</code>, <code>Sinks.Empty</code>) is Reactor's purpose-built, much narrower replacement: it gives you exactly two operations, a way to push a value/error/completion in, and a way to get a Flux/Mono view out to subscribe to, with the framework handling the Reactive Streams protocol correctness for you. It explicitly separates the producer-facing side (Sinks.Many, which you call tryEmitNext on) from the consumer-facing side (the Flux you get from <code>.asFlux()</code>, which callers subscribe to), which is a cleaner separation of concerns than Processor's dual Subscriber-and-Publisher role.
+</p>
+
+</div>
+
+<pre>
+Sinks.Many&lt;String&gt; sink = Sinks.many().multicast().onBackpressureBuffer();
+Flux&lt;String&gt; flux = sink.asFlux(); // consumer-facing view
+
+flux.subscribe(System.out::println);
+sink.tryEmitNext("hello"); // producer-facing push
+sink.tryEmitComplete();
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reaching for a hand-rolled <code>Subscriber</code> implementation, or the deprecated <code>FluxProcessor</code>/<code>DirectProcessor</code>/<code>EmitterProcessor</code> types, in new code. As of modern Reactor, Sinks is the documented, supported way to manually produce signals; the older Processor types are deprecated specifically because Sinks enforces correct concurrent-access semantics that hand-rolled implementations routinely got wrong.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q25">
+Q25. Sinks.many() Variants: Unicast, Multicast, Replay
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>Sinks.many().unicast()</code> supports exactly one subscriber; a second subscription attempt fails with an error, because a unicast sink's internal queue is designed to be drained by a single consumer and has no logic for distributing items across several. Use it for a strict single-producer/single-consumer bridge, for example adapting one callback-based connection into one reactive stream.
+</p>
+
+<p>
+<code>Sinks.many().multicast()</code> supports multiple subscribers and broadcasts each emitted item to all of them (a hot-publisher shape), but by default a subscriber only receives items emitted after it subscribes, exactly like <code>publish()</code>'s late-subscriber semantics discussed in Q17/Q18. <code>Sinks.many().replay()</code> is the multicast variant that also buffers some or all history (bounded with <code>.limit(n)</code> or left effectively unbounded with <code>.all()</code>) and replays it to every new subscriber before they start receiving live emissions.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Variant</th>
+<th>Subscribers</th>
+<th>Late subscriber sees</th>
+</tr>
+
+<tr>
+<td>unicast()</td>
+<td>Exactly one</td>
+<td>N/A - second subscriber errors</td>
+</tr>
+
+<tr>
+<td>multicast()</td>
+<td>Many</td>
+<td>Only emissions from the moment it joins</td>
+</tr>
+
+<tr>
+<td>replay()</td>
+<td>Many</td>
+<td>Buffered history, then live emissions</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The concise version: "unicast is one consumer only; multicast broadcasts live only; replay broadcasts with a history buffer for late joiners." Also mention onBackpressureBuffer()/onBackpressureError() overflow qualifiers that most of these factory methods take, which decide what happens if a subscriber falls behind, mirroring the same buffer/drop/latest/error policy choice from Q4.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q26">
+Q26. Emission Failure Handling: tryEmitNext vs emitNext
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>tryEmitNext(value)</code> is the non-throwing, result-returning emission method: it returns a <code>Sinks.EmitResult</code> enum value (OK, FAIL_TERMINATED, FAIL_OVERFLOW, FAIL_NON_SERIALIZED, and others) describing exactly why the emission did or did not succeed, and it is the recommended default because it forces you to consciously decide what to do on failure rather than letting an exception propagate from an unexpected place.
+</p>
+
+<p>
+<code>emitNext(value, EmissionFailureHandler)</code> is the alternative that takes a retry-strategy callback invoked on failure, letting you, for example, busy-spin briefly and retry on a transient concurrent-access failure (FAIL_NON_SERIALIZED, which happens if two threads call emit methods concurrently on a sink that requires serialized access) instead of dropping the value. The most commonly seen failure in practice is FAIL_NON_SERIALIZED, which is a strong signal that emissions are happening from multiple threads without external synchronization, since most Sinks.Many implementations require serialized (one-at-a-time) producer calls.
+</p>
+
+</div>
+
+<pre>
+Sinks.EmitResult result = sink.tryEmitNext(value);
+if (result.isFailure()) {
+    log.warn("emission failed: {}", result);
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Calling a sink's emit methods concurrently from multiple threads without any external synchronization and being surprised by FAIL_NON_SERIALIZED. Reactive Streams requires that onNext calls on a given Subscriber never happen concurrently; Sinks enforces this at the emission point rather than silently corrupting internal state, which is exactly the protocol-correctness benefit over a hand-rolled Subscriber that Q24 highlights.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q27">
+Q27. Bridging a Callback-Based API Into Reactor Using Sinks
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A very common real-world use of Sinks is adapting a legacy, callback-style API (a message listener, a WebSocket handler, an SDK that calls your registered callback whenever new data arrives) into a proper reactive Publisher that the rest of your pipeline can subscribe to with full backpressure support. You create a sink once, register its emit methods as the callback the legacy API invokes, and expose the sink's <code>.asFlux()</code>/<code>.asMono()</code> view to the rest of the application.
+</p>
+
+</div>
+
+<pre>
+Sinks.Many&lt;Message&gt; sink = Sinks.many().unicast().onBackpressureBuffer();
+
+legacyMessageListener.onMessage(msg -&gt; {
+    Sinks.EmitResult result = sink.tryEmitNext(msg);
+    if (result.isFailure()) {
+        log.warn("dropped message, sink emission failed: {}", result);
+    }
+});
+
+Flux&lt;Message&gt; messages = sink.asFlux(); // rest of the app subscribes to this
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+A strong signal of hands-on experience: noting that for a simpler one-shot bridge (adapting a single async callback into exactly one value), <code>Mono.create(sink -&gt; ...)</code> is often a lighter-weight fit than a full Sinks.One, while Sinks proper is what you reach for when you need to hold onto the producer-side handle across multiple calls (a long-lived listener registration), rather than a single inline callback.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h11">SECTION 9 - SCHEDULERS IN DEPTH</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q28">
+Q28. Scheduler Types In Depth: parallel() vs boundedElastic() vs immediate() vs a Custom Scheduler
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>Schedulers.parallel()</code> is a fixed-size pool sized to <code>Runtime.availableProcessors()</code>, intended strictly for short, non-blocking, CPU-bound work. Because it has exactly as many threads as CPU cores, blocking even one of them for any meaningful duration starves the rest of the application of CPU-bound processing capacity; this pool must never see a blocking call.
+</p>
+
+<p>
+<code>Schedulers.boundedElastic()</code> is designed for exactly the opposite case: unavoidable blocking or I/O calls (a legacy JDBC driver, a blocking SDK, a synchronous file read) that you cannot make non-blocking. It maintains a bounded but large pool (by default 10x the CPU core count, with a bounded backlog queue beyond that), creating threads on demand and reclaiming idle ones, so it can absorb many concurrently blocked threads without the unbounded growth risk of the old, now-removed <code>Schedulers.elastic()</code>.
+</p>
+
+<p>
+<code>Schedulers.immediate()</code> performs no thread switch at all, running the operator on whatever thread called it; it is mostly used internally, or when you deliberately want to cancel out an upstream publishOn/subscribeOn for testing or composition reasons. A <b>custom Scheduler</b>, built with <code>Schedulers.newBoundedElastic(...)</code>, <code>Schedulers.newParallel(...)</code>, or wrapping your own <code>ExecutorService</code> via <code>Schedulers.fromExecutorService(...)</code>, is appropriate when you need isolation, a dedicated, sized pool for one specific downstream dependency so that a problem with that dependency (say, a slow third-party API) cannot exhaust the shared boundedElastic pool and starve unrelated blocking calls elsewhere in the app.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Scheduler</th>
+<th>Sizing</th>
+<th>Use for</th>
+</tr>
+
+<tr>
+<td>parallel()</td>
+<td>Fixed, = CPU cores</td>
+<td>Short CPU-bound work only, never blocking</td>
+</tr>
+
+<tr>
+<td>boundedElastic()</td>
+<td>Bounded, elastic (~10x cores + queue)</td>
+<td>Unavoidable blocking/IO calls</td>
+</tr>
+
+<tr>
+<td>immediate()</td>
+<td>No pool, runs on calling thread</td>
+<td>No-op thread switch, testing/composition</td>
+</tr>
+
+<tr>
+<td>custom</td>
+<td>You define size and isolation</td>
+<td>Isolating one risky dependency from the shared pool</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior-level distinction to volunteer: boundedElastic is bounded and backpressure-aware (it queues excess tasks up to a configurable limit and then rejects), specifically as a reaction to the old unbounded elastic() scheduler having caused real production outages via unbounded thread creation. Knowing that history, and being able to name the default sizing (~10x cores, with a default 100k task queue), is a strong signal of production depth over tutorial-level knowledge.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q29">
+Q29. The Classic Incident: A Blocking Call Scheduled on parallel()
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+This is one of the most common real production incidents in reactive systems, and it is a direct, more insidious cousin of the Q12 "accidental blocking on the event loop" bug: a developer explicitly calls <code>.subscribeOn(Schedulers.parallel())</code> around a call they believe is CPU-bound or fast, but which actually blocks, a supposedly in-memory cache lookup that occasionally falls through to a blocking network call, a regex operation that pathologically backtracks, a JSON library that blocks on a lazy classloading step the first time it runs. Because parallel() has only as many threads as CPU cores, blocking even one of them removes a meaningful fraction of the entire application's CPU-bound processing capacity, not just capacity for that one call.
+</p>
+
+<p>
+The failure mode is uniquely nasty because it degrades gradually and non-deterministically: under low load the blocked calls are rare and brief enough that nobody notices; under production load, several unrelated CPU-bound operations across the whole service start queueing behind the same small, saturated parallel() pool, producing service-wide latency spikes that look like "everything is slow" with no obvious single culprit, since the actual blocking call may be a small percentage of total traffic.
+</p>
+
+</div>
+
+<pre>
+// WRONG: assumed fast/CPU-bound, actually blocks occasionally - starves parallel() pool
+Mono.fromCallable(() -&gt; maybeBlockingCacheLookup(key))
+    .subscribeOn(Schedulers.parallel());
+
+// RIGHT: anything that can block, even rarely, belongs on boundedElastic
+Mono.fromCallable(() -&gt; maybeBlockingCacheLookup(key))
+    .subscribeOn(Schedulers.boundedElastic());
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior framing: "parallel() should be treated as a hard invariant, never anything that can block, even occasionally or under rare conditions, because the blast radius of violating it is the entire pool, not just the caller." Mentioning BlockHound (Q12) as the tool that catches this class of bug automatically in CI/integration tests, by failing fast the moment a blocking call is detected on parallel() or an event-loop thread, is exactly the kind of detail that separates "read about it" from "got paged for it."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q30">
+Q30. How Do You Size and Create a Custom Scheduler?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Reactor exposes factory methods for custom pools: <code>Schedulers.newBoundedElastic(threadCap, queuedTaskCap, name)</code> for a dedicated, bounded blocking pool with its own limits; <code>Schedulers.newParallel(name, parallelism)</code> for a dedicated fixed pool; and <code>Schedulers.fromExecutorService(executorService)</code> to wrap an existing, manually-configured <code>ExecutorService</code> if you need control the built-in factories don't expose (custom thread naming, custom rejection policy, a specific queue implementation).
+</p>
+
+<p>
+Sizing a dedicated pool is about isolation, not raw throughput: the goal is usually to give one specific, potentially slow or unreliable downstream dependency (a third-party API known to have latency spikes, a batch job's blocking file I/O) its own bounded thread budget, so that if that dependency degrades, it saturates only its own dedicated pool and cannot starve unrelated blocking calls that would otherwise share the same default boundedElastic pool.
+</p>
+
+</div>
+
+<pre>
+private static final Scheduler THIRD_PARTY_API_SCHEDULER =
+        Schedulers.newBoundedElastic(20, 200, "third-party-api");
+
+Mono&lt;Response&gt; call = Mono.fromCallable(() -&gt; blockingThirdPartyClient.call(req))
+                           .subscribeOn(THIRD_PARTY_API_SCHEDULER);
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The reusable principle: "share the default boundedElastic pool for well-behaved, fast blocking calls; carve out a dedicated, isolated custom scheduler for any dependency known to be slow, flaky, or capable of degrading independently of the rest of the system." This is essentially bulkheading applied at the scheduler level, the same isolation idea Resilience4j's bulkhead pattern applies at the call level.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q31">
+Q31. How Do You Monitor and Diagnose Scheduler Saturation?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Reactor integrates with Micrometer to expose scheduler metrics, active thread count, queued task count, completed task count, when metrics are enabled via <code>Schedulers.enableMetrics()</code> (or automatically in a Spring Boot app with Micrometer on the classpath and Reactor's metrics integration active), and these show up as standard <code>executor</code>-family meters tagged by scheduler name in whatever monitoring backend (Prometheus, Datadog) you have wired up.
+</p>
+
+<p>
+In practice, the diagnostic signal to watch for is a boundedElastic (or a custom) scheduler's queued-task count climbing steadily, or its active-thread count pinned at its configured cap, both of which indicate the pool is saturated and new work is queueing or being rejected, exactly the production symptom of the Q29 incident, just visible on a dashboard before it becomes a full outage.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth stating directly: alerting on scheduler saturation metrics is the proactive version of the reactive debugging story, catching a slow downstream dependency choking a shared pool before it cascades into unrelated latency, rather than only discovering it after an incident via BlockHound or a stack-trace investigation.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h12">SECTION 10 - RETRY STRATEGIES IN DEPTH</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q32">
+Q32. retry() vs retryWhen() - What's the Real Difference?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>retry(n)</code> is the blunt instrument: it resubscribes to the upstream immediately, up to n times, on any error, with no delay and no way to inspect what actually failed. It is fine for a quick prototype or a genuinely instantaneous, always-safe-to-retry operation, but in production it is almost always the wrong tool, because it retries indiscriminately (including on errors that will never succeed on retry, like a validation failure) and hammers the failing dependency immediately with no backoff, which is exactly the behaviour that turns a brief blip into a self-inflicted retry storm.
+</p>
+
+<p>
+<code>retryWhen(Retry spec)</code> is the composable, production-grade version: it takes a <code>Retry</code> strategy object (most commonly built via <code>Retry.backoff(maxAttempts, minBackoff)</code>) that controls delay between attempts, jitter, a maximum number of attempts, and, via <code>.filter(predicate)</code>, exactly which exception types are worth retrying at all. This is the version every real reactive codebase should standardize on for anything touching a network call.
+</p>
+
+</div>
+
+<pre>
+// retry(n): blunt, no delay, retries everything, rarely correct for production
+flakyCall.retry(3);
+
+// retryWhen: backoff, jitter, and a filter for only-retryable errors
+flakyCall.retryWhen(
+    Retry.backoff(3, Duration.ofMillis(200))
+         .maxBackoff(Duration.ofSeconds(2))
+         .jitter(0.5)
+         .filter(ex -&gt; ex instanceof TimeoutException || ex instanceof ConnectException)
+);
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The senior answer names the failure mode plain retry() causes at scale: a downstream dependency having a brief hiccup gets hit by every in-flight caller's immediate retry simultaneously, a "retry storm" or "thundering herd," which can turn a transient blip into a full outage. retryWhen with backoff and jitter exists specifically to spread those retries out in time and across callers.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q33">
+Q33. Retry.backoff() With Jitter - Why Does Jitter Matter?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>Retry.backoff(maxAttempts, minBackoff)</code> implements exponential backoff: the delay before each successive retry attempt roughly doubles (bounded by an optional <code>.maxBackoff(...)</code> ceiling), so the third or fourth retry waits meaningfully longer than the first, giving a struggling downstream dependency real breathing room to recover rather than being hit again almost immediately.
+</p>
+
+<p>
+<b>Jitter</b> (<code>.jitter(factor)</code>, a value between 0 and 1) adds a randomized variance to each computed backoff delay. Without jitter, every client that started calling a failing dependency at roughly the same moment computes the exact same backoff schedule and therefore retries at the exact same moments, in perfect lockstep, which recreates the thundering-herd problem backoff was meant to solve, just delayed and periodic instead of immediate. Jitter spreads those synchronized retry waves out across a window of time, so the failing dependency sees a smoothed-out trickle of retries instead of periodic synchronized spikes.
+</p>
+
+</div>
+
+<pre>
+Retry.backoff(5, Duration.ofMillis(100))
+     .maxBackoff(Duration.ofSeconds(5))
+     .jitter(0.75) // randomize up to 75% of the computed delay
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+A memorable one-liner: "backoff spaces out one client's own retries over time; jitter spaces out many clients' retries from each other." Both are needed together, backoff alone still produces synchronized retry waves across every client instance that failed at the same moment.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q34">
+Q34. Retry Budgets and Distinguishing Retryable vs Non-Retryable Errors
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Not every failure should be retried, and treating all exceptions as retryable is a common, damaging mistake. A validation error, a 400 Bad Request, an authentication failure, will fail identically no matter how many times you retry it; retrying it only adds latency and pointless load. The correct pattern is to explicitly filter which exception types or status codes are considered retryable (typically transient network failures: timeouts, connection resets, 503/429 responses) via <code>Retry.backoff(...).filter(predicate)</code>, and let everything else fail fast and propagate immediately.
+</p>
+
+<p>
+A <b>retry budget</b> is a further refinement used in higher-scale systems: rather than a fixed per-call retry count, the service tracks, over a rolling time window, what fraction of total outbound calls are retries, and stops issuing new retries once that fraction exceeds a threshold (e.g. retries may not exceed 10% of total call volume). This protects against the aggregate case where individually-reasonable per-call retry policies still sum up to overwhelming a struggling downstream dependency when a large fraction of a fleet's calls are failing simultaneously.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth raising unprompted: retry budgets are the concept that scales the "should I retry this one call" decision (Retry.backoff().filter()) up to a fleet-wide "how much retry traffic can this dependency safely absorb right now" decision, and is exactly the kind of resilience thinking that separates someone who has only configured a Retry spec from someone who has operated a system at scale during a real dependency outage.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q35">
+Q35. Handling Retry Exhaustion
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+When every configured retry attempt has been exhausted, Reactor's default behaviour for <code>Retry.backoff(...)</code> is to emit a <code>Exceptions.RetryExhaustedException</code> wrapping the last actual failure, rather than re-emitting the original exception directly. This distinction matters because downstream error handlers (onErrorResume, onErrorMap) written to check for the original exception type will not match unless they specifically account for the wrapper, or unless you call <code>.onRetryExhaustedThrow((spec, signal) -&gt; signal.failure())</code> to unwrap and rethrow the original cause instead.
+</p>
+
+<p>
+The overall pattern in a production-grade chain typically composes retryWhen with a final fallback: retry a bounded number of times with backoff and jitter, filtered to only genuinely retryable errors, then fall back to a cached value, a degraded response, or a translated domain exception once retries are exhausted, exactly the layered structure shown in Q9's error-handling example, with retryWhen as the middle layer.
+</p>
+
+</div>
+
+<pre>
+flakyCall.retryWhen(
+        Retry.backoff(3, Duration.ofMillis(200))
+             .filter(ex -&gt; ex instanceof TimeoutException)
+             .onRetryExhaustedThrow((spec, signal) -&gt; signal.failure()) // unwrap original cause
+    )
+    .onErrorResume(TimeoutException.class, ex -&gt; fallbackService.call());
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Writing an <code>onErrorResume(TimeoutException.class, ...)</code> handler after a retryWhen and being confused when it never triggers on exhaustion, because by default the signal reaching it is a RetryExhaustedException, not a TimeoutException. Either match on RetryExhaustedException and unwrap its cause, or configure onRetryExhaustedThrow to rethrow the original exception so downstream handlers keyed on the original type continue to work.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h13">PART 1 COMPLETE</h1>
+
+<p>
+
+Next Part:
+
+* Debugging reactive stack traces (Hooks.onOperatorDebug, checkpoint, ReactorDebugAgent)
+* WebClient deep dive: pooling, timeouts, Resilience4j reactive resilience
+* Server-Sent Events and streaming responses
+* Reactive transactions with R2DBC
+* Advanced testing: virtual time and TestPublisher
+* Reactive vs virtual threads - production decision-making
+
+These are some of the most frequently asked advanced Project Reactor/WebFlux topics in senior interviews.
+
+</p>
+
+<hr>
+
+<h1 id="h14">SECTION 11 - DEBUGGING REACTIVE CHAINS</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q36">
+Q36. Why Is a Raw Reactor Stack Trace Nearly Useless?
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+In imperative code, a stack trace shows the actual call chain that led to an exception, each frame is a real method invocation still on the call stack. In a Reactor chain, execution is assembled from many small, generic operator classes (FluxMap, FluxFlatMap, MonoPeek, and so on) that get invoked asynchronously, often from a thread pool's worker thread that has no relationship to whichever thread originally assembled the chain. By the time an exception surfaces, the stack trace shows you Reactor's internal plumbing, callback invocation frames from whatever Scheduler happened to run it, not the sequence of your own application code that built the chain in the first place.
+</p>
+
+<p>
+This is a direct consequence of the assembly/execution split from Q15: the trace at execution time reflects how the signal is being delivered right now, not where in your source code the operator was declared. For a chain with several flatMaps and scheduler hops, the resulting stack trace can be dozens of frames of Reactor internals with barely a hint of which line of your own code actually failed, which is precisely why interviewers ask this: it is a real, everyday pain point that separates people who have actually run Reactor in production from people who have only read the docs.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The framing to lead with: "the cost of Reactor's async execution model is that you lose the free, built-in stack trace imperative code gives you for locating a failure's assembly site; checkpoint() and operator debug mode exist specifically to buy that information back, at a real performance cost, which is why they are opt-in rather than always-on."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q37">
+Q37. Hooks.onOperatorDebug() and checkpoint()
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>Hooks.onOperatorDebug()</code> globally instruments every operator in the application to capture the assembly-time stack trace (where in your code the operator was actually declared) and attach it to any exception that later flows through that operator, effectively stitching an "Assembly trace" section onto the otherwise-useless execution-time stack trace. It works by wrapping every single operator's declaration with a stack-trace capture, which is exactly why it is expensive: enabling it globally in production adds real, measurable overhead to every single operator in every single chain in the application, since every one of them now pays the cost of a stack-trace capture regardless of whether it will ever actually fail.
+</p>
+
+<p>
+<code>.checkpoint()</code> (and its labeled overload, <code>.checkpoint("some description")</code>) is the targeted, low-cost alternative: placed at specific points in a chain, it captures assembly-site information only for that one point, letting you selectively instrument the handful of chains or operators you actually suspect, rather than paying the cost everywhere. In practice, checkpoint() at strategically chosen points in a hot production chain, versus onOperatorDebug() only enabled temporarily in a lower-traffic environment or during active incident investigation, is the standard trade-off senior engineers make.
+</p>
+
+</div>
+
+<pre>
+Mono&lt;Order&gt; order = repository.findById(id)
+        .checkpoint("findById lookup") // labeled assembly-site marker
+        .flatMap(this::enrichWithCustomer)
+        .checkpoint("enrichment step");
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth stating precisely: checkpoint() has a lightweight variant, checkpoint() with no message, that only records a marker without a full stack trace capture (cheaper), versus checkpoint(String) or the full-stack-trace-capturing overload, which trades more overhead for more detail. Knowing that this cost/detail dial exists, and choosing the cheaper option by default in hot paths, is exactly the kind of nuance interviewers are listening for.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q38">
+Q38. Reactor Tools' ReactorDebugAgent and the Cost of Debug Mode
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>reactor-tools</code>'s <code>ReactorDebugAgent</code> is a bytecode instrumentation agent (installed via a Java agent or programmatically via <code>ReactorDebugAgent.init()</code> at application startup) that rewrites operator assembly call sites at class-load time to capture accurate assembly-site information far more cheaply than the runtime stack-trace capture <code>Hooks.onOperatorDebug()</code> performs on every single operator invocation. Because the instrumentation happens once, at class-load time, rather than on every operator assembly at runtime, it is the recommended way to get assembly-time debugging information with meaningfully lower steady-state overhead than the older, fully runtime-based debug hook.
+</p>
+
+<p>
+Even with this cheaper approach, debug-mode instrumentation of any kind is still not something you leave permanently enabled in a high-throughput production service without measuring the impact first; it remains a tool you reach for during active investigation, in staging, or behind a feature flag you can flip on briefly in production during an incident, rather than a default-on setting.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Enabling <code>Hooks.onOperatorDebug()</code> globally and leaving it on permanently in a production service "just in case," without measuring the throughput/latency impact. The safer default in 2026 production Reactor applications is targeted checkpoint() calls at suspect points, with ReactorDebugAgent or full operator debug mode reserved for genuine investigation windows, not steady-state operation.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q39">
+Q39. A Practical Workflow for Debugging a Failing Reactive Chain
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+A pragmatic, senior-level workflow, rather than reaching for full debug mode immediately, usually goes: first, read the execution-time stack trace anyway, it often still tells you the exception type and message even if the frame locations are unhelpful, which alone can narrow things down. Second, add targeted <code>doOnError</code> (or <code>.log()</code>) at a few candidate points in the suspect chain to bisect where in the pipeline the failure is actually originating, without any global instrumentation cost. Third, if that is not enough, add <code>.checkpoint("label")</code> at those same candidate points to get proper assembly-site information cheaply, scoped only to the chain under investigation. Only as a last resort, for genuinely elusive bugs that resist all of the above, reach for full <code>Hooks.onOperatorDebug()</code> or ReactorDebugAgent, ideally in a lower-traffic environment or a tightly time-boxed production window.
+</p>
+
+<p>
+This graduated approach, cheap first, expensive only when necessary, mirrors how experienced teams actually operate reactive systems: debug tooling that is powerful but costly is treated as an escalation path, not a default-on setting.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The signal to give: "I reach for .log()/doOnError first because it's free, checkpoint() second because it's cheap and targeted, and full operator debug mode last because it's expensive and global." That ordering, not just knowing the tools exist, is what shows real operational judgment.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h15">SECTION 12 - WEBCLIENT DEEP DIVE</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q40">
+Q40. WebClient vs RestTemplate
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>RestTemplate</code> is Spring's original, synchronous, blocking HTTP client; it has been in maintenance mode and officially marked for eventual deprecation-in-spirit (Spring's documentation has steered users away from it for new development for years, even where the class itself remains present for backward compatibility), specifically because every call blocks the calling thread until the full response is received, making it fundamentally incompatible with a non-blocking WebFlux pipeline.
+</p>
+
+<p>
+<code>WebClient</code> is Spring's non-blocking, reactive HTTP client, built on Reactor Netty by default, returning Mono/Flux for both the request execution and the response body. It supports the same functional, composable operator style as the rest of Reactor, streaming response bodies, and works correctly inside a WebFlux request-handling chain without introducing a blocking call. It is also perfectly usable from a plain Spring MVC (blocking) application, either by calling <code>.block()</code> at the edge (acceptable there, since MVC threads are expected to block) or by embracing async, non-blocking calls even in an otherwise-blocking MVC app.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth noting precisely: WebClient is the recommended HTTP client for all new Spring code regardless of whether the calling application itself is WebFlux or MVC; it is not "the WebFlux HTTP client," it is simply the modern, actively developed one, and RestTemplate should be treated as legacy in any codebase written from 2020 onward.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q41">
+Q41. WebClient Connection Pooling and ConnectionProvider Tuning
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+By default, WebClient (via Reactor Netty) reuses a shared, global connection pool sized with sensible defaults, but any service making a meaningful volume of outbound calls to a specific downstream dependency should configure a dedicated <code>ConnectionProvider</code> for that client, controlling the maximum number of connections, the pending-acquire timeout (how long a request waits for a free connection before failing), the pending-acquire max count (queue depth), and idle/max connection lifetime.
+</p>
+
+<p>
+Under-provisioning this pool is a common, subtle production bottleneck: if the max connection count is too low for the actual concurrent call volume to a given host, requests start queueing on <code>pendingAcquireTimeout</code> and eventually fail with a pool-exhaustion error that looks like a downstream outage but is actually a self-inflicted client-side connection limit.
+</p>
+
+</div>
+
+<pre>
+ConnectionProvider provider = ConnectionProvider.builder("custom-pool")
+        .maxConnections(200)
+        .pendingAcquireTimeout(Duration.ofSeconds(5))
+        .maxIdleTime(Duration.ofSeconds(30))
+        .build();
+
+HttpClient httpClient = HttpClient.create(provider);
+WebClient client = WebClient.builder()
+        .clientConnector(new ReactorClientHttpConnector(httpClient))
+        .baseUrl("https://downstream-service")
+        .build();
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Sharing the default global connection pool across many downstream dependencies with wildly different traffic profiles, then being unable to tell, when pool exhaustion happens, which dependency actually caused it. A dedicated ConnectionProvider (and a dedicated WebClient instance) per significant downstream dependency gives you isolation, exactly mirroring the scheduler-isolation argument from Q30, applied at the HTTP connection-pool layer instead.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q42">
+Q42. WebClient Timeouts: Connect, Read, Write, and Response Timeout
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+WebClient has no built-in default timeout on the overall response, an easy-to-miss fact that means, unconfigured, a call to a hung downstream dependency can wait indefinitely, tying up a subscription (and whatever it is downstream of) forever. Correctly configuring a production WebClient means setting timeouts at multiple layers, each catching a different failure mode: <b>connect timeout</b> (how long to wait to establish the TCP connection itself, set on the underlying Netty HttpClient), <b>read timeout</b> and <b>write timeout</b> (how long to wait for data once the connection is established, also Netty-level handlers), and a Reactor-level <b>response timeout</b> applied with <code>.timeout(Duration)</code> on the returned Mono/Flux, which is the catch-all covering the entire request/response exchange regardless of where it stalls.
+</p>
+
+</div>
+
+<pre>
+HttpClient httpClient = HttpClient.create()
+        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)
+        .doOnConnected(conn -&gt; conn
+                .addHandlerLast(new ReadTimeoutHandler(5, TimeUnit.SECONDS))
+                .addHandlerLast(new WriteTimeoutHandler(5, TimeUnit.SECONDS)));
+
+WebClient client = WebClient.builder()
+        .clientConnector(new ReactorClientHttpConnector(httpClient))
+        .build();
+
+Mono&lt;Response&gt; result = client.get().uri("/data").retrieve()
+        .bodyToMono(Response.class)
+        .timeout(Duration.ofSeconds(6)); // overall Reactor-level safety net
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The point worth stressing: layered timeouts exist because each one catches a different stall point, connect timeout catches an unreachable host, read/write timeout catches a connection that opened but then stalled mid-transfer, and the Reactor .timeout() is the last-line-of-defense catch-all. Relying on only one of them leaves gaps; production WebClient configuration should set all of them deliberately, never rely on defaults.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q43">
+Q43. Wrapping WebClient Calls With Reactive Resilience (Resilience4j)
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Resilience4j ships a reactor module (<code>resilience4j-reactor</code>) providing operators, <code>CircuitBreakerOperator</code>, <code>RateLimiterOperator</code>, <code>BulkheadOperator</code>, <code>RetryOperator</code>, that transform naturally into Reactor's Mono/Flux operator chain via <code>.transformDeferred(...)</code>, letting you compose resilience patterns directly into a WebClient call without leaving the reactive world or blocking anywhere to check circuit state. This chapter's lens is specifically the reactive-mechanics side of this: how the resilience wrapper composes as a Reactor operator, not the internal state-machine mechanics of the circuit breaker pattern itself, which is covered in the microservices resilience material.
+</p>
+
+<p>
+A circuit-breaker-wrapped WebClient call fails fast (short-circuits without even attempting the network call) once the downstream dependency's failure rate crosses the configured threshold, which is precisely what protects a shared boundedElastic pool or a limited outbound connection pool from being consumed entirely by calls that are very likely to fail anyway, complementing rather than replacing the timeout/retry mechanisms above.
+</p>
+
+</div>
+
+<pre>
+CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("downstream-service");
+
+Mono&lt;Response&gt; result = webClient.get().uri("/data").retrieve()
+        .bodyToMono(Response.class)
+        .transformDeferred(CircuitBreakerOperator.of(circuitBreaker))
+        .timeout(Duration.ofSeconds(3))
+        .onErrorResume(CallNotPermittedException.class, ex -&gt; fallback());
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth naming precisely: a circuit breaker rejecting a call throws <code>CallNotPermittedException</code>, a distinct exception type from any actual network/timeout failure, so your onErrorResume/fallback logic needs to distinguish "the circuit is open, we deliberately did not call" from "we called and it failed," since they usually warrant different fallback behaviour and different alerting.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q44">
+Q44. Common WebClient Pitfalls
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The most common WebClient mistake is calling <code>.retrieve()</code> and then never subscribing to (or otherwise consuming) the resulting Mono/Flux; because WebClient's request is only actually sent once its response publisher is subscribed to (Q15's "nothing happens until subscribe" applies here too), a chain that builds the request but drops the result silently never sends it, exactly analogous to the reactive repository bug from Q19.
+</p>
+
+<p>
+The other common pitfall is not properly draining or handling error response bodies: <code>.retrieve()</code> by default turns any 4xx/5xx status into a WebClientResponseException without you seeing the actual response body content unless you explicitly call <code>.onStatus(...)</code> to customize the handling, or reach for <code>.exchangeToMono(...)</code>/<code>.exchangeToFlux(...)</code> when you need full manual control over reading the response including its body on error paths (exchangeToMono/Flux, unlike retrieve, puts you on the hook for consuming the body yourself in every branch, including errors, to avoid leaking the connection).
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reaching for <code>exchangeToMono</code> "for more control" and then forgetting to consume the response body on every code path, including error branches, which can leak the underlying connection back to the pool improperly. Unless you specifically need that level of control, <code>.retrieve()</code> with <code>.onStatus(...)</code> handlers is the safer, harder-to-misuse default.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h16">SECTION 13 - SERVER-SENT EVENTS &amp; STREAMING RESPONSES</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q45">
+Q45. Streaming Server-Sent Events From a WebFlux Controller
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Server-Sent Events (SSE) are a one-directional, long-lived HTTP streaming protocol, the server keeps the connection open and pushes a sequence of text-formatted events to the client over time, and they map onto WebFlux's reactive model almost perfectly: a controller method simply returns a <code>Flux&lt;ServerSentEvent&lt;T&gt;&gt;</code> (or a plain <code>Flux&lt;T&gt;</code> with the media type set to <code>text/event-stream</code>), and WebFlux keeps the underlying connection open, writing each emitted element to the response as it arrives, for as long as the Flux keeps emitting.
+</p>
+
+<p>
+This is a genuinely different shape of endpoint from a normal request/response controller method returning a Mono, the response is not "complete" until the Flux itself completes (or the client disconnects), which could be seconds, minutes, or indefinitely for a live feed. Client disconnection is handled naturally too: when the client closes the connection, WebFlux cancels the underlying subscription, which propagates cancellation up through the Flux's operator chain exactly like any other subscriber cancellation, letting the server release any resources tied to that particular stream.
+</p>
+
+</div>
+
+<pre>
+@GetMapping(value = "/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux&lt;ServerSentEvent&lt;String&gt;&gt; streamEvents() {
+    return Flux.interval(Duration.ofSeconds(1))
+               .map(seq -&gt; ServerSentEvent.builder("tick " + seq)
+                                          .id(String.valueOf(seq))
+                                          .event("tick")
+                                          .build());
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth calling out: because SSE endpoints are long-lived, they occupy a connection (and whatever resources back the Flux, a subscription to a message broker, a polling loop) for the connection's entire lifetime, so capacity planning for an SSE-heavy service is closer to planning for concurrent open connections than for request throughput, a genuinely different operational profile than a typical REST endpoint.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q46">
+Q46. How Does Backpressure Propagate All the Way to an HTTP Client?
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Reactive Streams backpressure inside a single JVM's operator chain is straightforward, the request(n) protocol from Q2, but WebFlux extends that same idea across the actual network connection: the underlying Netty channel only writes as much of the response as the client's TCP receive window and the channel's own writability allow, and Reactor Netty's HTTP response-writing machinery translates "the socket cannot currently accept more bytes" back into reduced <code>request(n)</code> signals up through your Flux's operator chain. Concretely, if a slow SSE client is not reading fast enough, TCP-level backpressure (a full receive window) eventually causes Reactor Netty to stop requesting more elements from your Flux, which naturally slows or pauses whatever is producing those elements upstream, all without you writing any explicit backpressure-handling code.
+</p>
+
+<p>
+This is the genuine, often-cited advantage of a fully reactive stack for exactly this kind of streaming workload: a Spring MVC streaming endpoint (using a blocking OutputStream) has no equivalent mechanism, a slow client there either blocks the serving thread indefinitely or requires manual, application-level throttling logic that WebFlux gets essentially for free from the Reactive Streams protocol.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The precise claim to make: "backpressure in WebFlux is not just an in-process operator concept, Reactor Netty bridges TCP-level flow control (the client's receive window) into Reactive Streams request(n) signals, so a slow HTTP client genuinely throttles your upstream Flux, not just the bytes sitting in a server-side buffer." This is a detail that clearly separates deep WebFlux experience from surface-level familiarity.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q47">
+Q47. NDJSON and Streaming JSON Responses
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Newline-Delimited JSON (NDJSON, media type <code>application/x-ndjson</code>) is WebFlux's other main streaming response shape besides SSE: instead of wrapping every element in an SSE event envelope with an id/event/data structure, each emitted element is serialized as a standalone JSON object followed by a newline, letting a client parse the stream incrementally, one JSON object per line, without needing to buffer the entire response before it can start processing. It is a natural fit for streaming a large or unbounded Flux of JSON entities (a bulk export endpoint, a live feed of domain objects) to a client that just wants a stream of typed objects rather than SSE's richer, browser-EventSource-oriented event metadata.
+</p>
+
+<p>
+A controller method returns <code>Flux&lt;T&gt;</code> with the produces media type set to NDJSON, and WebFlux's Jackson integration streams each element as it is emitted rather than collecting the whole Flux into a single JSON array first, which is the key difference from a normal <code>Flux&lt;T&gt;</code> endpoint returning ordinary <code>application/json</code>: a plain JSON array response has to buffer the entire Flux before it can write the closing bracket, defeating the point of streaming for a large or slow-arriving dataset.
+</p>
+
+</div>
+
+<pre>
+@GetMapping(value = "/export", produces = "application/x-ndjson")
+public Flux&lt;Order&gt; exportOrders() {
+    return orderRepository.findAll(); // streamed one JSON object per line, no buffering
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Returning a large Flux&lt;T&gt; as plain application/json expecting streaming behaviour. A standard JSON array response must buffer every element to correctly emit the array's closing bracket, so it does not stream incrementally to the client the way NDJSON or SSE do; for genuinely large or slow-to-produce datasets, NDJSON (or SSE) is the correct media type choice, not a plain JSON array.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h17">SECTION 14 - REACTIVE TRANSACTION MANAGEMENT WITH R2DBC</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q48">
+Q48. Why Do @Transactional's Usual Semantics Get Tricky With R2DBC?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Classic Spring transaction management, the mechanism behind blocking @Transactional with JDBC/JPA, works by binding the current database connection (or EntityManager) to the current thread, via <code>TransactionSynchronizationManager</code>'s ThreadLocal-based resource map, for the duration of the transaction; every repository call made from that same thread transparently reuses the same bound connection so all the operations participate in one transaction. This is exactly the pattern that breaks under reactive execution: as established in Q20, a reactive chain routinely hops across multiple threads mid-flight, so "bind the connection to the current thread" simply does not carry the connection through the rest of the chain the way it does in a single-threaded blocking call stack.
+</p>
+
+<p>
+@Transactional itself still technically works with R2DBC in modern Spring versions, Spring bridges the transactional context through Reactor's Context (Q21) rather than ThreadLocal specifically to solve this, but the mechanism underneath is fundamentally different from the JDBC case, and understanding that it is Context-based, not ThreadLocal-based, is what lets you reason correctly about edge cases (a transaction boundary that spans a scheduler hop, or a chain that partially escapes the reactive world) that behave differently than their JDBC counterparts would.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The precise statement to make: "R2DBC's @Transactional support works by propagating the transaction's bound connection through Reactor Context instead of ThreadLocal, which is why it still functions across scheduler hops, but it also means transaction propagation now inherits every one of Context's own rules and pitfalls, including the upstream-only visibility and the loss of propagation across any drop into blocking code, discussed in Q21/Q23."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q49">
+Q49. TransactionalOperator and ReactiveTransactionManager
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>ReactiveTransactionManager</code> is R2DBC's reactive counterpart to the blocking <code>PlatformTransactionManager</code>, and <code>TransactionalOperator</code> is the explicit, programmatic way to demarcate a transaction boundary around a specific Mono/Flux chain, an alternative to the declarative @Transactional annotation that many teams actually prefer in reactive code because it makes the transaction boundary visible right at the call site, rather than implicit via a proxy (recall that @Transactional relies on AOP proxying, and self-invocation and similar proxy pitfalls apply here too).
+</p>
+
+<p>
+<code>TransactionalOperator.transactional(publisher)</code> wraps a given Mono/Flux so that its execution runs within a transaction managed by the configured ReactiveTransactionManager, committing on successful completion and rolling back on error, exactly mirroring @Transactional's commit/rollback semantics but expressed as an explicit operator in the chain instead of an annotation applied to a method.
+</p>
+
+</div>
+
+<pre>
+@Bean
+ReactiveTransactionManager transactionManager(ConnectionFactory cf) {
+    return new R2dbcTransactionManager(cf);
+}
+
+@Service
+class OrderService {
+    private final TransactionalOperator txOperator;
+    private final OrderRepository orders;
+    private final InventoryRepository inventory;
+
+    Mono&lt;Order&gt; placeOrder(Order order) {
+        Mono&lt;Order&gt; work = orders.save(order)
+                .flatMap(saved -&gt; inventory.decrement(saved.getSku())
+                                           .thenReturn(saved));
+        return txOperator.transactional(work); // commits/rolls back the whole chain
+    }
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+The clean comparison to draw: "@Transactional is declarative and relies on an AOP proxy, exactly like the JDBC case; TransactionalOperator is programmatic and wraps the publisher explicitly, avoiding proxy-related pitfalls like self-invocation at the cost of a slightly more verbose call site. Many reactive-first teams prefer TransactionalOperator specifically because the transaction boundary is visible in the code, not hidden behind a proxy."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q50">
+Q50. Common Pitfalls With Reactive Transaction Boundaries
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+The most common mistake is calling <code>.subscribeOn()</code> or otherwise introducing a genuine subscription boundary (a separate subscribe() call, a cached/shared Mono reused across requests) in the middle of what is meant to be one transactional chain; because the transactional Context needs to flow continuously through a single, unbroken chain of operators bound to one subscription, splitting the work across separate subscriptions breaks the transaction boundary in ways that are easy to miss until a partial-commit bug shows up in production.
+</p>
+
+<p>
+The other common pitfall is mixing a blocking call (a legacy JDBC-backed repository, invoked via <code>Mono.fromCallable(...).subscribeOn(boundedElastic())</code>) into what is otherwise an R2DBC-transactional chain, expecting it to participate in the same transaction. It will not: the blocking call runs against a completely separate connection obtained through a completely separate transaction manager, so there is no way for R2DBC's reactive transaction to span across it; if you must combine blocking and reactive data access in one logical operation, you need either two independent transactions (with the operational complexity of coordinating their outcomes yourself) or a genuine migration of the blocking piece to R2DBC.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming a reactive transaction can span a mixed R2DBC-and-JDBC data access chain just because both pieces eventually run "inside" the same overall Mono. Transaction managers operate on their own resource type; an R2DBC transaction manager has no visibility into (and cannot roll back) a JDBC connection's changes, and vice versa. Treat mixed blocking/reactive persistence as two separate transactional domains, not one.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h18">SECTION 15 - ADVANCED TESTING: VIRTUAL TIME &amp; TESTPUBLISHER</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q51">
+Q51. StepVerifier.withVirtualTime() - What It Actually Does and Its Limits
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>StepVerifier.withVirtualTime(() -&gt; publisherSupplier)</code> swaps in Reactor's <code>VirtualTimeScheduler</code> as the default scheduler for the duration of the test, so that any time-based operator (<code>delayElements</code>, <code>Mono.delay</code>, <code>timeout</code>, an interval-based Flux) advances according to virtual, simulated time rather than actually sleeping the test thread for real wall-clock duration. Combined with <code>.thenAwait(Duration)</code> to fast-forward the virtual clock by a specific amount, this lets you write a test asserting the behaviour of, say, a 30-second timeout, or a stream that ticks once a minute for an hour, that runs in milliseconds of real time instead of actually waiting.
+</p>
+
+<p>
+The important limitation to know: the publisher must be constructed <i>inside</i> the supplier lambda passed to withVirtualTime, not built beforehand and passed in as a plain value, because the VirtualTimeScheduler has to be installed as the default scheduler before any time-based operator is assembled; building the publisher too early captures a reference to the real scheduler instead, and the virtual-time trick silently does not apply, a very common gotcha when refactoring a test.
+</p>
+
+</div>
+
+<pre>
+@Test
+void tickerEmitsHourlyWithoutRealWaiting() {
+    StepVerifier.withVirtualTime(() -&gt;
+            Flux.interval(Duration.ofMinutes(1)).take(3)) // built INSIDE the supplier
+        .expectSubscription()
+        .expectNoEvent(Duration.ofMinutes(1))
+        .expectNext(0L)
+        .thenAwait(Duration.ofMinutes(2))
+        .expectNext(1L, 2L)
+        .verifyComplete();
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Building the Flux/Mono outside the supplier lambda (e.g. as a field or local variable computed before calling withVirtualTime) and passing a reference to it. The scheduler substitution only affects operators assembled after VirtualTimeScheduler is installed, so a publisher built too early quietly uses real time, and the test either passes for the wrong reason or actually sleeps for real, defeating the entire point of virtual time.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q52">
+Q52. TestPublisher: Simulating Backpressure and Upstream Failures
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+<code>TestPublisher&lt;T&gt;</code> is Reactor Test's tool for the opposite side of what StepVerifier normally covers: instead of asserting on emissions coming out of a chain you already have, it lets you construct a controllable, hand-driven Publisher to feed into a chain you are testing, so you can simulate exactly the upstream conditions you want, a slow producer, a producer that violates the Reactive Streams protocol, an upstream that fails mid-stream, situations that are difficult or impossible to trigger reliably using a real repository or client as the source.
+</p>
+
+<p>
+This is the tool of choice for testing your own operators, custom backpressure handling code, or resilience logic (retry, timeout, fallback) against upstream failure scenarios that would otherwise require an elaborate mock setup: you emit exactly the sequence of signals you want, including onNext, onError at a specific moment, or even protocol violations (via <code>TestPublisher.createNoncompliant(...)</code>) to verify your code degrades gracefully rather than crashing when fed a misbehaving Publisher.
+</p>
+
+</div>
+
+<pre>
+@Test
+void fallsBackWhenUpstreamErrors() {
+    TestPublisher&lt;String&gt; upstream = TestPublisher.create();
+
+    StepVerifier.create(
+                upstream.flux().onErrorResume(ex -&gt; Flux.just("fallback")))
+            .then(() -&gt; upstream.emit("first"))
+            .expectNext("first")
+            .then(() -&gt; upstream.error(new RuntimeException("boom")))
+            .expectNext("fallback")
+            .verifyComplete();
+}
+</pre>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Worth mentioning: TestPublisher can deliberately misbehave (emit after completion, emit without a preceding request, violate the spec in other ways) specifically so you can verify your own operators or resilience wrappers handle a non-compliant upstream defensively, something a well-behaved mock repository would never expose, but that a real third-party Publisher implementation occasionally does in production.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q53">
+Q53. Testing Scheduler and Thread-Hop Behaviour
+</div>
+
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Asserting that a chain actually executes on the scheduler you configured (verifying a subscribeOn/publishOn placement is correct, or that a blocking call really is quarantined onto boundedElastic as intended from Q29) is one of the trickier things to unit test cleanly, because the assertion has to happen from inside the running chain, on whatever thread is currently executing, rather than from the test's own thread after the fact. The common pattern is a <code>doOnNext</code> (or a custom operator) that captures <code>Thread.currentThread().getName()</code> at the relevant point in the chain into a thread-safe holder (an AtomicReference), which the test then inspects after the StepVerifier has finished verifying the chain's emissions.
+</p>
+
+<p>
+For genuinely deterministic thread-hop testing, some teams prefer injecting a named, dedicated test Scheduler (via <code>Schedulers.newSingle("test-scheduler")</code>, or a hand-rolled Scheduler wrapping a single-thread executor) into the code under test rather than the default Schedulers.parallel()/boundedElastic(), so the test can assert precisely "the operator ran on the thread belonging to this specific injected scheduler" rather than a fragile assertion based on default-scheduler naming conventions.
+</p>
+
+</div>
+
+<pre>
+@Test
+void runsOnBoundedElastic() {
+    AtomicReference&lt;String&gt; threadName = new AtomicReference&lt;&gt;();
+
+    StepVerifier.create(
+            Mono.fromCallable(() -&gt; "value")
+                .doOnNext(v -&gt; threadName.set(Thread.currentThread().getName()))
+                .subscribeOn(Schedulers.boundedElastic()))
+        .expectNext("value")
+        .verifyComplete();
+
+    assertThat(threadName.get()).contains("boundedElastic");
+}
+</pre>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Asserting on Thread.currentThread() from the test method's own thread, after the StepVerifier call returns, rather than capturing it from inside the reactive chain while it is actually executing on the scheduled thread. By the time verify() returns, execution has already finished and the test thread was never the one running the operator in question, so the assertion has to be captured during execution, not afterward.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h19">PART 2 COMPLETE</h1>
+
+<p>
+
+Next Part:
+
+* Reactive vs virtual threads - production decision-making, going deeper than a surface-level comparison
+* When migrating an existing WebFlux service back to a virtual-thread MVC model is (and isn't) worth it
+* Hybrid architectures mixing virtual-thread MVC services with genuinely reactive streaming services
+
+These are the questions that come up when interviewers want to know whether you have an actual point of view on reactive's future, not just its mechanics.
+
+</p>
+
+<hr>
+
+<h1 id="h20">SECTION 16 - REACTIVE VS VIRTUAL THREADS: PRODUCTION DECISION-MAKING</h1>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q54">
+Q54. A Decision Framework: WebFlux vs Virtual-Thread Spring MVC for a New Service
+</div>
+
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Building on Q14's foundational comparison, a concrete decision framework for a brand-new service in 2026 looks roughly like this: default to Spring MVC with virtual threads enabled (a one-line property in Spring Boot 3.2+) unless a specific, identifiable requirement points toward reactive. Virtual threads give you most of the concurrency-ceiling benefit reactive was originally adopted for, while keeping ordinary, debuggable, imperative code, existing blocking libraries and drivers, and a team that does not need to learn a new operator vocabulary.
+</p>
+
+<p>
+Reach for WebFlux specifically when you have a genuine, first-class need for backpressure as a concept (a fast producer and a slow, network-connected consumer that must be able to signal "slow down," true streaming semantics rather than just "handle a lot of concurrent requests"), when you are building something that is fundamentally a stream-processing pipeline with rich composition needs (complex zip/merge/windowing across multiple live sources), or when you are already deeply invested in a reactive stack (R2DBC, reactive Kafka consumers) where introducing a blocking island would be worse than staying consistently reactive end-to-end. The single question worth asking out loud in a design review: "do we need backpressure and stream composition, or do we just need to handle a lot of concurrent I/O-bound requests?" Only the former genuinely justifies reactive's complexity tax over virtual threads.
+</p>
+
+</div>
+
+<table border="1">
+
+<tr>
+<th>Signal</th>
+<th>Points toward</th>
+</tr>
+
+<tr>
+<td>Just need to handle high concurrency of I/O-bound calls</td>
+<td>Spring MVC + virtual threads</td>
+</tr>
+
+<tr>
+<td>Team unfamiliar with Reactor, tight timeline</td>
+<td>Spring MVC + virtual threads</td>
+</tr>
+
+<tr>
+<td>Existing blocking JDBC/JPA stack, no urgency to change</td>
+<td>Spring MVC + virtual threads</td>
+</tr>
+
+<tr>
+<td>Genuine backpressure need (slow consumer, fast producer)</td>
+<td>WebFlux / Reactor</td>
+</tr>
+
+<tr>
+<td>Streaming/SSE/complex multi-source composition</td>
+<td>WebFlux / Reactor</td>
+</tr>
+
+<tr>
+<td>Already fully reactive stack (R2DBC, reactive Kafka)</td>
+<td>WebFlux / Reactor</td>
+</tr>
+
+</table>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The 2026-appropriate framing: "reactive used to be the default answer to 'we have too much concurrent I/O,' virtual threads have taken over that specific use case, so reactive's remaining, genuinely justified niche is backpressure and stream composition, not raw concurrency. A team reaching for WebFlux purely for throughput in a new service in 2026, without a backpressure or streaming requirement, is very likely paying a complexity tax for a benefit virtual threads would have given them for free."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q55">
+Q55. Is Migrating an Existing WebFlux Service Back to Virtual-Thread MVC Worth It?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Almost always, no, at least not as a standalone project justified purely by "virtual threads exist now." A working, correctly-implemented WebFlux service already has its non-blocking drivers (R2DBC, reactive clients), its team already trained on the operator vocabulary, and its operational tooling (dashboards, alerting) already built around reactive-specific signals. Rewriting all of that back to a blocking model, re-introducing JDBC/JPA where R2DBC currently sits, retraining the team on blocking idioms, is a substantial rewrite with real regression risk, undertaken to relieve a debugging/complexity cost that the team has, by definition, already absorbed and is presumably already productive despite.
+</p>
+
+<p>
+The calculus changes when the WebFlux adoption itself was a mistake in the first place, a genuinely CRUD-shaped service adopted reactive "because it seemed modern" (Q13's cautionary case) with no real backpressure or streaming need, is chronically understaffed with reactive expertise, and is paying an ongoing productivity/incident-frequency tax that outweighs the one-time migration cost. In that specific scenario, migrating to virtual-thread MVC is a legitimate simplification, not a fashion-driven rewrite, but the bar for justifying it should be concrete, measured pain (incident frequency, time-to-debug, onboarding friction), not simply "virtual threads are newer."
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating "virtual threads now exist" as sufficient justification on its own to migrate a healthy, working reactive service. Migration cost and regression risk are real and often underestimated; the decision should be driven by a measured, ongoing cost the current architecture is actually imposing on the team, not by the availability of a technically-interesting alternative.
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q56">
+Q56. Hybrid Architectures: Mixing Virtual-Thread MVC Services With Reactive Streaming Services
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+In a microservices fleet, the two models are not mutually exclusive, and the pragmatic 2026 pattern in many organizations is genuinely hybrid: the majority of ordinary, CRUD-and-orchestration services run on Spring MVC with virtual threads, simple, debuggable, using whatever blocking drivers the team already knows, while a small number of services with a genuine streaming or backpressure requirement, a real-time notification/event-fan-out service, a bulk data export pipeline, an SSE-based live dashboard feed, are deliberately built on WebFlux and R2DBC, where the complexity investment is justified by an actual technical requirement, not organizational fashion.
+</p>
+
+<p>
+This mirrors how most architectural decisions should be made at the service level rather than as a single organization-wide mandate: the choice between reactive and virtual-thread-blocking is a per-service decision driven by that service's actual I/O and streaming shape, not a company-wide "we are a reactive shop" or "we don't do reactive" policy that ignores the real variation in requirements across a fleet of services with genuinely different needs.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The strongest answer treats this as an architectural maturity signal: "the mark of a team that actually understands both models is making this choice per-service based on concrete requirements, rather than a blanket organizational mandate in either direction. Most services in a typical fleet do not need reactive; a handful of genuinely streaming-shaped services do, and treating that as a case-by-case engineering decision, not a religious one, is the mature position."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<div class="section">
+
+<div class="question" id="q57">
+Q57. What Concrete Signals Tell You a Service Actually Needs Reactive's Backpressure Model?
+</div>
+
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+
+<h3>Short Answer</h3>
+
+<div class="answer">
+
+<p>
+Beyond the general framework in Q54, a few concrete, checkable signals reliably indicate a genuine backpressure need rather than just "a lot of concurrent requests": the service has a data source that can produce faster than any reasonable consumer can process (a market data feed, a high-frequency sensor stream, a change-data-capture stream from a database) where dropping, buffering, or explicitly slowing the producer is a real design decision the service must make, not a hypothetical. The service exposes a genuinely long-lived streaming endpoint to external clients (SSE, WebSocket, gRPC streaming) where a slow client must not be allowed to either stall the server or silently drop data without an explicit policy decision. Or the service's core logic is naturally expressed as composition over multiple live, ongoing streams (combining several real-time feeds with zip/merge/combineLatest) rather than as a sequence of discrete request/response calls.
+</p>
+
+<p>
+If none of those apply, if the workload is fundamentally "receive a request, make a few downstream calls, return a response," even at very high concurrency and very high downstream call volume, that is precisely the shape virtual threads handle well without reactive's complexity, and the presence of high concurrency alone, without any of the above signals, is not by itself evidence that reactive is the right tool.
+</p>
+
+</div>
+
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+The concise test to offer: "ask whether the service's core problem is 'too many concurrent things waiting on I/O' (virtual threads' sweet spot) or 'a producer and consumer moving at different speeds where that mismatch is itself part of the business problem' (reactive's actual differentiator). Conflating the two is exactly how teams end up adopting reactive for services that only ever needed the former."
+</p>
+</div>
+
+</div>
+
+<hr>
+
+<h1 id="h21">QUICK REVISION SHEET</h1>
 
 <hr>
 
@@ -969,6 +2981,30 @@ The nuanced take interviewers want in 2026: "Loom does not make Reactor obsolete
 <li>Skip reactive for CPU-bound work, simple low-concurrency CRUD with blocking drivers, or teams without the ramp-up time; the complexity tax must buy real throughput</li>
 
 <li>Virtual threads (Loom) make blocking cheap instead of avoiding it: ordinary blocking code scales past the thread ceiling with normal debuggability, narrowing reactive's case to real streaming/backpressure needs; watch for carrier-thread pinning on synchronized blocks</li>
+
+<li>A Reactor chain has three phases: assembly (building operators, nothing runs), subscription (request(n) travels bottom-up), execution (signals travel top-down, your code actually runs) - a Mono/Flux built but never subscribed to is inert</li>
+
+<li>Cold publishers rerun their source per subscriber; hot publishers run once and broadcast, late subscribers miss history unless replay() buffers it; share() = publish().refCount(1)</li>
+
+<li>ThreadLocal breaks across reactive thread-hops; Reactor's Context is attached to the subscription (not a thread), is immutable, and propagates upstream only - contextWrite must sit at or below every reader</li>
+
+<li>Sinks.Many/Sinks.One replace hand-rolled Subscriber/FluxProcessor implementations for manually pushing values; unicast = one subscriber, multicast = broadcast live only, replay = broadcast with history; prefer tryEmitNext and check the EmitResult</li>
+
+<li>parallel() is fixed-size and must never block; boundedElastic() absorbs unavoidable blocking calls; a blocking call scheduled on parallel() by mistake starves the whole pool - isolate risky dependencies with a dedicated custom scheduler</li>
+
+<li>retry(n) retries blindly with no delay; retryWhen(Retry.backoff(...).filter(...)) adds backoff, jitter (to avoid synchronized retry storms), and a filter for only genuinely retryable errors; exhausted retries surface as RetryExhaustedException unless unwrapped</li>
+
+<li>Raw Reactor stack traces show scheduler plumbing, not your assembly site; escalate cheap-to-expensive: log()/doOnError, then checkpoint(), then Hooks.onOperatorDebug()/ReactorDebugAgent only during active investigation</li>
+
+<li>WebClient replaces RestTemplate; tune its ConnectionProvider and layer connect/read/write/response timeouts explicitly (none are set by default); wrap calls with Resilience4j's reactive operators (transformDeferred) for circuit breaking</li>
+
+<li>SSE (Flux&lt;ServerSentEvent&lt;T&gt;&gt;) and NDJSON stream responses incrementally; Reactor Netty bridges TCP-level flow control into request(n), so a slow HTTP client genuinely throttles the upstream Flux</li>
+
+<li>R2DBC's @Transactional propagates the bound connection via Reactor Context, not ThreadLocal; prefer TransactionalOperator for an explicit boundary; a mixed R2DBC+JDBC chain is two separate transactional domains, never one</li>
+
+<li>Test time-based operators with StepVerifier.withVirtualTime() (build the publisher inside the supplier lambda); use TestPublisher to simulate upstream backpressure/failure/protocol violations</li>
+
+<li>2026 decision framework: default new services to Spring MVC + virtual threads; reach for WebFlux only for a genuine backpressure/streaming/composition need or an already-reactive stack - most fleets end up hybrid, not all-in on one model</li>
 
 </ul>
 

@@ -110,6 +110,17 @@ Once you state a rule, interviewers usually continue with "and how would you han
 <li>Rate limiting and the 429 response</li>
 <li>HATEOAS, caching (ETag) and content negotiation</li>
 <li>OpenAPI/Swagger and REST vs GraphQL vs gRPC</li>
+<li>Conditional requests (If-Match/If-None-Match) for optimistic concurrency</li>
+<li>JSON Merge Patch vs JSON Patch semantics</li>
+<li>Async APIs: 202 Accepted + polling, job resources, webhooks and SSE</li>
+<li>Bulk/batch endpoint design and partial-success (207 Multi-Status) reporting</li>
+<li>Rate limiting algorithms: token bucket, leaky bucket, sliding window</li>
+<li>API deprecation, Sunset headers and backward-compatible schema evolution</li>
+<li>Contract-first vs code-first OpenAPI and consumer-driven contract testing</li>
+<li>API Gateway / BFF pattern and shaping contracts per client type</li>
+<li>Multi-tenancy in API design</li>
+<li>Mass assignment, CORS and other contract-boundary security concerns</li>
+<li>A deeper REST vs GraphQL vs gRPC decision framework</li>
 
 </ol>
 
@@ -771,7 +782,1433 @@ Rule of thumb: <b>REST</b> for public-facing CRUD APIs where HTTP caching and ub
 
 <hr>
 
-<h1 id="h9">QUICK REVISION SHEET</h1>
+<h1 id="h9">SECTION 7 - CONDITIONAL REQUESTS, PATCH SEMANTICS &amp; CONCURRENCY</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q17">
+Q17. How do If-Match, If-None-Match and If-Modified-Since work for optimistic concurrency on writes?
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Q15 introduced ETag for caching reads. The same mechanism, applied to writes, gives you optimistic concurrency without a database lock: the client first GETs the resource and receives an <code>ETag</code> (a version fingerprint, e.g. <code>"v7"</code>). When it later updates the resource, it sends that ETag back as a precondition on the write:
+</p>
+<pre>
+PUT /api/v1/accounts/42
+If-Match: "v7"
+</pre>
+<p>
+The server compares the supplied value against the resource's current ETag. If they match, the update proceeds and a new ETag (<code>"v8"</code>) is issued. If someone else updated the resource in between, the current ETag is now <code>"v8"</code>, the precondition fails, and the server rejects the write with <b>412 Precondition Failed</b> - without applying it - so the client never silently clobbers a change it never saw. This is the HTTP-native expression of the same idea as JPA's <code>@Version</code> optimistic locking (see the JPA chapter): the client is forced to refetch, look at what changed, and retry.
+</p>
+<table border="1">
+<tr><th>Header</th><th>Sent on</th><th>Meaning</th><th>Failure code</th></tr>
+<tr><td>If-None-Match</td><td>GET</td><td>"send the body only if it changed since this ETag"</td><td>304 Not Modified</td></tr>
+<tr><td>If-None-Match: *</td><td>POST/PUT</td><td>"only create if a resource at this URI does not already exist"</td><td>412 Precondition Failed</td></tr>
+<tr><td>If-Match</td><td>PUT/PATCH/DELETE</td><td>"only apply if the resource is still at this exact version"</td><td>412 Precondition Failed</td></tr>
+<tr><td>If-Modified-Since</td><td>GET</td><td>weaker, timestamp-based version of If-None-Match (second-resolution only)</td><td>304 Not Modified</td></tr>
+<tr><td>If-Unmodified-Since</td><td>PUT/PATCH/DELETE</td><td>weaker, timestamp-based version of If-Match</td><td>412 Precondition Failed</td></tr>
+</table>
+<p>
+Prefer ETag-based preconditions over date-based ones whenever you can compute a real fingerprint: <code>Last-Modified</code> only has second-level resolution, so two updates within the same second are indistinguishable, while an ETag (hash or version counter) is exact. A <code>W/"..."</code> prefix marks a <i>weak</i> ETag - equivalent for caching purposes but not guaranteed byte-identical - versus a strong ETag with no prefix, which must be byte-for-byte identical to match.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"If-None-Match: * on a POST/PUT is how you implement create-if-absent without a race: the server only creates the resource if nothing exists yet at that URI, and returns 412 if a concurrent request beat it there." This is a detail most candidates never mention and immediately separates a strong answer.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q18">
+Q18. What is the difference between JSON Merge Patch and JSON Patch for implementing PATCH?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+HTTP deliberately does not define the shape of a PATCH body - that is left to the media type. Two IETF standards fill that gap, and picking one (rather than inventing an ad hoc partial-update JSON shape) keeps your PATCH semantics unambiguous to clients and tooling.
+</p>
+<p>
+<b>JSON Merge Patch (RFC 7396)</b>, media type <code>application/merge-patch+json</code>, sends a partial object that is merged key by key into the target; a key set to <code>null</code> means "delete this field". Simple to produce and consume, but it cannot express array element operations precisely (an array is replaced wholesale, not patched element-by-element) and it cannot distinguish "leave this field alone" from "field wasn't in my object" versus a client that serializes absent fields as null by mistake.
+</p>
+<pre>
+PATCH /api/v1/users/42
+Content-Type: application/merge-patch+json
+
+{ "email": "new@acme.com", "nickname": null }
+</pre>
+<p>
+<b>JSON Patch (RFC 6902)</b>, media type <code>application/json-patch+json</code>, sends an ordered array of explicit operations addressed by JSON Pointer paths - far more expressive, including precise array index operations and a <code>test</code> operation that can assert a field's current value before applying the rest (a field-level optimistic-concurrency check, complementary to If-Match from Q17).
+</p>
+<pre>
+PATCH /api/v1/users/42
+Content-Type: application/json-patch+json
+
+[
+  { "op": "test",    "path": "/email", "value": "old@acme.com" },
+  { "op": "replace", "path": "/email", "value": "new@acme.com" },
+  { "op": "remove",  "path": "/nickname" },
+  { "op": "add",     "path": "/roles/-", "value": "REVIEWER" }
+]
+</pre>
+<p>
+Idempotency note (ties back to Q4): Merge Patch is idempotent because it sets absolute values. JSON Patch is idempotent only if every operation is idempotent by construction - <code>replace</code> is, but <code>add</code> to an array or a <code>test</code>-guarded sequence generally is not, since replaying the same array-append twice appends twice.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Inventing a custom, undocumented "partial update" JSON shape instead of adopting one of these two standards. Doing so forces every client to hand-read your prose docs instead of using an off-the-shelf JSON Patch/Merge Patch library, and it is a tell that the API wasn't designed with PATCH semantics in mind at all.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q19">
+Q19. How does RFC 7807 Problem Details relate to the custom error formats teams already use?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Q11 introduced RFC 7807 as the standard error envelope. In practice, almost every team already has some homegrown error shape (an <code>errorCode</code>, a <code>validationErrors</code> array, a <code>requestId</code>) that predates or sits alongside it. The right relationship is not "replace your format with 7807" but "put your format's extra fields inside 7807's envelope as extension members", since the spec explicitly allows adding arbitrary additional properties beyond <code>type</code>/<code>title</code>/<code>status</code>/<code>detail</code>/<code>instance</code>.
+</p>
+<pre>
+{
+  "type": "https://api.acme.com/errors/validation-failed",
+  "title": "Validation failed",
+  "status": 422,
+  "detail": "3 fields failed validation",
+  "instance": "/api/v1/users",
+  "traceId": "a1b2c3d4",
+  "errors": [
+    { "field": "email", "code": "INVALID_FORMAT", "message": "not a valid email address" },
+    { "field": "age",   "code": "MIN_VALUE",       "message": "must be at least 18" }
+  ]
+}
+</pre>
+<p>
+This gets you both worlds: generic HTTP tooling, gateways and even other teams' unrelated clients can parse the standard members (<code>status</code>, <code>title</code>) without knowing anything about your domain, while your own SDKs and frontend read the extension members (<code>errors</code>, <code>traceId</code>) for rich, field-level detail. Treat the <code>type</code> URI as a stable part of your public contract, not a debugging string - clients legitimately branch (<code>switch</code>/<code>if</code>) on it, so renaming or repurposing a <code>type</code> value is a breaking change subject to the same deprecation discipline as an endpoint (see Q35).
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"7807 is a base envelope, not a replacement for your domain-specific error detail." Saying this shows you understand it as an interoperability layer rather than a rigid schema you're locked into.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q20">
+Q20. How much do teams actually adopt HATEOAS in practice, and when is it worth it?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Full HATEOAS - a client that discovers what it can do next purely by following links in the response, with no hard-coded routes - is rare in production, for concrete reasons: client SDKs are usually generated from a static OpenAPI contract (Q39), not from following hypermedia links at runtime; embedding <code>_links</code> on every response adds payload weight; and frontend frameworks need routes at build time anyway (a React Router config doesn't discover itself from an API response). For a typical CRUD backend serving a known frontend, the cost outweighs the benefit, which is why most production APIs deliberately stop at Richardson Level 2 (Q2).
+</p>
+<p>
+Where hypermedia genuinely earns its keep is <b>state-machine-heavy resources</b>: an order, a support ticket, a loan application - anything whose valid next actions differ by current state. Embedding the currently-valid transitions in the response means the client renders "Cancel" and "Pay" buttons based on what the server says is legal right now, instead of duplicating the state-machine's transition rules in frontend code (which inevitably drifts out of sync with the backend's actual rules).
+</p>
+<pre>
+{ "id": 42, "status": "PENDING",
+  "_links": {
+    "self":   { "href": "/orders/42" },
+    "cancel": { "href": "/orders/42/cancel" },
+    "pay":    { "href": "/orders/42/payment" }
+  }
+}
+</pre>
+<p>
+A lighter-weight alternative many teams use instead of full HATEOAS: return an explicit <code>status</code> enum plus an <code>allowedTransitions</code> array, and document the full state machine in OpenAPI/prose rather than making link discovery the mechanism. It gives most of the same benefit (client doesn't hard-code transition rules) with far less machinery.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"I reach for hypermedia specifically for workflow/state-machine resources, not as a blanket architectural rule - for plain CRUD, Level 2 with good docs is the pragmatic choice." This shows judgment rather than dogma about REST purity.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h10">SECTION 8 - ASYNCHRONOUS &amp; LONG-RUNNING OPERATIONS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q21">
+Q21. How do you design an endpoint for an operation that cannot complete synchronously?
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+When an operation (report generation, video transcoding, a large bulk import) can take seconds to minutes, holding the client's connection open until it finishes is unreliable - proxies, load balancers and the client's own HTTP stack all have timeouts you don't control. The standard pattern: the initiating request returns immediately with <b>202 Accepted</b> and a <code>Location</code> header pointing at a status resource; the client polls that resource until it reports completion.
+</p>
+<pre>
+POST /api/v1/reports
+--&gt; 202 Accepted
+    Location: /api/v1/reports/jobs/abc123
+    Retry-After: 5
+
+GET /api/v1/reports/jobs/abc123
+--&gt; 200 OK
+    { "status": "RUNNING", "progress": 40 }
+
+GET /api/v1/reports/jobs/abc123
+--&gt; 200 OK
+    { "status": "DONE", "resultUrl": "/api/v1/reports/jobs/abc123/download" }
+</pre>
+<p>
+Use <code>Retry-After</code> on the 202 itself to tell the client how soon it's reasonable to poll again, so well-behaved clients don't hammer the status endpoint. Once the job is done, some designs 303-redirect the status GET to the actual result resource rather than embedding a <code>resultUrl</code> field - either is fine as long as it's documented consistently.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Returning 200 immediately with a fake "success" body while the real work happens asynchronously behind the scenes. 202 exists precisely to say "accepted, not yet done" - using 200 for this misleads every client and monitoring tool that reasonably assumes 200 means the operation actually completed.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q22">
+Q22. How do you model an async operation as a first-class "job" resource rather than a status blob?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+A stronger version of Q21's pattern treats the operation itself as a resource with its own lifecycle, not just an opaque status field bolted onto the original request. <code>GET /jobs/{id}</code> returns a status enum (<code>PENDING</code>/<code>RUNNING</code>/<code>SUCCEEDED</code>/<code>FAILED</code>/<code>CANCELLED</code>), timestamps, and links to the job's inputs and outputs; <code>POST /jobs/{id}/cancel</code> (or <code>DELETE /jobs/{id}</code>) supports cancellation; <code>GET /jobs?status=RUNNING&amp;createdBy=42</code> gives operational visibility into everything currently in flight, which an opaque per-request status field never can.
+</p>
+<p>
+This composability - a job can be queried, listed, filtered and cancelled like any other resource, with the same pagination (Q9) and filtering (Q10) conventions as everything else in the API - is what separates a well-designed async API from a one-off status blob wired to a single endpoint. On failure, store a structured <code>error</code> (shaped like Q11/Q19's problem+json) on the job resource itself, so the failure reason survives past the moment it happened and is visible to anyone querying the job later, not just whoever was polling at the time.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"I treat the job as a resource, not the original request as having a hidden second life." This reframing - job-as-resource - is exactly the kind of API-design maturity interviewers are listening for here.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q23">
+Q23. How do you design webhooks: delivery guarantees, signature verification and idempotent receivers?
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+A webhook inverts Q21's pattern: instead of the client polling, your server pushes an event to a URL the client registered, the moment something happens. Designing the <b>sender</b> side well means addressing four things:
+</p>
+<ul>
+<li><b>Delivery guarantee</b>: no distributed system can promise exactly-once delivery over an unreliable network. Document "at least once" honestly, and design receivers to cope (below) rather than pretending exactly-once is achievable.</li>
+<li><b>Retries</b>: on a non-2xx response or a timeout, retry with exponential backoff and jitter, up to a capped number of attempts; after exhausting retries, dead-letter the event and alert/disable the endpoint rather than retrying forever against a broken receiver.</li>
+<li><b>Signature verification (HMAC)</b>: sign the raw request body with a shared secret and send the signature as a header, so the receiver can verify the payload is authentic and untampered without needing mutual TLS.</li>
+<li><b>Event identity</b>: include a unique event id and timestamp in the payload so a receiver can detect and drop a duplicate or unreasonably stale delivery.</li>
+</ul>
+<pre>
+// Sender: sign the raw body
+String signature = "sha256=" + hmacSha256Hex(sharedSecret, rawRequestBody);
+// sent as header: X-Signature: sha256=...
+
+// Receiver: verify before trusting the payload
+boolean valid = MessageDigest.isEqual(
+    hmacSha256(sharedSecret, rawRequestBody).getBytes(),
+    receivedSignatureBytes);
+if (!valid) return ResponseEntity.status(401).build();
+</pre>
+<p>
+On the <b>receiver</b> side: verify the signature before doing anything else, respond 2xx quickly and process the actual work asynchronously off the request thread (a slow receiver just causes the sender to retry or time out, compounding load), and be idempotent - store processed event ids and skip a duplicate delivery of the same id. This mirrors the idempotency-key pattern from Q13, applied to inbound events instead of outbound client requests.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"Webhooks need the same idempotency discipline as payments - the receiver, not just the sender, has to assume duplicates will happen and dedupe on event id." Connecting this back to Q13's idempotency-key pattern signals you see the general principle, not just this one feature.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q24">
+Q24. When would you use Server-Sent Events (SSE) instead of polling or webhooks?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Polling (Q21) and webhooks (Q23) both deliver a final result or discrete events. When a client instead needs a continuous stream of incremental updates - a progress bar, a live log tail, chat messages, price ticks - three options exist: keep polling (simple but wasteful and laggy, since the update rate is bounded by the poll interval); <b>Server-Sent Events (SSE)</b>, a single long-lived HTTP response with <code>Content-Type: text/event-stream</code> that the server keeps writing <code>data: ...\n\n</code> frames to; or <b>WebSockets</b>, a full-duplex protocol upgrade.
+</p>
+<p>
+SSE is the natural fit when the data only flows server-to-client: it rides on plain HTTP/1.1 (no protocol upgrade, so it passes through standard proxies and load balancers more easily than WebSockets often do), the browser's <code>EventSource</code> API handles auto-reconnect for you, and Spring supports it directly via <code>SseEmitter</code> (MVC) or <code>Flux&lt;ServerSentEvent&lt;T&gt;&gt;</code> (WebFlux). Reach for WebSockets only when the client also needs to push data back over the same connection (a chat message going both directions, collaborative editing) - that bidirectionality is the one thing SSE cannot do.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Reaching for WebSockets by default for anything "real-time". If the data only flows one way (server to client), SSE is simpler to implement, simpler to operate, and fits far more naturally into an existing HTTP-based REST API than standing up a separate WebSocket protocol.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q25">
+Q25. How do you choose between synchronous, 202+poll, webhook and streaming patterns for a given operation?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+A decision framework, from simplest to most involved:
+</p>
+<ul>
+<li><b>Synchronous</b>: the operation reliably completes in well under a second (ordinary CRUD) - just return the result directly.</li>
+<li><b>202 + poll (Q21/Q22)</b>: the operation is long but client-initiated, and the client is willing to ask "done yet?" without running any infrastructure of its own - reports, imports, batch inference.</li>
+<li><b>Webhook (Q23)</b>: the event happens on the server's own schedule, not in response to a specific client request, and the consumer already runs a reachable HTTP endpoint - payment settled, order shipped, common in B2B integrations and platforms with a developer ecosystem.</li>
+<li><b>SSE/streaming (Q24)</b>: the client needs continuous incremental updates during the operation, not just a final result - a live progress bar or log tail.</li>
+</ul>
+<p>
+Mature platforms (Stripe, GitHub) commonly expose <i>both</i> polling and webhooks for the same class of event: the webhook is the low-latency push, and a periodic reconciliation poll/list call is the fallback for the (rare, but real) lost delivery. Recommending both, and telling clients to treat webhooks as best-effort with polling as a safety net, is the senior answer here.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"Webhooks are a latency optimization on top of an eventually-consistent poll/list endpoint, not a replacement for one." That framing shows you design for the failure mode (a lost webhook delivery), not just the happy path.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h11">SECTION 9 - BULK OPERATIONS, FILES &amp; COMPLEX QUERIES</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q26">
+Q26. What are the trade-offs of batch/bulk endpoints versus one request per resource?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+When a client needs to create or update many resources at once (importing 10,000 rows), one-request-per-resource is simple and stays purely within standard REST semantics, but pays N round trips of network, auth and validation overhead. A batch endpoint amortizes that cost:
+</p>
+<pre>
+POST /api/v1/orders/batch
+Content-Type: application/json
+
+{ "items": [ {"sku":"A1","qty":2}, {"sku":"B7","qty":1}, ... ] }
+</pre>
+<p>
+but complicates the contract: what single HTTP status represents "3 succeeded, 2 failed" (see Q27)? What caps the batch size so one request can't blow memory or time out (reject anything over, say, 100 items with 400)? Before building one, weigh whether the real bottleneck is round trips (favors a batch endpoint) or is already mitigated by HTTP/2 connection multiplexing letting many small parallel requests share one connection cheaply (an argument for not building bulk endpoints prematurely, since they add real design and operational surface).
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Building a bulk endpoint before confirming the bottleneck is actually round-trip count and not something else (like per-item processing time, which a batch endpoint doesn't fix at all). Measure first.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q27">
+Q27. How do you report partial success in a batch API - what is 207 Multi-Status?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+A batch call is neither cleanly a success nor a failure as a whole - some items succeed, some don't. <b>207 Multi-Status</b> (originally defined for WebDAV, now widely reused for REST batch APIs) is the correct top-level status: it signals "the batch was processed, see the body for per-item outcomes" rather than falsely implying total success (200/201) or total failure (4xx/5xx) when the reality is mixed.
+</p>
+<pre>
+HTTP/1.1 207 Multi-Status
+
+{
+  "results": [
+    { "id": 1, "status": 201, "location": "/orders/1" },
+    { "id": 2, "status": 422, "error": { "title": "Invalid amount" } }
+  ]
+}
+</pre>
+<p>
+Guarantee the <code>results</code> array's order matches the request array's order, so the client can zip results back to the original items positionally without needing a separate correlation id per item (though including one doesn't hurt for clarity).
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Explicitly naming 207 by number and RFC origin (WebDAV, RFC 4918) is a strong signal - most candidates either don't know a "partial success" status code exists at all, or invent a 200 with a mixed-results body, which loses the "something here failed" signal for any generic HTTP-status-aware tooling.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q28">
+Q28. Should a batch endpoint be transactional (all-or-nothing) or best-effort?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Two fundamentally different contracts, and the endpoint must commit to one and document it explicitly:
+</p>
+<ul>
+<li><b>Transactional</b>: the whole batch runs in one database transaction - either everything commits or everything rolls back, and the client gets a single top-level status with no partial results. Simpler for the client to reason about, but a single bad row fails the entire batch, and large transactions hold locks longer as batch size grows.</li>
+<li><b>Best-effort</b>: each item is processed independently; partial success is the normal case and is reported per-item via Q27's 207 shape.</li>
+</ul>
+<p>
+Silently mixing the two - or leaving it undocumented - is a real production hazard: a client that assumes atomicity (because most batch APIs feel like they should be atomic) may build duplicate-recovery logic on top of an endpoint that actually applied half the batch, and that recovery logic then double-applies the succeeded half on retry. State the contract in the docs and in the response shape itself, not just in a comment.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Assuming "batch" implies "atomic" without checking. Many production batch APIs (including cloud provider bulk APIs) are best-effort by default specifically because true atomicity across many independent writes doesn't scale.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q29">
+Q29. How do you design file uploads in a REST API?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Two common approaches, depending on file size:
+</p>
+<ul>
+<li><b>Direct multipart POST</b>: <code>multipart/form-data</code> straight to your API, simplest to implement, fine for small files (avatars, documents under a few MB), but ties the raw bytes to your application server's request handling and memory, which doesn't scale to large files or high upload volume.</li>
+<li><b>Pre-signed URL (two-step)</b>: the client POSTs metadata only, the server returns a pre-signed upload URL (S3/GCS-style) plus a resource id, the client PUTs the actual bytes directly to object storage, then confirms completion via a callback or a final POST. This takes your app server entirely out of the data path - it never touches the file bytes - which is the standard approach for anything beyond small files.</li>
+</ul>
+<pre>
+POST /api/v1/documents
+--&gt; 201 Created
+    { "id": "d1", "uploadUrl": "https://storage.../d1?signature=...", "expiresIn": 900 }
+
+PUT https://storage.../d1?signature=...   (client uploads bytes directly to storage)
+
+POST /api/v1/documents/d1/complete        (client confirms; server verifies + kicks off processing)
+</pre>
+<p>
+Validate <code>Content-Length</code>/<code>Content-Type</code> up front, and treat anything beyond "bytes received" (virus scanning, transcoding, indexing) as an async step using the Q21 202-pattern - "uploaded" is not the same event as "processed and usable".
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"Uploaded and processed are two different states, and the API should expose both explicitly rather than conflating them." This distinction, plus recognizing when to take the app server off the data path with pre-signed URLs, is the senior signal here.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q30">
+Q30. When do you use a POST-based search endpoint instead of GET with query parameters?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+GET with query parameters (Q10) is semantically correct for search, but hits practical limits once criteria get rich: URL length limits (roughly 2-8KB depending on client/proxy/server), awkward encoding of nested boolean logic or geospatial bounds, and no request body to carry a structured query. The pragmatic escape hatch is a POST-based search endpoint:
+</p>
+<pre>
+POST /api/v1/orders/search
+Content-Type: application/json
+
+{
+  "filters": { "status": ["PAID","SHIPPED"], "amount": {"gte": 100} },
+  "sort": [{"field":"createdAt","direction":"desc"}]
+}
+</pre>
+<p>
+Be explicit about the trade-off this makes: the request is not HTTP-cacheable (proxies don't cache POST bodies), and it isn't safe/idempotent by method semantics even though it conceptually only reads data - so authorize it against the same read-scope as the equivalent GET, not a write-scope, and document clearly that despite the verb, this is a query, not a mutation. This is a well-precedented pattern - Elasticsearch's own <code>_search</code> endpoint uses POST for exactly this reason - so it's a pragmatic response to the "search violates REST purity" critique, not a design smell.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Forgetting to document (and enforce, in authorization) that a POST search endpoint is read-only in effect. A code reviewer or security scanner that only looks at the HTTP verb will assume every POST is a write, unless you say otherwise.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h12">SECTION 10 - RATE LIMITING ALGORITHMS &amp; TRAFFIC MANAGEMENT</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q31">
+Q31. Compare token bucket, leaky bucket, fixed window and sliding window rate limiting algorithms.
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Q14 covered rate limiting's response contract (429, Retry-After); this is the algorithm choice behind it:
+</p>
+<table border="1">
+<tr><th>Algorithm</th><th>How it works</th><th>Burst handling</th><th>Notes</th></tr>
+<tr><td>Token bucket</td><td>Bucket holds up to N tokens, refilled at a fixed rate; each request consumes one</td><td>Allows bursts up to bucket capacity</td><td>Most common default; simple to reason about and implement (Redis Cell / a Lua script)</td></tr>
+<tr><td>Leaky bucket</td><td>Requests queue and are processed ("leak out") at a constant rate regardless of arrival pattern</td><td>Smooths bursts into a steady output rate</td><td>Adds queuing latency; drops/rejects when the queue is full</td></tr>
+<tr><td>Fixed window counter</td><td>Count requests in a hard clock-aligned window (e.g. per minute)</td><td>Boundary-burst problem: 2x the limit can slip through at a window edge</td><td>Cheapest to implement (Redis INCR + EXPIRE)</td></tr>
+<tr><td>Sliding window (log/counter)</td><td>Tracks timestamps (log) or interpolates between adjacent fixed windows (counter)</td><td>Smooths out the fixed-window boundary problem</td><td>More accurate, more memory/CPU per check (Redis sorted sets for the log variant)</td></tr>
+</table>
+<p>
+Token bucket is the pragmatic default for a public API because it explicitly allows short bursts (a client that's been idle can spend up to the bucket's full capacity in one burst) while still enforcing a long-run average - which matches how real client traffic actually behaves. Sliding window is worth the extra cost specifically when the fixed-window boundary exploit (batching requests at the edge of two adjacent windows to briefly double your effective rate) is a real concern, e.g. for a security-sensitive endpoint like login.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the fixed-window boundary problem specifically - "a client can send up to 2x the limit by timing requests at the tail of one window and head of the next" - is the detail that separates candidates who've only read the algorithm names from those who've actually reasoned about their failure modes.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q32">
+Q32. What rate-limit response headers does a well-designed API return, and why on every response?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Beyond the 429 itself (Q14), a well-designed API returns quota headers on <i>every</i> response, not only when a client gets rejected, so well-behaved clients can throttle themselves before ever hitting the wall:
+</p>
+<pre>
+HTTP/1.1 200 OK
+RateLimit-Limit: 100
+RateLimit-Remaining: 37
+RateLimit-Reset: 42
+</pre>
+<p>
+There are two overlapping conventions in the wild: the long-standing de facto <code>X-RateLimit-Limit</code>/<code>-Remaining</code>/<code>-Reset</code> (used by GitHub, Twitter and many others), and the newer IETF draft standard <code>RateLimit-Limit</code>/<code>-Remaining</code>/<code>-Reset</code> without the <code>X-</code> prefix. Neither has full industry consensus yet - pick one, document it clearly, and be consistent across every endpoint. Where API tiers exist (free/pro/enterprise), the limit a client sees in these headers should automatically reflect their actual tier's quota, so a client library can adapt its throttling without hard-coding tier-specific numbers.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Only sending rate-limit headers on the 429 response itself. By then the client has already been rejected - the headers are far more useful proactively, on successful responses, so a well-behaved client can back off before it ever gets throttled.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q33">
+Q33. How do you design multi-tier rate limits (per-key, per-IP, per-tenant) with graceful degradation?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Real systems layer several limiters, each protecting a different thing: a coarse per-IP or per-anonymous-key limit at the edge defends against abuse before auth even runs; a per-API-key/per-user limit enforces fair use of the shared service; and a per-tenant aggregate limit (see Q49) prevents one noisy tenant's many individually-under-quota users from collectively starving a shared downstream resource (a DB, a third-party API) that every tenant relies on.
+</p>
+<p>
+"Graceful degradation" means that as the system nears capacity, it should shed load selectively rather than fail uniformly: prefer rejecting or delaying lower-priority traffic (background sync, analytics polling) over user-facing requests, and prefer serving a slightly stale cached response over a hard failure where staleness is tolerable. This is the bulkhead idea from the Microservices/resilience chapters, applied at the API-contract layer rather than the infrastructure layer.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"Rate limiting isn't one number - it's a layered set of limits, each protecting a different failure mode, from edge abuse up to shared-resource contention." That framing shows you've thought about limits as a system property, not a single config value.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q34">
+Q34. What is the difference between 429 and 503 for signaling backpressure, and how should clients react to each?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Both tell a client to slow down, but they mean different things and should be handled differently:
+</p>
+<ul>
+<li><b>429 Too Many Requests</b>: <i>this specific client</i> used more than their quota allows. It is client-attributable, and the accompanying <code>Retry-After</code>/rate-limit-reset headers (Q32) are meaningful and specific to that client's own window.</li>
+<li><b>503 Service Unavailable</b>: the service overall is over capacity or shedding load - not this client's fault specifically. It may come from a load balancer's health check tripping, or the app deliberately returning it once a concurrency/queue-depth threshold is crossed (a bulkhead pattern). Any <code>Retry-After</code> here is a generic, system-level hint, not a personalized quota reset.</li>
+</ul>
+<p>
+Client-side implication: back off with exponential backoff and jitter for both, but honor the specific reset time given on a 429, while treating a 503's retry hint as more conservative and generic, since the server gave no client-specific information about when capacity will free up.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"429 says 'you personally used too much'; 503 says 'the service overall is over capacity, and it's not about you specifically.'" A crisp one-line distinction like this is exactly what interviewers are listening for on this question.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h13">SECTION 11 - VERSIONING EVOLUTION, DEPRECATION &amp; TRACEABILITY</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q35">
+Q35. How do you communicate API deprecation and sunset to consumers?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Signal deprecation in-band, in the HTTP response itself, not only in a changelog nobody reads:
+</p>
+<pre>
+HTTP/1.1 200 OK
+Deprecation: true
+Sunset: Sat, 31 Dec 2026 23:59:59 GMT
+Link: &lt;https://docs.acme.com/migrate-v2&gt;; rel="sunset"
+</pre>
+<p>
+<code>Deprecation</code> marks "this still works today, but is deprecated". <code>Sunset</code> (RFC 8594) gives the actual hard date after which it stops working. A <code>Link</code> header with <code>rel="sunset"</code> points at a migration guide so the signal is actionable, not just informational. Combine this with proactive, out-of-band communication - emailing API-key owners, a dashboard banner - and critically, log and alert on real server-side traffic still hitting the deprecated field/endpoint, so you know actual usage before you remove it. Never trust "surely nobody uses this anymore" without the telemetry to back it up; sunsetting a still-used endpoint without warning is one of the most consumer-hostile things an API team can do.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Naming the <code>Deprecation</code> and <code>Sunset</code> headers by name (and RFC 8594 for Sunset) shows you've actually operated a versioned public API through a deprecation cycle, not just read about versioning strategies (Q8) in the abstract.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q36">
+Q36. What is a checklist for backward-compatible schema evolution without a version bump?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Extending Q8's "the best version bump is the one you never make" - concrete rules that keep a v1 contract alive:
+</p>
+<ul>
+<li><b>Add</b> new fields and endpoints - never require them on existing clients.</li>
+<li><b>Never remove or rename</b> a field or endpoint in place; add the replacement, deprecate the old one (Q35), run both during the deprecation window.</li>
+<li><b>Never change a field's type or meaning</b> in place (e.g. <code>status</code> going from a string enum to an integer code) - that silently breaks every existing deserializer.</li>
+<li><b>Never make an optional field required.</b></li>
+<li><b>Widening an enum</b> is only safe if clients are contractually required to tolerate unknown values gracefully - state that expectation explicitly in the docs as part of the contract, don't assume it.</li>
+<li><b>Pagination/envelope shape changes count as breaking too</b> - treat the response envelope itself (Q46) as part of the versioned contract, not just individual field values.</li>
+</ul>
+<p>
+Anything outside this list is a breaking change and needs the version bump, deprecation window and migration communication from Q8/Q35 - not a silent in-place edit.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Treating "adding a required field" as a minor, safe change because it "just adds more data". From an existing client's point of view, a newly-required field it never sends is indistinguishable from a breaking validation change - it will start failing requests it used to make successfully.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q37">
+Q37. What is the role of correlation/request-id headers at the API boundary?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Every response - success or error - should carry a correlation id (<code>X-Request-Id</code>, or the W3C standard <code>traceparent</code> header used by distributed tracing systems) generated at the edge if the client didn't already supply one, echoed back to the client, and logged alongside the request server-side. On an error, it belongs in the RFC 7807 body as the <code>traceId</code> extension member from Q11/Q19.
+</p>
+<p>
+This is what turns "the API returned an error for me around 3pm" into an actual, findable log line, and lets a client attach the same id when filing a support ticket instead of the support engineer having to reconstruct which of thousands of requests around that time was theirs. This chapter's scope stops at the HTTP-contract surface - the header's name, its presence on every response, and its slot in the error body; how that id propagates across service hops as a distributed trace (spans, sampling, exporters) is the Microservices/observability chapters' job.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"A correlation id on every response is cheap to add and disproportionately valuable in production support - it's the single header I'd never ship an API without." A simple, confident line like this lands well because it's true and easy to defend.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q38">
+Q38. How do you manage multiple concurrent API versions in one codebase without it rotting?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Once v1 and v2 run side by side during a deprecation window (Q8/Q35), the risk is the two turning into a maintained parallel implementation that silently drifts. Guardrails:
+</p>
+<ul>
+<li>Route both versions to the <b>same internal domain/service layer</b>, and fork only at the thin controller/DTO-mapping layer - business logic should never be duplicated per version.</li>
+<li><b>Contract-test both versions independently</b> in CI against their own OpenAPI specs (Q40), so a change made to fix v2 can't silently break v1 underneath it.</li>
+<li><b>Track per-version traffic</b> (the same telemetry from Q35) so you know, with evidence, when v1 usage has dropped enough to actually retire it - not just when it feels like enough time has passed.</li>
+</ul>
+<p>
+The target state: supporting an old version should look like a thin adapter over shared internals, not a second implementation someone has to remember to keep in sync by hand.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Copy-pasting the v1 controller to create v2's, then fixing bugs in only one of them going forward. This is exactly how "supporting two versions" quietly turns into "maintaining two products".
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h14">PART 1 COMPLETE</h1>
+
+<p>
+Next Part:
+* OpenAPI/contract-first vs code-first development, SDK generation and consumer-driven contract testing
+* API Gateway / BFF pattern at the API-design level, and shaping contracts for different client types
+* Multi-tenancy considerations in API design
+* Contract-boundary security: CORS, mass assignment, soft delete semantics and defensive input limits
+
+These are some of the most frequently asked platform/API-governance topics in senior and staff-level interviews.
+</p>
+
+<hr>
+
+<h1 id="h15">SECTION 12 - OPENAPI, CONTRACT-FIRST DEVELOPMENT &amp; SDK GENERATION</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q39">
+Q39. What are the trade-offs between contract-first and code-first OpenAPI generation?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Q16 introduced springdoc-openapi generating docs <i>from</i> annotated code - that's the <b>code-first</b> approach: fast to start, and the spec tracks what the code actually accepts reasonably well (modulo incomplete/wrong annotations), but the contract itself is only discovered after the implementation exists, which makes it hard to review the API shape before writing code, and hard for a separate client/frontend team to start integration work early.
+</p>
+<p>
+<b>Contract-first</b> flips the order: the OpenAPI YAML is written by hand (or in a design tool) as the source of truth first, server-side interface stubs are generated from it (e.g. via <code>openapi-generator</code>) that the implementation must satisfy, and client SDKs are generated from that same file for every consumer. This forces an explicit design review of the shape before any code exists, lets client teams start against a mock server immediately, and guarantees the client and server are working from literally the same schema, not two hand-written approximations of it.
+</p>
+<p>
+Recommend contract-first for public/partner APIs and any cross-team internal API where the contract itself is the expensive-to-change asset; code-first for a small internal service owned start-to-finish by one team, where the extra process overhead of maintaining a separate spec file doesn't pay for itself.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"Contract-first isn't about purity - it's useful specifically when the contract crosses a team or organizational boundary, because that's where an out-of-sync assumption between client and server actually costs real time." Framing it as a boundary-driven choice, not a universal best practice, reads as senior.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q40">
+Q40. What is consumer-driven contract testing and how does it relate to OpenAPI?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Contract tests catch a gap unit tests miss entirely: does the real running server actually conform to what it publishes, and does a real client actually only rely on what's promised? Two complementary techniques:
+</p>
+<ul>
+<li><b>Provider-side schema validation</b>: fire real requests at the running service and validate each response against the OpenAPI schema (tools like Dredd, schemathesis, or REST-assured combined with a swagger/OpenAPI request-validator). This catches drift between the annotations/spec and actual runtime behavior that a code review would miss.</li>
+<li><b>Consumer-driven contracts</b> (Pact-style): the <i>consumer</i> team publishes the exact request/response interactions its code actually relies on; the <i>provider's</i> CI replays those interactions against its own code before every deploy, and fails the build if a provider-side change would break a real, currently-registered consumer.</li>
+</ul>
+<p>
+The consumer-driven approach is the more powerful of the two at scale: it catches a breaking change <i>before release</i> rather than after, and it scales to many consumer teams without the provider team having to manually track "who calls what" - the consumers themselves declare their reliance, and the tooling enforces it.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"Consumer-driven contracts shift the 'did I just break someone' question from a Slack message after the fact to a failing CI build before the deploy even ships." That's the concrete payoff worth stating out loud.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q41">
+Q41. How do you document async patterns like 202+poll and webhooks in OpenAPI?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Low-Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+OpenAPI models standard request/response CRUD cleanly, but async patterns (Section 8) need explicit conventions since the spec has no native "this response points at that other endpoint" construct: for the 202+poll pattern (Q21), document both the initiating operation's 202 response <i>and</i> the polling resource's GET as separate paths, and describe the relationship between them in prose/examples, since the <code>Location</code> header's target isn't something OpenAPI can express as a typed link on its own.
+</p>
+<p>
+For webhooks (Q23), OpenAPI 3.1 added first-class top-level <code>webhooks:</code> support - the payload shape your service will POST to a consumer's callback URL can now be described the same way as any normal path, letting consumers validate and generate types for <i>incoming</i> webhook payloads, not just outgoing API calls. Pre-3.1 tooling used the less standardized <code>callbacks</code> keyword nested under an operation for roughly the same purpose - worth knowing the history if you're working against an older OpenAPI 3.0 toolchain.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Leaving async/webhook behavior entirely out of the OpenAPI spec because "it doesn't fit the normal request/response shape". A partial spec that only covers the synchronous CRUD surface leaves exactly the trickiest part of the API (the async contract) undocumented and untestable by the tooling in Q40.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q42">
+Q42. How do you keep OpenAPI documentation from drifting out of sync with the running code?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Docs rot the moment they're maintained by hand, separately from the code path they describe. Three guardrails, in increasing order of rigor:
+</p>
+<ul>
+<li>Prefer code-first generation (Q39) for the base shape, or contract-first with generated server stubs, so a mismatch becomes a compile error rather than a stale doc nobody notices.</li>
+<li>Add the provider-side schema-validation contract test from Q40 to CI, so any response that violates the published schema fails the build - not just a manual QA pass that may or may not happen.</li>
+<li>Diff the generated OpenAPI spec between pull requests (<code>openapi-diff</code>-style tooling) and require explicit review/approval on any detected breaking change, turning "did we just silently break v1" from a code-review guess into an automated CI gate.</li>
+</ul>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+Mentioning spec-diffing in CI as a breaking-change gate is a detail most candidates miss entirely - it directly operationalizes the backward-compatibility checklist from Q36 instead of leaving it as a manual discipline someone has to remember to apply.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h16">SECTION 13 - API GATEWAY / BFF PATTERN &amp; CLIENT-SHAPED CONTRACTS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q43">
+Q43. What is the Backend-for-Frontend (BFF) pattern at the API-design level?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+This is a different concern from the infrastructure-level API Gateway covered in the Microservices chapter (routing, TLS termination, service mesh). Here, the question is purely about <i>contract shape</i>: different client families - a native mobile app, a web SPA, a partner integration - genuinely want different response shapes from the same underlying domain data. A BFF is a thin API layer, one per client family, that aggregates and reshapes calls to one or more backend services into exactly what that specific client needs: fewer round trips (mobile especially benefits, given higher-latency networks), fields trimmed to only what that UI actually renders, and protocol translation where useful (e.g. the mobile BFF speaks GraphQL to the app while calling REST/gRPC services internally).
+</p>
+<p>
+Contrast this with exposing one generic REST API to every client and letting each hand-roll its own aggregation and field-trimming client-side - simpler to operate (one contract to maintain) but pushes over-fetching, under-fetching and multi-call orchestration cost onto every consuming client. The trade-off worth naming explicitly: a BFF is an extra service to own, deploy and version per client family - justify it once client needs have genuinely diverged, not reflexively by default for every project.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"A BFF is a contract-shaping decision, not an infrastructure decision - it can sit entirely behind an existing API gateway, and the two solve different problems." Making that separation explicit avoids the common confusion between this pattern and ch.19's gateway.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q44">
+Q44. How do sparse fieldsets and field expansion (?fields=, ?expand=) work as a lighter-weight alternative to a BFF?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+When client divergence is only "which fields/relations does this client need", not a fully different shape, a lighter mechanism than a full BFF often suffices:
+</p>
+<ul>
+<li><b>Sparse fieldsets</b> (extends Q10): <code>GET /orders/42?fields=id,total,status</code> trims the response to reduce payload size for bandwidth-constrained clients.</li>
+<li><b>Field expansion</b> (the inverse problem - avoiding client-side N+1 calls): <code>GET /orders/42?expand=customer,items</code> embeds related resources inline instead of forcing the client to follow separate URIs per relation, which is similar in spirit to what GraphQL gives natively, bolted onto plain REST.</li>
+</ul>
+<p>
+Guardrails matter here as much as the feature itself: whitelist which fields/relations are selectable/expandable server-side (the same injection/performance concern as Q10's sort/filter allow-list), cap expansion depth so a client can't accidentally trigger serialization of a huge object graph, and treat <code>expand</code> as a real server-side performance concern - a naive implementation that lazy-loads each expanded relation independently just relocates the N+1 query problem from the client to the server instead of eliminating it.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Implementing <code>?expand=</code> by lazily fetching each relation one at a time per request. That "fixes" the client's N+1 problem by creating the exact same N+1 problem inside your own service against the database.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q45">
+Q45. How should API design differ for mobile, web and partner/public consumers?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+The same underlying domain operation can reasonably be exposed through different contracts for different consumer types:
+</p>
+<ul>
+<li><b>Mobile</b>: minimize round trips and payload size (metered, higher-latency networks, battery cost) - favor fewer, richer endpoints and app-specific shaping, which is exactly what a BFF (Q43) is built for.</li>
+<li><b>Web/SPA</b>: typically has better, cheaper connectivity, and benefits most from standard browser HTTP caching - favor staying closer to plain REST with ETags (Q15) over heavy custom aggregation.</li>
+<li><b>Partner/public API</b>: stability and long-term backward compatibility matter far more than payload optimization, since partners integrate once and rarely revisit the integration - favor a conservative, well-versioned (Q8/Q35), thoroughly documented (Q39) generic contract over anything client-specific, since a bespoke BFF per external partner doesn't scale.</li>
+</ul>
+<p>
+Recognizing that a deliberately different contract per consumer type is a design choice - not an inconsistency to be "fixed" into one universal shape - is the senior signal on this question.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"The same 'get order' operation can legitimately be three different API shapes for three different consumers - the domain logic underneath is shared, the contract on top isn't." A clean line like this closes the question well.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q46">
+Q46. Envelope vs bare array/object for collection responses - which do you use, and why does consistency matter more than the choice?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Two competing conventions for a collection endpoint's response body:
+</p>
+<ul>
+<li><b>Bare array</b>: <code>[ {...}, {...} ]</code> - minimal, but leaves no room for pagination metadata (total count, next cursor) without inventing out-of-band headers for it.</li>
+<li><b>Enveloped</b>: <code>{ "data": [...], "meta": {"total": 532, "nextCursor": "..."}, "_links": {...} }</code> - gives pagination (Q9) and hypermedia (Q20) metadata an obvious home, at the cost of clients needing to unwrap <code>data</code> everywhere, and some client codegen tooling deserializing it less cleanly into a plain list type.
+</li>
+</ul>
+<p>
+Recommend enveloped for any collection endpoint that paginates - which is most of them - since the metadata needs somewhere to live; a bare single-resource GET is fine either convention. The actual mistake is not which one you pick, it's mixing both conventions across different endpoints of the same API - a client library has to special-case "is this endpoint's list response wrapped or not" per endpoint, which is exactly the kind of inconsistency that erodes trust in an API's design.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Different teams within the same company shipping some endpoints with a bare array and others enveloped, with no shared convention. Consistency across the whole surface matters more than which specific convention wins.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h17">SECTION 14 - MULTI-TENANCY IN API DESIGN</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q47">
+Q47. What are the tenant identification strategies (path, header, subdomain) and their trade-offs?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<table border="1">
+<tr><th>Strategy</th><th>Example</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>Path segment</td><td><code>/api/v1/tenants/{tenantId}/orders</code></td><td>Explicit, cacheable per-tenant, visible in logs/URLs</td><td>Couples every route to carrying the id; awkward for any resource later shared cross-tenant</td></tr>
+<tr><td>Subdomain</td><td><code>acme.api.example.com/orders</code></td><td>Clean URLs, natural home for tenant-specific TLS/branding, very common in B2B SaaS</td><td>Requires wildcard DNS/certs and more routing infrastructure</td></tr>
+<tr><td>Header</td><td><code>X-Tenant-Id: acme</code></td><td>Keeps the URL tenant-agnostic</td><td>Invisible to anything that only looks at the URL - harder to eyeball in access logs, curl, browser address bar</td></tr>
+</table>
+<p>
+In practice, the most common and safest approach derives tenant identity from the <i>authenticated principal's claims</i> (a tenant claim inside the auth token - mentioned here only in passing, since the JWT/OAuth2 mechanics themselves are the Spring Security chapter's territory), rather than trusting a client-supplied header or path segment alone. Whatever a client supplies explicitly (path/header/subdomain) should still be validated against the token's claim as the source of truth - never trusted standalone - so a client cannot simply ask for a different tenant's data by changing a header value.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"The tenant id in the URL or header is a routing convenience for the client - the tenant id in the auth token's claims is the actual security boundary." Drawing that line clearly is what separates a correct answer from a subtly exploitable one.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q48">
+Q48. What are the data isolation implications of multi-tenancy for endpoint and schema design?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+The API-level tenant identification from Q47 only matters if it's backed by real isolation at the data layer - otherwise it's theater. Three common isolation models, and how each shows up in the design:
+</p>
+<ul>
+<li><b>Shared schema, tenant_id column</b>: cheapest to operate, but <i>every</i> query must filter by <code>tenant_id</code>, and a single missed <code>WHERE</code> clause is a cross-tenant data leak. Mitigate with a global query filter (a Hibernate <code>@Filter</code>, or a repository-level interceptor applied uniformly) rather than relying on every developer remembering it by convention on every query.</li>
+<li><b>Schema-per-tenant</b>: stronger isolation, but migrations must run per-schema and connection routing gets materially more complex.</li>
+<li><b>Database-per-tenant</b>: strongest isolation, and it conveniently simplifies "delete all of a tenant's data" for offboarding/compliance requests, at the highest operational overhead.</li>
+</ul>
+<p>
+Whichever model is chosen, the endpoint contract itself should look identical to the client - tenant scoping is a server-side implementation concern, not something that should leak into the API shape beyond the tenant-identification mechanism from Q47.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Relying on "every repository method remembers to filter by tenant_id" as the only isolation mechanism in a shared-schema design. One missed filter, in one query, in one code path, is a real cross-tenant data breach - enforce it structurally (a global filter/interceptor), not by convention.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q49">
+Q49. How do you design rate limiting and quotas per tenant versus per user?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Low-Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Extending Q33's multi-tier limits with the multi-tenant case specifically: apply the rate limiter's key at the <i>tenant</i> level, not just per API key or per individual user, for any limit meant to protect shared infrastructure. Otherwise a tenant with 500 users, each individually well under their own personal quota, can still collectively overwhelm a shared downstream resource (a database, a third-party API) that the whole platform depends on.
+</p>
+<p>
+Design tiered quotas that map to the tenant's commercial plan (free/pro/enterprise), and expose the tenant's current usage through a self-serve endpoint (<code>GET /tenants/{id}/usage</code>) so customers can see how close they are to their limit proactively - discovering a quota only via a wave of 429s in production is a materially worse experience for a paid API product than a visible usage dashboard.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"The rate limit key should match the unit that's actually sharing the constrained resource - if that unit is the tenant, not the individual user, the limiter has to key on tenant." That's the precise reasoning interviewers want here, not just "add a limit per tenant" as a rule of thumb.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q50">
+Q50. How do you design tenant-scoped versus global/admin endpoints in a multi-tenant API?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Low-Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Most endpoints are naturally tenant-scoped - everything under a single tenant's own data. But every multi-tenant API also needs a small set of endpoints that deliberately cross tenant boundaries: platform admin operations (list all tenants, support-tooling impersonation, cross-tenant billing/analytics). Keep these under a clearly separate namespace (<code>/api/v1/admin/...</code>, or an entirely separate internal-only API surface) with its own, stricter authorization (mentioned only in passing here - the authz mechanics are ch.12's territory), and ideally its own rate limits and audit logging, since accidentally exposing a "list everything across tenants" endpoint under the same contract surface as ordinary tenant-scoped routes is a real, recurring source of production data breaches.
+</p>
+<p>
+The API-design takeaway: tenant scoping should be the <i>default</i>, requiring a deliberate, distinctly-named escape hatch to cross it - never the reverse, where crossing tenant boundaries is the default and scoping is something a developer has to remember to add.
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Building the "admin, cross-tenant" version of an endpoint by adding an optional query parameter to the normal tenant-scoped endpoint (e.g. <code>?allTenants=true</code>) instead of a distinctly namespaced, separately authorized route. That pattern has caused real breaches when the parameter's authorization check was missed or bypassed.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h18">SECTION 15 - CONTRACT-BOUNDARY SECURITY &amp; DATA SHAPE</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q51">
+Q51. How does CORS work at the API-design level, and what does it actually protect against?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+CORS (Cross-Origin Resource Sharing) is a <i>browser-enforced</i> policy, not a server-side access control on its own - a non-browser client (curl, a mobile app, a server-to-server call) ignores it entirely. It's still part of your API's contract with browser-based clients and needs deliberate design. For a "non-simple" request (a custom header, a method other than GET/POST/HEAD, a JSON content type), the browser first sends a preflight <code>OPTIONS</code> asking which origins/methods/headers are allowed; the server answers with <code>Access-Control-Allow-Origin</code>, <code>-Methods</code>, <code>-Headers</code>, and, if cookies/credentials are involved, <code>Access-Control-Allow-Credentials: true</code> - which specifically forbids pairing with a wildcard <code>*</code> origin, so a credentialed response must echo back one specific allowed origin.
+</p>
+<pre>
+Access-Control-Allow-Origin: https://app.acme.com
+Access-Control-Allow-Methods: GET, POST, PATCH, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Allow-Credentials: true
+Access-Control-Max-Age: 3600
+</pre>
+<p>
+Design guidance: maintain an explicit allow-list of origins - never <code>*</code> for any endpoint that reads authenticated or sensitive data - and cache the preflight response via <code>Access-Control-Max-Age</code> to avoid paying the extra round trip on every request. Remember what CORS actually protects against: a malicious <i>page</i> in the victim's own browser trying to call your API using the victim's cookies/session. It is not what stops a malicious <i>server</i> from calling your API directly - that's real authentication/authorization (see the Spring Security chapter), which CORS does not replace.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"CORS is a browser-side safety mechanism protecting the user, not a server-side authorization mechanism protecting the API." Stating this distinction clearly heads off the most common misconception interviewers probe for on this topic.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q52">
+Q52. What is mass assignment, and how do you prevent it at the API boundary?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Mass assignment is binding a client's raw request body directly onto a domain/entity object that has more settable fields than the client should ever be allowed to control - for example, a <code>PATCH /users/42</code> body that includes <code>{"role": "ADMIN"}</code> getting bound straight onto the JPA <code>User</code> entity, simply because the entity happens to have a <code>role</code> setter, even though no legitimate UI ever exposed that field to the caller.
+</p>
+<pre>
+// Vulnerable: entity deserialized directly from the request body
+@PatchMapping("/users/{id}")
+public User update(@PathVariable Long id, @RequestBody User body) {
+    return userRepository.save(body); // "role" rides along if present in the JSON
+}
+
+// Fixed: a dedicated DTO that only exposes what a client may set
+public record UpdateUserRequest(String name, String email) {}
+
+@PatchMapping("/users/{id}")
+public UserDto update(@PathVariable Long id, @Valid @RequestBody UpdateUserRequest req) {
+    return userService.updateProfile(id, req); // role is structurally not settable here
+}
+</pre>
+<p>
+The fix: never deserialize a request body directly into a persistence entity; always bind into a purpose-built request DTO that declares only the fields a client is actually permitted to set for that specific operation, and map DTO to entity explicitly. Any entity field absent from the DTO cannot be set from the wire - structurally, not by convention or code-review vigilance. This composes naturally with the request-validation pattern from Q12, since the DTO is already exactly where <code>@Valid</code> annotations live.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"The DTO boundary isn't just about validation - it's the single structural control that prevents mass assignment, because a field that doesn't exist on the DTO literally cannot be bound from client input." Tying request DTOs to security, not just to clean code, is the senior framing here.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q53">
+Q53. Soft delete vs hard delete - what does DELETE actually do to the row, and what should GET return afterward?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+<code>DELETE /orders/42</code> returning 204 (Q3/Q4) doesn't dictate what actually happens to the underlying row - two implementations, with different contract implications:
+</p>
+<ul>
+<li><b>Hard delete</b>: the row is physically removed. A subsequent GET correctly returns 404 - the resource is genuinely gone, and the contract is simple with no recovery path.</li>
+<li><b>Soft delete</b>: a <code>deletedAt</code>/<code>status=DELETED</code> flag is set and the row is retained, supporting recovery, audit trails and retention/compliance requirements. This complicates the read contract: should a GET after a soft-delete still return 404 (arguably correct from the client's perspective - "this resource no longer exists to you"), or <b>410 Gone</b> - a status specifically meaning "this used to exist here and is now permanently gone", distinct from 404's "never existed or not found"?</li>
+</ul>
+<p>
+Whichever convention is chosen, apply it consistently across the API, and remember that every collection/list/filter endpoint (Q9/Q10) must explicitly exclude soft-deleted rows by default - a frequently missed spot that leaks "deleted" data back into list views, mirroring exactly the tenant-filter discipline from Q48 (a query that forgets one WHERE clause).
+</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>
+Implementing soft delete at the persistence layer but forgetting to add the exclusion filter to every list/search endpoint, so "deleted" records reappear the moment someone lists or filters instead of fetching by id directly.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q54">
+Q54. What defensive limits (input size, timeouts, abuse prevention) belong at the API-contract level?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Beyond field-level validation (Q12), a hardened contract also bounds how much resource any single request can consume, independent of who's making it:
+</p>
+<ul>
+<li><b>Request body size</b>: reject oversized payloads early, before they reach business logic (e.g. Spring's multipart/servlet container size limits), with <b>413 Payload Too Large</b>.</li>
+<li><b>Batch/page size caps</b>: cap array/batch sizes (Q26) and enforce a hard server-side maximum page size (Q9) regardless of what a client requests in <code>?limit=</code>, rejecting an unreasonable value with 400 rather than letting a single query starve the database.</li>
+<li><b>Request timeouts</b>: bound how long a slow client or a slow downstream dependency can hold a connection/thread, tying into the rate-limiting/backpressure discussion in Q33-34.</li>
+<li><b>Nested payload depth</b>: reject deeply nested JSON with a max-depth check - a cheap but real denial-of-service vector via parser stack depth that field-level validation alone won't catch.</li>
+</ul>
+<p>
+None of this replaces authentication or authorization; it's the contract-level discipline that keeps any single request - authenticated or not - from being disproportionately expensive to serve.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"These limits protect the service from cost, not from unauthorized access - they're a different axis from authn/authz entirely, and both need to be designed deliberately." Making that distinction explicit shows you're not conflating two separate concerns under one "security" umbrella.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h19">PART 2 COMPLETE</h1>
+
+<p>
+Next Part:
+* A deeper REST vs GraphQL vs gRPC decision framework, beyond the brief comparison in Section 6
+* Aggregating and federating multiple backend services behind one client-facing contract
+* When and how to expose multiple API styles from the same backend without duplicating business logic
+
+These are some of the most frequently asked architecture-judgment topics in senior and staff-level interviews.
+</p>
+
+<hr>
+
+<h1 id="h20">SECTION 16 - REST vs GraphQL vs gRPC: A DECISION FRAMEWORK</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q55">
+Q55. Beyond the basic comparison table, how do you actually decide between REST, GraphQL and gRPC for a given client?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+Q16 gave the comparison table; this is the decision process behind it, asked in order:
+</p>
+<ol>
+<li><b>Who is the primary consumer?</b> The public internet/third parties (favors REST, for ubiquity, caching and tooling every client already has); your own diverse frontend clients with varied, evolving data-shape needs (favors GraphQL, or a BFF over REST per Q43); or your own services talking to each other at high volume and low latency (favors gRPC).</li>
+<li><b>Does HTTP-layer caching matter for this traffic?</b> REST's GET-based caching (CDN, browser, reverse proxy - Q15) is a real, hard-to-replicate advantage that GraphQL (mostly POST) and gRPC (binary, not HTTP-cacheable) both give up.</li>
+<li><b>How strong a schema-evolution story do you need?</b> gRPC's Protobuf IDL and GraphQL's schema both give strong compile-time contracts and codegen out of the box; REST's is only as strong as your own OpenAPI discipline (Q39-42).</li>
+</ol>
+<p>
+On migration: teams rarely do a flag-day rewrite from one style to another. In practice, a GraphQL or gRPC layer gets added <i>alongside</i> an existing REST API for the specific consumer that benefits (a new mobile client, a new internal service), rather than migrating the whole surface - because existing REST consumers (public partners, legacy integrations) have no reason to move and every reason to be left alone, which is exactly the backward-compatibility discipline from Q8/Q35 applied at the protocol-choice level rather than the field level.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"I don't migrate a whole API from REST to GraphQL - I add GraphQL for the specific consumer whose needs justify it, and leave the REST surface alone for everyone else." This answer shows you think about protocol choice per-consumer, not as an all-or-nothing platform decision.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q56">
+Q56. How do you aggregate or federate multiple backend services behind one client-facing contract?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+As a system decomposes into more services, a single logical client request - "render an order detail page" - may need data owned by several different services (orders, inventory, customer). Client-facing options, roughly in order of increasing power and complexity:
+</p>
+<ul>
+<li>Expose the services as-is and let the client make multiple calls - simplest to build, but pushes aggregation and partial-failure handling onto every client.</li>
+<li>Build a BFF/aggregation layer (Q43) that fans out server-side and returns one composed response - centralizes the fan-out and partial-failure logic once, at the cost of an extra hop and an extra service to maintain.</li>
+<li>Adopt GraphQL federation (Apollo Federation / GraphQL Mesh-style) where each service publishes its own subgraph and a gateway stitches them into one unified schema, letting the client query across service boundaries in a single round trip with no team hand-writing the aggregation logic.</li>
+</ul>
+<p>
+Federation is powerful but adds real operational complexity of its own - schema composition, cross-service query planning, and versioning a schema that now spans team boundaries. The pragmatic guidance: reach for a hand-written BFF first, and only invest in federation tooling once you have enough services and teams that the coordination cost of hand-written aggregation genuinely outweighs the federation tooling's own overhead.
+</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>
+"Federation solves a coordination problem, not a technical one - it's worth it exactly when enough independent teams need to compose data without a single team owning all the aggregation code." That framing shows you evaluate it as an organizational trade-off, not just a technology choice.
+</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q57">
+Q57. When is it reasonable to expose REST, GraphQL and gRPC from the same backend at once, and how do you avoid duplicated business logic?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>
+It's common and reasonable for one backend domain to be reachable through more than one contract simultaneously, each serving a different consumer per Q45/Q55: gRPC between the service and its internal siblings for low-latency calls, REST at the public edge for partners/webhooks/third-party integrators who expect ubiquitous HTTP+JSON tooling, and GraphQL for the company's own web/mobile frontends that need flexible, aggregated queries.
+</p>
+<p>
+The risk to actively manage: business logic must live in exactly <i>one</i> shared internal layer (domain/application services), with each protocol's API surface acting as a thin adapter that only translates its wire format to and from that shared layer. The mistake to avoid is implementing the same business rule three times - once per protocol adapter - which drifts subtly out of sync the moment one gets updated and the others don't (a discount rule fixed in the REST controller but never ported to the gRPC service, for instance).
+</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>
+"The protocol is a client-facing concern; the domain logic underneath should not know, or care, which contract style is being spoken above it." That closing line ties Section 15 back to the whole chapter's central theme - the HTTP/REST contract is a boundary decision, not where the business logic itself should live.
+</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h21">QUICK REVISION SHEET</h1>
 
 <hr>
 
@@ -794,6 +2231,16 @@ Rule of thumb: <b>REST</b> for public-facing CRUD APIs where HTTP caching and ub
 <li><b>Content negotiation</b>: Accept / Content-Type; 406 if unsupported; basis of media-type versioning.</li>
 <li><b>Docs</b>: OpenAPI/Swagger via springdoc-openapi - auto-generated, interactive, drives SDK codegen.</li>
 <li><b>REST vs GraphQL vs gRPC</b>: REST for public CRUD + caching; GraphQL for flexible client queries; gRPC for fast internal service-to-service. Often combined per boundary.</li>
+<li><b>Conditional writes</b>: If-Match/If-Unmodified-Since -&gt; 412 on stale version (optimistic concurrency); If-None-Match: * -&gt; create-if-absent.</li>
+<li><b>PATCH bodies</b>: JSON Merge Patch (RFC 7396, simple, absolute values, idempotent) vs JSON Patch (RFC 6902, ops array, precise, not always idempotent).</li>
+<li><b>Async patterns</b>: 202 + Location + poll for long-running ops; model as a job resource; webhooks (HMAC-signed, at-least-once, idempotent receiver) for server-initiated events; SSE for one-way streaming.</li>
+<li><b>Bulk/batch</b>: cap batch size; 207 Multi-Status for partial success; state explicitly whether transactional or best-effort.</li>
+<li><b>Rate limit algorithms</b>: token bucket (bursty, common default), leaky bucket (smooths), fixed window (boundary-burst flaw), sliding window (accurate, costlier). 429 = client quota; 503 = system overload.</li>
+<li><b>Deprecation</b>: Deprecation + Sunset (RFC 8594) + Link headers; monitor real usage before removing anything. Never remove/rename/retype a field in place - add and deprecate instead.</li>
+<li><b>OpenAPI</b>: code-first (fast, drifts less from code) vs contract-first (design-reviewed, drives SDKs/mock servers); back it with provider schema validation and/or consumer-driven (Pact) contract tests in CI.</li>
+<li><b>BFF / client-shaped contracts</b>: one thin aggregation layer per client family (mobile/web/partner), distinct from ch.19's infrastructure gateway; sparse fieldsets/?expand= as a lighter alternative.</li>
+<li><b>Multi-tenancy</b>: identify tenant via path/header/subdomain but trust the auth token's claim; enforce isolation structurally (global query filter), not by convention; separate, stricter-scoped admin/cross-tenant endpoints.</li>
+<li><b>Contract-boundary security</b>: CORS protects the browser/user, not the API itself; prevent mass assignment via dedicated request DTOs, never bind entities directly; soft vs hard delete changes what GET returns afterward (404 vs 410).</li>
 </ul>
 </div>
 </div>

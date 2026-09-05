@@ -102,6 +102,18 @@ This chapter focuses on the mental model and the judgement calls, with the comma
 <li>Walk me through a pull request and code review workflow.</li>
 <li>How do you undo common mistakes and recover with reflog?</li>
 <li>Explain git stash, cherry-pick, .gitignore, hooks, and handling secrets / large binaries.</li>
+<li>Explain Git's object model (blobs, trees, commits, tags) and why it's a content-addressable store.</li>
+<li>What are packfiles, and how does git gc keep large repositories fast?</li>
+<li>How do you use git bisect to find the exact commit that introduced a regression?</li>
+<li>What is git worktree, and how does it let you work on multiple branches at once?</li>
+<li>Why and how do you sign commits, and what does branch-protection "require signed commits" mean?</li>
+<li>How do client-side vs server-side Git hooks differ, and how are they used for linting / secret scanning?</li>
+<li>What problem does Git LFS solve, and how does it differ from committing large binaries directly?</li>
+<li>Monorepo vs polyrepo, and what are shallow clone, sparse checkout, and partial clone?</li>
+<li>What do branch protection rules, CODEOWNERS, and merge queues enforce at the platform level?</li>
+<li>How does automated changelog / semantic-version generation work from Conventional Commits?</li>
+<li>How do you recover from a bad force-push using git fsck --lost-found and dangling commits?</li>
+<li>Why doesn't deleting a secret in a new commit remove it from history, and how do you scrub it with git filter-repo / BFG?</li>
 </ol>
 
 <hr>
@@ -620,7 +632,1136 @@ target/
 
 <hr>
 
-<h1 id="h8">QUICK REVISION SHEET</h1>
+<h1 id="h8">SECTION 6 - GIT OBJECT MODEL &amp; INTERNALS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q16">
+Q16. Explain Git's object model: blobs, trees, commits, and tags.
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Everything in Git's history is one of four object types, all stored under <code>.git/objects</code> and addressed by the SHA hash of their own content. A <strong>blob</strong> stores raw file content (no filename, no metadata). A <strong>tree</strong> stores a directory listing: a mapping of names to blob or tree SHAs plus file modes. A <strong>commit</strong> points at one tree (the snapshot) and one or more parent commits, plus author/committer/message metadata. An <strong>annotated tag</strong> is its own object pointing at a commit, carrying a message and optional GPG/SSH signature.</p>
+<p>Notice what is missing: there is no "rename" object and no "diff" object. A file's name lives only in the tree that references its blob, which is why renaming a file whose content is unchanged creates zero new blob objects — the tree simply points the new name at the same existing blob SHA.</p>
+</div>
+<pre>
+git cat-file -t HEAD^{tree}      # tree
+git ls-tree HEAD                # name -&gt; mode, type, SHA
+100644 blob 8ab68f2   README.md
+040000 tree 3fa91cd   src
+
+git cat-file -p HEAD             # commit object
+tree 3fa91cd...
+parent 9b1e02f...
+author Nasir &lt;n@x.io&gt; 1718...
+committer ...
+
+Add retry to payment client
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Say it plainly: "a commit is a pointer to a tree plus a pointer to its parent(s)." That one sentence explains why history is a DAG, why two commits with identical trees but different parents are different objects, and why Git can deduplicate identical file content across the entire repository automatically.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q17">
+Q17. Why is Git called a content-addressable store, and how does that differ from a "diff-based" VCS?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>In a content-addressable store, an object's identity <em>is</em> the hash of its own content — store the same bytes twice and you get the same SHA, so it is only ever stored once. Older, diff-based systems (CVS, older SVN) instead store each revision as a delta against the previous one and must replay a chain of diffs to reconstruct any given version.</p>
+<p>The practical consequences run deep: Git can jump straight to any historical snapshot without walking a chain (fast checkout of old commits), identical content anywhere in history is automatically deduplicated, and a corrupted object is immediately detectable because its hash no longer matches its content. Git does still apply delta compression — but only later, for storage efficiency in packfiles, never as the mechanism for reconstructing a snapshot.</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Saying Git "stores diffs like SVN, just distributed." It doesn't — it stores full-content objects keyed by hash and computes diffs on the fly for display. Confusing the storage model with the (later, optional) packing optimization is a common junior-level slip.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q18">
+Q18. What are packfiles, and how does git gc keep large repositories fast?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Every new commit initially creates <strong>loose objects</strong> — one zlib-compressed file per object under <code>.git/objects/xx/</code>. That is simple but wasteful at scale: lots of small files, no cross-object compression. <code>git gc</code> (triggered automatically by <code>git gc --auto</code> once loose-object counts cross a threshold, or run manually) collects loose objects into a single <strong>packfile</strong> plus an index (<code>.pack</code> / <code>.idx</code>), using delta compression between similar objects — e.g. successive versions of the same file are stored as a small delta against a chosen base rather than full copies.</p>
+</div>
+<pre>
+git count-objects -v          # loose objects, size, packs
+git gc                        # repack loose objects, prune unreachable
+git gc --aggressive           # deeper repack, much slower, rarely needed
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Mention that this is also how the network protocol works: a <code>git push</code>/<code>git fetch</code> negotiates and transfers a packfile, not individual objects, which is why a repo with poor delta locality (e.g. lots of large, frequently-changed binaries) is slow to clone even before you touch local storage.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q19">
+Q19. Loose objects vs packed objects — what's the difference and when does packing happen?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A loose object is one file, individually zlib-compressed, with no relationship to any other object on disk. A packed object lives inside a packfile alongside many others, frequently stored as a delta against a similar "base" object chosen by Git's packing heuristics, which is why packed storage is dramatically smaller for repositories with many similar revisions of the same files.</p>
+</div>
+<table border="1">
+<tr><th>Aspect</th><th>Loose objects</th><th>Packed objects</th></tr>
+<tr><td>Storage</td><td>One file per object</td><td>Many objects in one file + index</td></tr>
+<tr><td>Compression</td><td>Per-object zlib only</td><td>Zlib + inter-object delta</td></tr>
+<tr><td>Created by</td><td>Every new commit/add</td><td>git gc / git repack / push-fetch negotiation</td></tr>
+<tr><td>Typical size</td><td>Larger in aggregate</td><td>Much smaller in aggregate</td></tr>
+</table>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>Note that unreachable loose objects — the leftovers of a <code>reset --hard</code>, an amended commit, or an abandoned rebase — are exactly what makes reflog-based recovery possible. <code>git gc</code> respects <code>gc.pruneExpire</code> (default two weeks) before actually deleting them, which is the safety window behind "Git almost never loses committed work immediately."</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q20">
+Q20. How does Git detect file renames if it doesn't store them explicitly?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Git never records a "rename" operation anywhere — a tree simply has a different name-to-blob mapping between two commits. Tools like <code>git diff</code>, <code>git log --follow</code>, and the merge machinery detect renames <em>after the fact</em> by similarity heuristics: they look for a path deleted in one tree and a path added in the other whose blob content is similar enough (by default at least 50% similar, tunable with <code>-M&lt;percent&gt;</code>) and present it as a rename.</p>
+</div>
+<pre>
+git diff -M                     # detect renames explicitly in a diff
+git log --follow -- OldName.java  # follow a single file across renames
+</pre>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Assuming <code>git log --follow</code> works for a directory or multiple files — it only follows a single file path. Also, because rename detection is a similarity heuristic, heavily editing a file in the same commit as renaming it can push similarity below the threshold, and Git will present it as a plain delete + add instead of a rename.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q21">
+Q21. What's stored in .git besides objects, and how do refs, HEAD, and the index fit together?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>.git/objects</code> is the content store described above. <code>.git/refs/heads/*</code> and <code>.git/refs/tags/*</code> are named pointers — plain text files (or entries in <code>packed-refs</code> once there are many) each holding a single commit SHA. <strong>HEAD</strong> is a symbolic reference: normally a pointer to the current branch ref (e.g. <code>ref: refs/heads/main</code>), which in turn points at a commit — two hops to get "the current commit." The <strong>index</strong> (<code>.git/index</code>) is a separate binary file representing the staging area: a flat list of paths, blob SHAs, and file-stat cache entries used to make <code>git status</code> and <code>git diff</code> fast without rehashing every file.</p>
+</div>
+<pre>
+cat .git/HEAD                          # ref: refs/heads/main
+cat .git/refs/heads/main               # a1b2c3d4...
+
+git checkout a1b2c3d       # HEAD now points directly at a commit
+cat .git/HEAD               # a1b2c3d4...   &lt;- "detached HEAD"
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Use this to explain <strong>detached HEAD</strong> precisely: it is simply the state where HEAD holds a commit SHA directly instead of a symbolic ref to a branch. Any new commit made there has no branch pointer following it, so it becomes unreachable and eligible for GC unless you create a branch to hold onto it — exactly the scenario the reflog recovery workflow (Q14) is designed to rescue.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h9">SECTION 7 - HISTORY FORENSICS &amp; DEBUGGING TOOLS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q22">
+Q22. How do you use git bisect to find the exact commit that introduced a regression?
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git bisect</code> performs a binary search over a commit range between a known-good and a known-bad commit. You mark each end, Git checks out the midpoint, you test it and report <code>good</code> or <code>bad</code>, and Git halves the remaining range each time — finding the culprit in roughly log2(n) steps instead of a linear crawl through history.</p>
+</div>
+<pre>
+git bisect start
+git bisect bad                 # current commit is broken
+git bisect good v2.3.0         # this old tag was fine
+
+# Git checks out a midpoint commit each time:
+git bisect good     # or
+git bisect bad
+# ... repeat until Git reports the first bad commit ...
+
+git bisect reset               # return to original branch when done
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>The senior move is <code>git bisect run &lt;script&gt;</code>, automating the entire search with a script that exits 0 for good and non-zero for bad — turning a debugging session that could take a day of confused stepping through code into a few minutes of unattended CI-style execution.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q23">
+Q23. What is git blame, and what are its limits for tracking down why a line of code exists?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git blame &lt;file&gt;</code> annotates every line with the commit, author, and date that last touched it — the standard way to answer "why is this weird timeout value 4500ms?" before you go bother a teammate. But blame only shows the <em>last</em> change to a line, not necessarily the original author or the real reason it exists; a wholesale reformat or a bulk rename can bury the meaningful history under a single "reformat code" commit.</p>
+</div>
+<pre>
+git blame -w UserService.java         # ignore whitespace-only changes
+git blame -C -C UserService.java      # detect moves/copies across files
+git blame --ignore-revs-file .git-blame-ignore-revs UserService.java
+</pre>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>Mention the <code>.git-blame-ignore-revs</code> convention (supported natively by GitHub/GitLab's blame view): list large reformat/auto-fix commit SHAs in that file so blame skips straight past them to the last <em>meaningful</em> change — a small habit that keeps blame useful forever after a big lint/format pass.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q24">
+Q24. What do git log -p, --follow, and -S (the pickaxe) do?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>These are the log-forensics tools for "when and why did this text appear or disappear." <code>-p</code> shows the actual patch alongside each commit, not just the message. <code>--follow</code> continues a single file's history across renames (only works for one path at a time). <code>-S"&lt;string&gt;"</code> — the "pickaxe" — finds commits where the <em>number of occurrences</em> of a string changed, which is how you find exactly when a function, constant, or bug was introduced or removed, regardless of what the commit message says.</p>
+</div>
+<pre>
+git log -p -- PaymentClient.java             # full diffs for one file
+git log --follow -- PaymentClient.java       # history across renames
+git log -S"retryTimeoutMs" --oneline         # when did this string's count change
+git log -G"retry.*[Tt]imeout" --oneline      # regex match against diff content
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Distinguish <code>-S</code> from <code>-G</code> precisely: <code>-S</code> triggers only when the total occurrence count of the string changes (add one, remove one elsewhere in the same commit — count unchanged — and <code>-S</code> stays silent), while <code>-G</code> matches any commit whose diff contains a line matching the regex, regardless of count. Knowing which one to reach for is a real signal of hands-on log forensics experience.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q25">
+Q25. What is git worktree, and how does it let you work on multiple branches simultaneously?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Increasingly Common
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git worktree</code> checks out another branch into a separate working directory that shares the same underlying <code>.git</code> object store and refs — no second clone, no stashing your in-progress feature work just to jump onto an urgent hotfix. Each worktree has its own working directory and index, but a fetch or a new commit in one is immediately visible from the others because they share history.</p>
+</div>
+<pre>
+git worktree add ../hotfix-payments hotfix/payments
+cd ../hotfix-payments
+# ... fix, commit, push, PR, all independent of the main working dir ...
+
+git worktree list
+git worktree remove ../hotfix-payments
+</pre>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Trying to check the same branch out in two worktrees at once — Git refuses, since a branch pointer can only be "checked out" in one place at a time. Also remember to <code>git worktree remove</code> (not just <code>rm -rf</code> the directory) so Git's internal bookkeeping in <code>.git/worktrees/</code> stays clean.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q26">
+Q26. What is git rerere, and when is it worth enabling?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git rerere</code> ("reuse recorded resolution") records how you manually resolved a merge conflict, and if the identical conflict shows up again — extremely common when repeatedly rebasing a long-lived branch onto a fast-moving main, or maintaining a fork with recurring upstream merges — Git reapplies the same resolution automatically instead of making you retype it.</p>
+</div>
+<pre>
+git config --global rerere.enabled true
+# resolve a conflict once as normal; next time the same hunk conflicts,
+# rerere stages the previously recorded resolution automatically
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>The strongest example: rebasing a big long-lived feature branch onto main day after day produces the <em>same</em> conflicting hunk in an unrelated file every single time. Without rerere you resolve it manually on every rebase; with it enabled once, every subsequent rebase resolves that hunk silently.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q27">
+Q27. How do you automate a regression hunt with git bisect run?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git bisect run &lt;script&gt;</code> hands the entire search loop to a script: exit code <code>0</code> means good, any code from 1-127 (except 125) means bad, and <code>125</code> means "skip this commit" — used when a given commit simply can't be tested (e.g. the build itself is broken there for an unrelated reason), so bisect steps around it instead of drawing a wrong conclusion.</p>
+</div>
+<pre>
+git bisect start HEAD v2.3.0
+git bisect run ./run-regression-test.sh
+# Git walks the whole range unattended and reports the first bad commit
+</pre>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>A regression-hunt script is only as good as its test's determinism — a flaky test will make bisect converge on the wrong commit. Mentioning that you'd first confirm the test script reliably reproduces the bug before trusting an automated bisect run is a mark of real debugging discipline.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h10">SECTION 8 - SECURITY: COMMIT SIGNING &amp; GIT HOOKS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q28">
+Q28. Why and how do you sign commits, and what does a "Verified" badge mean on GitHub/GitLab?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Anyone can set <code>git config user.email "anyone@anywhere.com"</code> — the author/committer fields are just claims, not proof of identity. Signing a commit (with GPG, or the simpler modern SSH-key based signing) attaches a cryptographic signature over the commit's content, proving it was created by whoever holds a specific private key. The platform verifies that signature against a public key registered to the account and shows a "Verified" badge — a much stronger identity guarantee than the plain author field.</p>
+</div>
+<pre>
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519.pub
+git config --global commit.gpgsign true
+
+git log --show-signature -1        # inspect a signature
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Note that some orgs go further and enforce <strong>"Require signed commits"</strong> as a branch protection rule on protected branches — a server-side gate that rejects any push containing an unsigned commit, closing the identity-spoofing gap entirely rather than just displaying a badge.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q29">
+Q29. Client-side vs server-side Git hooks — what's the difference?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><strong>Client-side hooks</strong> (<code>pre-commit</code>, <code>commit-msg</code>, <code>pre-push</code>, <code>post-checkout</code>, and more) live under <code>.git/hooks/</code> on each developer's own machine. Crucially, <code>.git</code> is <em>not</em> versioned content — hooks are not transferred by clone or push, so they cannot be centrally enforced without extra tooling (a setup script, or a framework like pre-commit). <strong>Server-side hooks</strong> (<code>pre-receive</code>, <code>update</code>, <code>post-receive</code>) run on the Git server itself when a push arrives, and — unlike client-side hooks — can actually reject the push. This is the real mechanism behind platform features like branch protection and required signed commits.</p>
+</div>
+<table border="1">
+<tr><th>Aspect</th><th>Client-side</th><th>Server-side</th></tr>
+<tr><td>Runs where</td><td>Developer's machine</td><td>Git server / platform</td></tr>
+<tr><td>Distributed by clone?</td><td>No</td><td>N/A (server config)</td></tr>
+<tr><td>Can be bypassed by dev?</td><td>Yes (--no-verify)</td><td>No</td></tr>
+<tr><td>Used for</td><td>Fast local feedback</td><td>Real enforcement</td></tr>
+</table>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Treating a client-side <code>pre-commit</code> hook as a compliance control. It is a convenience for developers who have it installed; it enforces nothing for anyone who hasn't run the setup step or who passes <code>--no-verify</code>. Real enforcement always needs a server-side or CI-equivalent required check.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q30">
+Q30. How do teams use pre-commit for linting and secret scanning?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>The <code>pre-commit</code> framework (or a hand-rolled <code>.git/hooks/pre-commit</code> script) runs fast checks — a formatter, a linter, a focused subset of unit tests, and, critically, a secret scanner (gitleaks, truffleHog, detect-secrets) — before a commit is even created. Catching an accidentally-pasted AWS key at commit time is dramatically cheaper than catching it after it has been pushed and is already permanently in history (see Q55/Q56).</p>
+</div>
+<pre>
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Always pair this with the honest caveat from Q29: hooks are per-developer opt-in and bypassable with <code>--no-verify</code>. Mature teams run the exact same secret-scan as a required CI check on every PR, so the local hook is a fast first line of defense and the CI check is the actual backstop.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q31">
+Q31. Can Git hooks be bypassed, and how do teams enforce checks centrally despite that?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Yes — <code>git commit --no-verify</code> and <code>git push --no-verify</code> skip client-side hooks outright, and since hooks live only in the local, unversioned <code>.git/hooks/</code> directory, there is no way to force every clone to have them installed. The reliable enforcement points are always server-side: a <code>pre-receive</code> hook on a self-hosted Git server, or — far more common today — required CI status checks combined with branch protection rules on GitHub/GitLab, which re-run the same linting and secret-scanning as an un-bypassable gate before a merge is even allowed.</p>
+</div>
+<div class="followup">
+<h3>Interview Favorite</h3>
+<p>The line that lands: "local hooks are a courtesy to the developer; the required CI check on the PR is the actual control." Interviewers ask this specifically to see whether you understand that developer tooling and enforcement are two different layers.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q32">
+Q32. What is a commit-msg hook used for, e.g. enforcing Conventional Commits?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>The <code>commit-msg</code> hook receives the path to the drafted commit message file and can validate it — for example, rejecting the commit unless the subject line matches a pattern like <code>^(feat|fix|chore|docs|refactor|test)(\(.+\))?: .+</code> — or rewrite it, such as appending a ticket ID parsed from the branch name. It is the standard local mechanism for enforcing a Conventional Commits format before the commit is even created.</p>
+</div>
+<pre>
+#!/bin/sh
+# .git/hooks/commit-msg
+pattern='^(feat|fix|chore|docs|refactor|test|perf|build|ci)(\(.+\))?!?: .+'
+if ! grep -qE "$pattern" "$1"; then
+  echo "Commit message must follow Conventional Commits format." &gt;&2
+  exit 1
+fi
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Since this hook is bypassable like any other (Q31), many teams instead (or additionally) validate the PR title and/or the final squashed commit in CI, since that is the message that actually lands on main and feeds the changelog tooling in Section 12.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h11">SECTION 9 - .GITATTRIBUTES, LINE ENDINGS &amp; GIT LFS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q33">
+Q33. What does .gitattributes control, and how does core.autocrlf handle line endings?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>.gitattributes</code> is a versioned, path-based configuration file — checked into the repo itself, unlike <code>.git/config</code> — that tells Git how to treat specific paths: text normalization, marking files binary, custom diff/merge drivers, export rules, and LFS tracking. The classic pain point it solves is line endings: Windows uses CRLF, Unix/macOS use LF, and without normalization every file looks changed to whichever teammate is on the other OS, generating noisy whole-file diffs.</p>
+</div>
+<pre>
+# .gitattributes — normalize everything to LF in the repo,
+# regardless of what any individual developer's OS checks out
+* text=auto
+*.bat text eol=crlf
+</pre>
+<table border="1">
+<tr><th>core.autocrlf value</th><th>On checkout</th><th>On commit</th><th>Typical use</th></tr>
+<tr><td>true</td><td>LF &rarr; CRLF</td><td>CRLF &rarr; LF</td><td>Windows developers</td></tr>
+<tr><td>input</td><td>No conversion</td><td>CRLF &rarr; LF</td><td>Mac/Linux developers</td></tr>
+<tr><td>false</td><td>No conversion</td><td>No conversion</td><td>Repo-level `* text=auto` instead</td></tr>
+</table>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Prefer <code>.gitattributes</code>'s <code>* text=auto</code> over relying on every developer setting <code>core.autocrlf</code> correctly — the attributes file travels with the repo and applies uniformly, while a local config setting is one more thing a new teammate can forget to configure.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q34">
+Q34. How do you mark files as binary or plug in a custom diff driver via .gitattributes?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Low-Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>*.png binary</code> is shorthand for <code>-diff -merge -text</code>: it tells Git not to attempt a line-based diff or three-way merge (meaningless, and potentially corrupting, for binary content) and not to apply CRLF normalization. For formats where a meaningful diff <em>is</em> possible — Jupyter notebooks, Word documents, compiled Java classes — you can register a custom diff driver that runs the file through a text-conversion command first.</p>
+</div>
+<pre>
+# .gitattributes
+*.png binary
+*.ipynb diff=jupyternb
+
+# .git/config or ~/.gitconfig
+[diff "jupyternb"]
+    textconv = jupyter nbconvert --to script --stdout
+</pre>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Forgetting to mark genuinely binary formats (fonts, compiled artifacts, images) as <code>binary</code> — without it, Git may attempt textual diff/merge heuristics on them, producing meaningless diff output or, worse, a corrupted merge result.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q35">
+Q35. What problem does Git LFS solve, and how does it differ from committing binaries directly?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Committing a large binary directly means every clone, fetch, and checkout carries every historical version of that file <em>forever</em> — Git's delta compression works well on text but poorly on most binary formats, so the repository balloons and never shrinks even after the file is later deleted (it is still reachable from history). <strong>Git LFS</strong> solves this by replacing the binary's content in Git with a tiny text "pointer" file (an object ID and size); the actual bytes live in a separate LFS store and are fetched on demand via smudge/clean filters as you check files out.</p>
+</div>
+<pre>
+git lfs install
+git lfs track "*.psd"
+cat .gitattributes
+# *.psd filter=lfs diff=lfs merge=lfs -text
+
+git add design.psd .gitattributes
+git commit -m "Add design mockup via LFS"
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Frame the trade-off honestly: LFS keeps the core Git repo small and fast, but it requires an LFS-compatible remote, adds a dependency (a plain <code>git clone</code> without LFS installed only gets pointer files, not usable binaries), and is one more piece of infrastructure to operate. It is worth it once binaries are large and change often; it's overkill for a handful of static images.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q36">
+Q36. How do you migrate an existing repo to Git LFS after large files are already in history?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Adding an LFS <code>track</code> rule only affects files added <em>going forward</em> — it does nothing for binaries already committed as regular blobs in history, so the repository stays bloated. <code>git lfs migrate</code> rewrites history (the same fundamental operation as <code>git filter-repo</code>) to replace matching blobs with LFS pointers across every commit and branch, which changes every downstream commit hash.</p>
+</div>
+<pre>
+git lfs migrate import --include="*.psd,*.zip" --everything
+git push --force --all
+git push --force --tags
+</pre>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Running an LFS history migration without warning the team. Every commit hash changes, exactly like the secrets-scrubbing rewrite in Section 14 — it requires a coordinated force-push and every collaborator either hard-resetting to the new history or re-cloning.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h12">SECTION 10 - SCALING GIT: MONOREPOS, SPARSE &amp; PARTIAL CLONE</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q37">
+Q37. Monorepo vs polyrepo — what are the trade-offs?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A <strong>monorepo</strong> keeps most or all of an organization's projects in one repository: cross-project refactors are a single atomic commit, tooling and CI conventions are shared, and code sharing needs no package-publishing step. The cost is that the repo's size, clone time, and CI load grow without bound unless you invest in scaling techniques (sparse/partial clone, a build system like Bazel that avoids rebuilding everything). A <strong>polyrepo</strong> keeps each project independent: small, fast, independently access-controlled repos — at the cost of coordinating a change across many repos and versioning dependencies between them explicitly.</p>
+</div>
+<table border="1">
+<tr><th>Aspect</th><th>Monorepo</th><th>Polyrepo</th></tr>
+<tr><td>Cross-project changes</td><td>One atomic commit</td><td>Coordinated PRs across repos</td></tr>
+<tr><td>Clone size / CI load</td><td>Grows with the whole org</td><td>Stays small per repo</td></tr>
+<tr><td>Tooling investment</td><td>High (build system, partial clone)</td><td>Lower per-repo, higher for cross-repo tooling</td></tr>
+<tr><td>Access control</td><td>Coarser (path-based)</td><td>Naturally per-repo</td></tr>
+</table>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>The senior answer is not "monorepos are better" or "polyrepos are better" — it's an infrastructure investment decision. Monorepos pay off when cross-project changes are frequent enough to justify the tooling cost; polyrepos are the pragmatic default until that tooling investment is worth making.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q38">
+Q38. What is a shallow clone (--depth), and what are its limitations?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git clone --depth 1</code> fetches only the most recent commit(s), skipping the rest of history entirely — dramatically faster and smaller, which is exactly what most CI jobs need since they only build the current tip. The limitation is that <code>git log</code>, <code>git blame</code>, and <code>git bisect</code> are crippled or impossible beyond the shallow boundary, and computing a merge-base against a far-back commit can fail if that commit was never fetched. Extending later requires <code>git fetch --unshallow</code> or <code>--deepen=&lt;n&gt;</code>.</p>
+</div>
+<pre>
+git clone --depth 1 https://example.com/repo.git
+git fetch --unshallow          # convert to a full clone later if needed
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>This is a brief, Git-mechanics note deliberately — the full design of checkout strategies per pipeline stage (Jenkins/GitHub Actions/GitLab CI specifics) belongs to the dedicated CI/CD pipelines chapter, not here.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q39">
+Q39. What is sparse-checkout, and when do you use it?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p><code>git sparse-checkout</code> populates only a chosen subset of the working directory tree from a repository, even though the full commit history and object set may still be present. In a monorepo where a given team only ever touches <code>services/payments/</code>, there is no reason to materialize the other thousands of unrelated files on disk. Modern "cone mode" restricts by whole directory prefixes and is fast even in huge trees.</p>
+</div>
+<pre>
+git sparse-checkout init --cone
+git sparse-checkout set services/payments shared/lib
+</pre>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Assuming sparse-checkout alone shrinks a clone — it only controls what's materialized in the <em>working directory</em>. The objects/history are still fetched in full unless paired with a partial clone (Q40).</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q40">
+Q40. What is a partial clone (--filter=blob:none), and how does it differ from a shallow clone?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A shallow clone truncates history <em>depth</em> — fewer commits, but full file content for whatever it does fetch. A <strong>partial clone</strong> (<code>git clone --filter=blob:none origin</code>) does the opposite trade: it fetches the <em>full commit graph</em> — so log, blame, bisect, and merge-base all work normally across all of history — but omits file content (blobs), fetching them lazily on demand from the "promisor remote" only as you check out or diff a given path.</p>
+</div>
+<table border="1">
+<tr><th>Aspect</th><th>Shallow clone</th><th>Partial clone</th><th>Sparse checkout</th></tr>
+<tr><td>Commit history</td><td>Truncated</td><td>Full</td><td>Full (unaffected)</td></tr>
+<tr><td>File content (blobs)</td><td>Full, for fetched range</td><td>Lazy, on demand</td><td>Full (unaffected)</td></tr>
+<tr><td>Working directory</td><td>Full tree</td><td>Full tree</td><td>Chosen subset only</td></tr>
+</table>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>This is the technique behind large-repo hosting at scale: full history navigation without paying for every historical blob upfront. Combined with sparse-checkout, an engineer's local clone can have complete metadata history but only the file content for the paths they actually work in.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q41">
+Q41. How do very large engineering orgs keep Git usable at monorepo scale?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Senior Favorite
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Organizations running single monorepos with millions of files and commits (as at Google or Microsoft) combine several techniques: partial clone plus sparse checkout so a given engineer's clone carries full history metadata but only the blobs/paths they touch; a virtual filesystem layer (Microsoft's VFS for Git / Scalar) that lazily materializes files on first access rather than at checkout time; and server-side optimizations — commit-graph files and a multi-pack-index that make history traversal and object lookup fast even at that scale.</p>
+</div>
+<pre>
+git maintenance start           # schedules background gc/repack/commit-graph jobs
+</pre>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Mention <code>git maintenance</code> as the modern, background-scheduled replacement for manually cron'ing <code>git gc</code> — it runs incremental repacking, commit-graph updates, and loose-object cleanup automatically, which is exactly the kind of infrastructure investment that makes monorepo scale viable at all.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q42">
+Q42. What's a practical checklist for choosing monorepo vs polyrepo for a growing org?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Rather than a stance, treat it as a checklist. How often do changes genuinely span multiple projects or services? Does the org already have (or is it willing to build) monorepo-capable tooling — Bazel, Nx, Turborepo — to avoid rebuilding everything on every change? How much CI contention will many teams sharing one repo's protected branches create? Do teams need independently enforced access control or visibility per project? Is there appetite to adopt partial clone and sparse checkout as the repo grows past a comfortable clone size?</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Treating this as a purity contest ("monorepos are the modern way" or "polyrepos are simpler, always"). The senior answer connects the choice to concrete signals — cross-project change frequency, tooling maturity, and team size — rather than a general philosophy.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h13">PART 1 COMPLETE</h1>
+<p>
+Next Part:
+* Branch protection &amp; platform-level review workflows
+* Conventional Commits &amp; automated changelog/version generation
+* Recovering from a bad force-push, dangling commits, and git fsck
+* Scrubbing a leaked secret or large file out of history for good
+* Git's narrow role inside a CI/CD pipeline
+
+These are the "incident response" and "platform governance" topics that separate engineers who have merely used Git from engineers who have been on call when Git went wrong.
+</p>
+<hr>
+
+<h1 id="h14">SECTION 11 - BRANCH PROTECTION &amp; PLATFORM-LEVEL WORKFLOWS</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q43">
+Q43. What are branch protection rules, and what do they typically enforce?
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Branch protection locks down a branch — usually <code>main</code> or a release branch — with rules enforced server-side by the platform, entirely independent of any developer's local Git config or good intentions. Typical rules: require a pull request before merging (no direct pushes), require a minimum number of approvals, require specific status checks to pass, require the branch to be up to date with its base before merging, require signed commits, restrict who can push or force-push, and disallow deleting the branch.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>The framing that lands: client-side hooks and team conventions are <em>advisory</em>; branch protection is <em>enforced</em>. Any workflow discipline you actually need guaranteed (not just hoped for) belongs in branch protection or a required CI check, never in a local hook alone.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q44">
+Q44. What is a CODEOWNERS file, and how does it interact with required reviews?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A <code>CODEOWNERS</code> file maps file paths or patterns to individuals or teams, e.g. <code>/payments/ @payments-team</code>. Combined with a branch-protection rule requiring review from Code Owners, a PR touching a given path cannot merge until someone from the mapped team has approved — automating "the right domain expert must sign off" instead of relying on someone remembering to manually tag them.</p>
+</div>
+<pre>
+# CODEOWNERS
+/payments/          @payments-team
+/infra/terraform/   @platform-team
+*.sql                @data-team
+</pre>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q45">
+Q45. What are required status checks and merge queues, and why do teams add a merge queue?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Required status checks block merging until named CI jobs report success against the PR's latest commit. The subtlety is that this alone doesn't guarantee the <em>merged result</em> stays green: two PRs can each individually pass against the current main yet conflict semantically once both have landed back-to-back. A <strong>merge queue</strong> closes that gap by serializing merges, re-testing each PR against the very latest main immediately before (and if the queue changes, again during) the merge, so main never goes red from a race between two approved-but-untested-together PRs.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Use the phrase "tested together, not just tested separately" — it is exactly the gap a merge queue closes and is a strong signal you understand why "all checks passed" on two individual PRs is not the same guarantee as the combined result passing.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q46">
+Q46. Merge commit vs squash-merge vs rebase-merge on the PR "merge" button — what's the trade-off?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A <strong>merge commit</strong> preserves every individual commit plus the real branch topology — complete, but noisy. <strong>Squash-merge</strong> collapses the entire PR into a single commit on main — clean mainline, but the intermediate commit-by-commit history (and the granularity that would help <code>git bisect</code> later) is lost. <strong>Rebase-merge</strong> replays the PR's individual commits directly onto main with no merge commit at all — linear <em>and</em> detailed, but only works well if the author already curated each commit to be independently sensible and buildable.</p>
+</div>
+<table border="1">
+<tr><th>Strategy</th><th>Mainline history</th><th>Best when</th></tr>
+<tr><td>Merge commit</td><td>Non-linear, complete</td><td>You want the exact real topology preserved</td></tr>
+<tr><td>Squash-merge</td><td>Linear, one commit per PR</td><td>PR commits are "wip"/noise, not individually meaningful</td></tr>
+<tr><td>Rebase-merge</td><td>Linear, full detail</td><td>Author already curated a clean commit series</td></tr>
+</table>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Picking squash-merge as a blanket team default without ever using interactive rebase (Q10) locally to curate a genuinely meaningful commit series — squash-merge quietly hides that habit was never built, since it papers over messy history rather than teaching people to avoid it.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q47">
+Q47. How does branch protection interact with a rebase + force-push PR workflow?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Branch protection commonly disallows force-pushing to the protected branch itself, but does not (and should not) block force-pushing to your own feature branch — which is exactly what <code>git push --force-with-lease</code> after a local rebase requires (Q13). Some platforms add "require linear history" alongside "require branches to be up to date before merging," which effectively forces every contributor to rebase (not merge) onto the latest main before the merge button is enabled — keeping mainline strictly linear even though the org still uses PR-based review.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h15">SECTION 12 - CONVENTIONAL COMMITS &amp; AUTOMATED RELEASES</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q48">
+Q48. What is the Conventional Commits format, in depth?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>The structure is <code>&lt;type&gt;[optional scope]: &lt;description&gt;</code>, optionally followed by a body and footer(s). Types include <code>feat</code>, <code>fix</code>, <code>docs</code>, <code>style</code>, <code>refactor</code>, <code>perf</code>, <code>test</code>, <code>build</code>, <code>ci</code>, <code>chore</code>, and <code>revert</code>. A breaking change is marked either with a <code>!</code> right after the type/scope (<code>feat!:</code>) or with a <code>BREAKING CHANGE:</code> footer. This structured, machine-parseable format is what lets tooling classify every commit automatically instead of a human writing a changelog by hand after the fact.</p>
+</div>
+<pre>
+feat(auth): add OAuth login via Google
+
+Adds a new /oauth/google endpoint and wires it into the
+existing login flow.
+
+BREAKING CHANGE: LoginResponse no longer includes `legacyToken`.
+</pre>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q49">
+Q49. How does automated changelog generation from commit history work?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Tools like conventional-changelog, release-please, or semantic-release parse the commits (or, more robustly, the squashed PR titles, if those are the ones enforced to the format) between the last release tag and HEAD, group them by type — Features, Bug Fixes, Breaking Changes — and generate or prepend a <code>CHANGELOG.md</code> section automatically as part of the release CI job. This removes both the manual toil of writing release notes and the human error of forgetting to mention a change.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q50">
+Q50. How do CI pipelines automate semantic-version bumps from commit messages?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A release tool inspects every commit since the last tag: any <code>feat</code> bumps MINOR, any <code>fix</code> bumps PATCH, and any breaking-change marker bumps MAJOR (the highest-precedence bump wins if a batch contains a mix). The tool then computes the new version, creates the annotated tag, generates the changelog, and often publishes the artifact — all triggered automatically by a merge to main, with no manual "what version should this be" judgement call, as long as commit discipline (Q48) was followed upstream.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Tie this back explicitly to Q11's SemVer answer: this is the payoff for disciplined commit messages — they are not vanity, they are the input data that makes automated, trustworthy version bumps possible at all.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h16">SECTION 13 - ADVANCED RECOVERY: DANGLING COMMITS &amp; FSCK</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q51">
+Q51. How do you recover from a bad force-push that overwrote a colleague's commits on a shared branch?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>The fastest fix is checking whether anyone still has the old commit's SHA locally — anyone who fetched before the bad push retains it in their own branch or reflog, and a corrective force-push of <code>git reset --hard &lt;old-sha&gt;</code> restores the remote. If nobody has a local copy, most Git hosts retain unreferenced commits for a retention window and support can sometimes recover them. As a last resort, <code>git fsck --lost-found</code> on any clone that had fetched the old tip before it was overwritten can locate the dangling commit locally, even without it being referenced by any branch.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>This is exactly why <code>git push --force-with-lease</code> (Q13) matters so much in practice — it refuses to overwrite if the remote moved since your last fetch, which is precisely the scenario that causes this incident in the first place.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q52">
+Q52. What is git fsck --lost-found, and what are "dangling" commits/blobs?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A commit becomes <strong>dangling</strong> when nothing references it anymore — no branch, no tag, and no (unexpired) reflog entry points to it — but the object is still physically present in <code>.git/objects</code> because <code>git gc</code> hasn't pruned it yet. <code>git fsck --unreachable</code> (and <code>--lost-found</code>, which additionally dumps candidates into <code>.git/lost-found/commit/</code> and <code>.git/lost-found/other/</code>) walks every object and lists ones unreachable from any ref, so you can inspect them with <code>git show &lt;sha&gt;</code> and recover anything relevant with <code>git branch rescued &lt;sha&gt;</code>.</p>
+</div>
+<pre>
+git fsck --full --unreachable
+git fsck --lost-found
+ls .git/lost-found/commit/
+git show &lt;dangling-sha&gt;
+git branch rescued &lt;dangling-sha&gt;
+</pre>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q53">
+Q53. When doesn't even reflog help — what happens once entries expire and gc prunes?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Reflog entries expire — by default after 90 days for entries still reachable via some ref, and after only 30 days for entries that are already unreachable (<code>gc.reflogExpireUnreachable</code>). Once an entry expires, a subsequent <code>git gc</code> is free to actually delete the now-truly-unreferenced object, and at that point the commit is gone for good — verifiably, since <code>git fsck</code> will find nothing.</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Treating "Git never loses committed work" as an absolute guarantee. The honest answer is: not for a generous default window (weeks), but eventually yes, if truly nothing references the commit. It isn't magic — it's an object store with conservative default deletion, not a store that never deletes at all.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q54">
+Q54. What's a practical incident playbook for "I think I just lost work"?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Stop first — running anything further destructive (another <code>reset --hard</code>, <code>git clean -f</code>, or a fresh re-clone over the same directory) can make things worse before you've even looked. Then work outward from the cheapest recovery: <code>git reflog</code> on the branch in question and on any related worktree or clone; if it's a deleted branch, check <code>git reflog show &lt;sha&gt;</code> against any SHA fragment still visible in a terminal scrollback or IDE history; broaden to <code>git fsck --lost-found</code> if reflog shows nothing; check whether a teammate or a CI runner still has a stale clone or fetch holding the old tip; and, as an absolute last resort for a pushed-then-overwritten commit, ask the Git host's support about ref retention.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>Always name the one case none of this recovers: working-directory changes that were never committed at all. That's the honest limit of Git's safety net, and pointing it out unprompted is exactly the kind of precision senior interviewers are listening for.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h17">SECTION 14 - SCRUBBING SECRETS &amp; LARGE FILES FROM HISTORY</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q55">
+Q55. Why doesn't deleting a secret in a new commit remove it from history?
+</div>
+<p class="roi">
+ROI: ★★★★★
+Frequency: Very High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A new commit that deletes the offending line only changes the <em>latest</em> tree — every earlier commit's tree still points at the old blob containing the secret, and that blob remains a perfectly reachable object as long as any ancestor commit's tree references it, which every one of them does. Anyone with a clone (and every clone carries the entire history) can run <code>git log -p</code> or <code>git show &lt;old-sha&gt;:path</code> and read the secret straight out of an old commit — no undelete required, no special tooling needed.</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Believing <code>git rm --cached</code> or a follow-up commit "removes" a leaked secret. The single correct first action is always to treat the credential as compromised and rotate it immediately — history-scrubbing (Q56) is clean-up, never the fix itself.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q56">
+Q56. How do git filter-repo and BFG Repo-Cleaner rewrite history to remove a secret or large file?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Both tools rewrite every commit that touches the target path or content, producing new trees — and therefore new commit hashes — for that commit and every descendant. It's fundamentally the same mechanism as a rebase, just applied across the entire history instead of a recent range. <code>git filter-repo</code> is the modern, officially recommended tool (the older <code>git filter-branch</code> is deprecated, slow, and easy to misuse); it can strip a path entirely or replace matching strings/blobs. <strong>BFG Repo-Cleaner</strong> is a simpler, much faster, purpose-built tool for the common cases — delete files by name or size, replace text matching a patterns file — without filter-repo's more general scripting surface.</p>
+</div>
+<pre>
+# git filter-repo: strip a path from all of history
+git filter-repo --path secrets.env --invert-paths
+
+# BFG: replace any text matching entries in a patterns file
+bfg --replace-text passwords.txt
+</pre>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q57">
+Q57. What's the full checklist after rewriting history to scrub a secret?
+</div>
+<p class="roi">
+ROI: ★★★★☆
+Frequency: Medium-High
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>Rewriting local history changes nothing until it reaches the remote and every collaborator. Rotate the leaked credential first, always — the rewrite is cleanup, not the fix. Then force-push every rewritten branch and tag (a plain, coordinated <code>--force</code>, not <code>--force-with-lease</code>, since every hash has changed on purpose). Tell every collaborator to stop pushing and either hard-reset their local branches to the new history or, if unsure, delete their clone and re-clone fresh. Expire the old objects server-side too — via the platform's support (GitHub) or <code>git gc --prune=now</code> on a self-hosted server — since a stale server-side cache or an existing fork can still carry the old blob. Finally, check CI caches, build artifacts, and any downloaded release tarballs that might have baked in the old history.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>The step people forget: forks and long-lived local clones that never re-synced still hold the secret in full. A history rewrite scrubs your canonical remote; it does not reach outward and scrub every copy that already exists in the world — which is exactly why credential rotation, not history rewriting, is the real fix.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h18">SECTION 15 - GIT IN CI/CD PIPELINES</h1>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q58">
+Q58. Why do CI pipelines almost always use a shallow clone, and what trade-off does that bring?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>CI jobs typically only need to build and test the current commit, so <code>--depth 1</code> (or a platform default like GitHub Actions' <code>actions/checkout</code> with <code>fetch-depth: 1</code>) drastically cuts checkout time on every single run, which adds up fast across hundreds of daily builds. The trade-off: any step that genuinely needs history — a diff against the merge-base, <code>git describe</code>, changelog generation, or a <code>git bisect</code> job — needs a deeper or full fetch (<code>fetch-depth: 0</code>), so a pipeline that needs those steps explicitly opts out of the shallow default for that job.</p>
+</div>
+<div class="followup">
+<h3>Interview Gold Point</h3>
+<p>This chapter covers the Git mechanics of the checkout, not pipeline design — full stage/runner/deployment-gate mechanics for Jenkins, GitHub Actions, and GitLab CI belong to the dedicated CI/CD pipelines chapter.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q59">
+Q59. What's the difference in checkout strategy between a PR build and a main-branch build?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>A PR build typically checks out the <em>merge preview</em> of the PR branch into the target branch (e.g. GitHub's <code>refs/pull/N/merge</code>) so CI tests what will actually land once merged, not just the feature branch in isolation — catching integration issues a standalone-branch build would miss. A main-branch build simply checks out the tip of main after a merge has already happened, and is often followed by tagging and deployment steps a PR build never runs at all.</p>
+</div>
+<div class="followup">
+<h3>Common Mistake</h3>
+<p>Getting this distinction wrong is a common, concrete cause of "it passed in the PR but broke main" — usually because a job was configured to check out the PR's source branch alone instead of its merge result.</p>
+</div>
+</div>
+
+<hr>
+
+<div class="section">
+<div class="question" id="q60">
+Q60. Where does Git's role end and CI/CD pipeline design begin?
+</div>
+<p class="roi">
+ROI: ★★★☆☆
+Frequency: Low-Medium
+</p>
+<h3>Short Answer</h3>
+<div class="answer">
+<p>This chapter covers Git the tool: how history, checkout strategy, and refs affect what a pipeline can do. The actual pipeline mechanics — Jenkins pipeline syntax, GitHub Actions workflow YAML, GitLab CI's <code>.gitlab-ci.yml</code>, stages, runners, artifacts, and deployment gates — are covered in depth in the dedicated CI/CD pipelines chapter. If asked to design a full pipeline in an interview, treat the Git checkout as one early, well-understood step in that larger system, not the whole answer.</p>
+</div>
+</div>
+
+<hr>
+
+<h1 id="h19">QUICK REVISION SHEET</h1>
 
 <hr>
 
@@ -659,6 +1800,22 @@ target/
 <li>reflog recovers lost commits/branches (~30 days); restore unstages/discards; reset --soft uncommits</li>
 
 <li>stash (shelve work), cherry-pick (one commit), .gitignore (never track), pre-commit hooks; never commit secrets — rotate + scrub; use Git LFS for binaries</li>
+
+<li>Objects are content-addressable (blob/tree/commit/tag by SHA) — not diffs; packfiles + git gc keep loose objects compact; unreachable objects survive ~2 weeks by default</li>
+
+<li>git bisect binary-searches for a regression's first bad commit (automate with bisect run); git blame/-S/-G/--follow do log forensics; git worktree runs branches in parallel; git rerere replays past conflict resolutions</li>
+
+<li>Client-side hooks (pre-commit, commit-msg) are local and bypassable (--no-verify); server-side hooks / branch protection / required CI checks are the real enforcement; sign commits (GPG/SSH) for verified identity</li>
+
+<li>.gitattributes normalizes line endings (text=auto) and marks binary/diff drivers; Git LFS swaps large binaries for pointer files so history stays small</li>
+
+<li>Shallow clone truncates history depth; partial clone (--filter=blob:none) keeps full history but lazy-loads blobs; sparse-checkout limits the working directory; pick monorepo vs polyrepo based on cross-project change frequency, not dogma</li>
+
+<li>Branch protection + CODEOWNERS + required status checks/merge queues enforce review and "tested together" guarantees at the platform level; merge commit vs squash vs rebase-merge trades topology detail for a clean mainline</li>
+
+<li>Conventional Commits (feat/fix/BREAKING CHANGE) drive automated changelogs and SemVer bumps in CI with no manual versioning judgement calls</li>
+
+<li>A leaked secret isn't gone until history is rewritten (git filter-repo / BFG) AND the credential is rotated; recover "lost" work beyond reflog with git fsck --lost-found before assuming it's gone for good</li>
 
 </ul>
 

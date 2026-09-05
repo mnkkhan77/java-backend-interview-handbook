@@ -656,6 +656,543 @@ Being honest about scope: MCP's security model deliberately leans on the host an
 <p>Direct, per-team integrations scale as roughly N applications × M systems in the worst case — every new AI application re-implements integration, auth, and schema handling for every system it needs, and every new system requires bespoke work from every consuming team. A shared protocol reduces this to roughly N + M: each application implements the client side once and gains access to every compliant server; each system's owning team implements the server side once and it becomes usable by every current and future AI application without further integration work. Organizationally, this also lets ownership follow domain expertise correctly — the team that understands the CRM or the deployment pipeline best builds and operates the MCP server for it, versioned and secured independently, rather than every AI application team reverse-engineering and duplicating that system's API surface themselves. The trade-off worth naming honestly: it introduces a network hop and a shared dependency surface that must be operated with production rigor (health checks, versioning, authz, observability) — the case for adopting it holds once you have more than a small, fixed number of application-to-system pairings, which is realistically almost every organization building more than one AI application.</p>
 </div>
 
+<div class="question" id="q9"><span class="level">JUNIOR</span>Q9. What is JSON-RPC 2.0, and why did MCP build on top of it rather than defining its own wire format?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Extremely High</p>
+<div class="answer">
+<p>JSON-RPC 2.0 is a lightweight, transport-agnostic remote procedure call spec: every message is a JSON object with a method name, optional params, and (for requests) an id used to match a later response. MCP reuses it wholesale rather than inventing a new format because it is already standardized, has mature parser libraries in every language, and cleanly separates "what the message means" from "how it travels" — the same JSON-RPC envelope works unchanged over stdio pipes or an HTTP connection, so MCP only had to define its own vocabulary of methods (initialize, tools/list, tools/call, etc.) on top of an already-solved transport-independent message format.</p>
+</div>
+
+<div class="question" id="q10"><span class="level">JUNIOR</span>Q10. JSON-RPC defines three message shapes. Name them and say how MCP uses each.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High</p>
+<div class="answer">
+<p><strong>Request</strong> (carries an id, expects a matching response) — e.g. <code>tools/call</code>. <strong>Response</strong> (carries the same id back, either a result or an error) — the server's reply to a request. <strong>Notification</strong> (has no id, and the sender expects no reply) — e.g. <code>notifications/progress</code> or <code>notifications/tools/list_changed</code>, used for fire-and-forget signals in either direction. The presence or absence of an id is the entire distinguishing feature, and it is why a client must never block waiting for a "response" to a message it sent as a notification.</p>
+</div>
+
+<div class="question" id="q11"><span class="level">JUNIOR</span>Q11. What is the practical difference between a "request" and a "notification" in MCP, and why does that difference matter for a client implementation?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A request carries an id and obligates the receiver to send back exactly one response (result or error); a notification has no id and the receiver is not expected — and must not — reply. This matters because a client's transport layer has to route incoming messages by id to whichever pending call is awaiting them, while notifications need a separate, non-blocking handler path (e.g., updating a locally cached tool list on <code>list_changed</code>) — conflating the two paths is a common source of hung clients waiting on a response that was never going to arrive.</p>
+</div>
+
+<div class="question" id="q12"><span class="level">JUNIOR</span>Q12. What does the initialize handshake actually accomplish, and what happens if a client skips it?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p><code>initialize</code> is the first request a client sends after connecting; it declares the client's protocol version and which optional MCP features it supports, and the server replies with its own version and supported features, plus basic server metadata. A client that skips it (or ignores the response) is guessing about the server's capabilities instead of knowing them — it might call <code>resources/list</code> on a server that doesn't implement resources at all, or assume progress notifications are supported when they aren't, producing failures that look like server bugs but are really unhandled capability mismatches on the client side.</p>
+</div>
+
+<div class="question" id="q13"><span class="level">JUNIOR</span>Q13. Describe the stdio transport in one sentence, and name the kind of deployment it's a poor fit for.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High — asked in nearly every MCP-focused interview</p>
+<div class="answer">
+<p>In the stdio transport, the client spawns the MCP server as a local child process and exchanges JSON-RPC messages over that process's stdin and stdout. It is a poor fit for any multi-tenant, server-side production deployment, since you would need to spawn and supervise one OS process per concurrent user/session, which does not scale the way a shared, pooled remote connection does.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Frame it as a proximity-trust model — stdio works precisely because the server is co-located with and spawned by the host, which is also why it needs a weaker authentication story than a remote server ever could.</div>
+
+<div class="question" id="q14"><span class="level">JUNIOR</span>Q14. What is Streamable HTTP, at a high level, and what transport did it replace in the MCP spec?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: High, especially in recent interviews</p>
+<div class="answer">
+<p>Streamable HTTP is MCP's remote transport: the client POSTs JSON-RPC messages to a single HTTP endpoint, and the server can respond either with a plain JSON body or, when it needs to stream multiple messages (progress notifications, then a final result), by upgrading that same response to a Server-Sent Events stream. It replaced an earlier, more rigid transport that required a long-lived SSE connection opened up front for all server-to-client messages — Streamable HTTP folds request/response and streaming into one endpoint, which is friendlier to ordinary HTTP infrastructure like load balancers and proxies.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Streamable HTTP negotiates within a single POST/response pair whether the reply is plain JSON or an SSE upgrade — client and server don't have to pre-agree, which is exactly why it removed the older transport's need to open a long-lived connection before you even know whether streaming is needed.</div>
+
+<div class="question" id="q15"><span class="level">JUNIOR</span>Q15. When a server describes a tool, what does the JSON Schema attached to it actually tell the model, and who writes it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The schema tells the model exactly what arguments the tool accepts — parameter names, types, which are required, and any constraints (enum values, string formats) — the same way a Java method signature tells a compiler what it needs. In most MCP server frameworks this schema is generated automatically from the server's own function/method signature (Spring AI does this from an annotated Java method's parameter types; Python's FastMCP does it from type hints), so the server author writes ordinary typed code and the schema is a byproduct, not something hand-authored as raw JSON.</p>
+</div>
+
+<div class="question" id="q16"><span class="level">JUNIOR</span>Q16. What kinds of content can a tool's result actually contain?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A tool result is a list of content blocks, not a single string — commonly plain text, but the spec also allows image content (base64-encoded with a MIME type), audio content, and embedded resource content (effectively handing back a resource by reference or inline). A single tool call can return a mix — for example, a chart-generation tool returning both a text summary and an image block — and the host is responsible for presenting each block type appropriately back to the model or the user.</p>
+</div>
+
+<div class="question" id="q17"><span class="level">JUNIOR</span>Q17. A resource is identified by what, and can you give two example resource identifiers?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A resource is identified by a URI, and the scheme is left open for the server author to define meaningfully — <code>file:///project/README.md</code> for a filesystem server, or <code>postgres://schema/orders_table</code> for a database server, are both valid MCP resource URIs. The client doesn't need to understand the scheme's semantics; it only needs to pass the URI back to <code>resources/read</code> on the same server that advertised it.</p>
+</div>
+
+<div class="question" id="q18"><span class="level">JUNIOR</span>Q18. How is a prompt primitive different from a tool, in terms of who triggers it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A tool is invoked at the model's own discretion, mid-reasoning, based on what it decides the conversation needs. A prompt is a reusable, parameterized template that a server author ships and that the user (or host UI) selects explicitly — much like a slash command — bypassing the model's judgment entirely about whether and when to use it. The model may still be involved in filling in the prompt's arguments, but the decision to invoke that particular template comes from the user, not from autonomous model reasoning.</p>
+</div>
+
+<div class="question" id="q19"><span class="level">JUNIOR</span>Q19. Why do tools/list, resources/list, and prompts/list support pagination, and how does a client use it?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A server might expose hundreds or thousands of resources (every file in a large repository, every row-backed record in a database), and returning them all in a single response would be wasteful or outright unworkable. These list operations return a page of results plus an opaque cursor; a client that wants the next page passes that cursor back in a follow-up request. Cursors are opaque to the client by design — it must never attempt to construct or interpret one itself, only pass back exactly what the server gave it.</p>
+</div>
+
+<div class="question" id="q20"><span class="level">JUNIOR</span>Q20. What is the MCP Inspector, and when would you reach for it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The MCP Inspector is a standalone developer tool that acts as a generic MCP client with a UI — you point it at a server (stdio command or remote URL) and it lets you manually walk through the handshake, list and invoke tools/resources/prompts, and inspect the raw JSON-RPC traffic in both directions. It's the first tool to reach for when a server you're building behaves unexpectedly against a real host, because it isolates whether the problem is in your server's protocol implementation versus in the host application's orchestration logic.</p>
+</div>
+
+<div class="question" id="q21"><span class="level">JUNIOR</span>Q21. What's a very common first mistake when writing a stdio-based MCP server, related to logging?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High — a classic "gotcha" question</p>
+<div class="answer">
+<p>Writing log or debug output to stdout. In the stdio transport, stdout is the exclusive channel carrying JSON-RPC messages back to the client — a single stray <code>print("debug: got here")</code> line corrupts the message stream and the client will fail to parse it (or worse, silently desynchronize). The fix is mechanical but easy to forget: send all logging to stderr (or to MCP's own logging capability, via <code>notifications/message</code>), never to stdout, in a stdio server.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> This is one of the single most common real-world MCP bugs reported by server authors — nearly every "my client can't parse anything from this server" report traces back to an accidental print statement landing on stdout instead of stderr.</div>
+
+<div class="question" id="q22"><span class="level">JUNIOR</span>Q22. Is MCP tied to a particular programming language or model provider?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>No — that neutrality is the entire point. MCP is a protocol specification, not a library, so a server can be written in Python, TypeScript, Java, Go, or anything else that can speak JSON-RPC over the supported transports, and a client/host can be built independently in a different language, and still interoperate correctly as long as both sides implement the spec. The same is true on the model side: MCP doesn't assume any particular LLM provider, since the protocol only governs how the host talks to servers, not how the host talks to its model.</p>
+</div>
+
+<div class="question" id="q23"><span class="level">MID</span>Q23. Walk through, field by field, what a client actually sends in the initialize request.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The <code>initialize</code> request's params typically include: <code>protocolVersion</code> (the specific MCP version the client speaks), a <code>capabilities</code> object declaring which optional client-side features it supports (e.g., whether it can service sampling requests, whether it supports a roots list), and a <code>clientInfo</code> object (name and version of the implementation, useful for server-side logging/debugging). The server's response mirrors this shape back — its own <code>protocolVersion</code>, its <code>capabilities</code> (tools? resources? prompts? does any of them support <code>list_changed</code> notifications?), and <code>serverInfo</code> — so both sides walk away from one round trip knowing exactly what the other supports.</p>
+</div>
+
+<div class="question" id="q24"><span class="level">MID</span>Q24. What does it mean for capabilities to be negotiated rather than assumed, and why is that a deliberate design choice?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Negotiation means neither side hardcodes an assumption about what the other supports — the client only signals sampling support if it can actually service a sampling request, and the server only advertises <code>resources.listChanged</code> if it will actually emit that notification. This lets the spec evolve additively: a client built against an older MCP version can still talk to a newer server by simply not declaring (and the server not depending on) capabilities that didn't exist yet, rather than the whole connection failing outright over a version mismatch on a single unused feature.</p>
+</div>
+
+<div class="question" id="q25"><span class="level">MID</span>Q25. What is the client expected to do if the server responds to initialize with a protocol version it doesn't support?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The spec expects the client to check the server's declared <code>protocolVersion</code> against the versions it knows how to speak; if there's no compatible version, the correct behavior is to fail the connection cleanly (and typically surface a clear error to whoever configured that server) rather than proceed and hope the mismatch doesn't matter. Silently continuing risks the client sending method calls or expecting response shapes the server's actual version doesn't implement, which produces confusing runtime errors far from the actual root cause.</p>
+</div>
+
+<div class="question" id="q26"><span class="level">MID</span>Q26. How does a client discover what capabilities a specific server offers beyond what the capability flags in initialize indicate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The coarse <code>capabilities</code> object in the initialize response tells the client which primitive categories exist at all (tools, resources, prompts) but not their contents — for that, the client calls the corresponding list method (<code>tools/list</code>, <code>resources/list</code>, <code>prompts/list</code>) after the handshake completes. Only after receiving that list does the client know the actual tool names, schemas, and descriptions it can present to the model, or the actual resource URIs it can offer the host/user.</p>
+</div>
+
+<div class="question" id="q27"><span class="level">MID</span>Q27. What triggers a tools/list_changed notification, and what must a well-behaved client do when it receives one?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A server sends <code>notifications/tools/list_changed</code> whenever its tool set changes at runtime — a plugin loads dynamically, a feature flag toggles a tool's availability, a dependent system's schema changes and the server updates its own tool definition to match. A well-behaved client treats this as a cache invalidation signal: it re-issues <code>tools/list</code> to refresh its local view before the next model turn, rather than continuing to hand the model a stale tool list that may now include tools the server will reject.</p>
+</div>
+
+<div class="question" id="q28"><span class="level">MID</span>Q28. Explain the message framing used by the stdio transport — how does a reader know where one JSON-RPC message ends and the next begins?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Stdio framing uses newline-delimited JSON: each individual JSON-RPC message is serialized on a single line and terminated with a newline character, with no length-prefixing or other framing needed. This is simple to implement in any language (read a line, parse it as JSON) but does impose a constraint worth knowing: the JSON itself must not contain a literal, unescaped newline, which is automatically satisfied by any conformant JSON serializer since newlines inside strings are escaped as <code>\n</code>.</p>
+</div>
+
+<div class="question" id="q29"><span class="level">MID</span>Q29. What is resources/subscribe used for, and how does a client find out when a subscribed resource changes?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>resources/subscribe</code> lets a client register interest in a specific resource URI so it doesn't have to poll <code>resources/read</code> repeatedly to notice changes. When the underlying data changes — a file is edited, a database row is updated — the server sends a <code>notifications/resources/updated</code> notification carrying that URI, and the client can then decide whether to re-read it immediately or lazily, and whether to re-surface it to the model or the user.</p>
+</div>
+
+<div class="question" id="q30"><span class="level">MID</span>Q30. What is a resource template, and why would a server prefer one over a flat list of resources?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A resource template is a URI pattern (using RFC 6570 URI template syntax, e.g. <code>file:///{path}</code> or <code>postgres://{schema}/{table}</code>) that describes a parameterized family of resources rather than enumerating every concrete instance. A server backing a large or dynamic dataset — every row in a growing database, every file in a repository that changes constantly — would rather advertise the template once than emit (and keep in sync) a full <code>resources/list</code> of every current instance, letting the client construct concrete URIs to <code>resources/read</code> on demand instead.</p>
+</div>
+
+<div class="question" id="q31"><span class="level">MID</span>Q31. What is the completion capability (completion/complete) and what problem does it solve for prompt or resource-template arguments?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p><code>completion/complete</code> lets a client ask a server "given that the user has typed this much of an argument value, what are plausible completions?" — the same UX problem a shell's tab-completion or an IDE's autocomplete solves. It's most useful for prompt arguments or resource-template variables where the valid values come from the server's own domain data (e.g., completing a partially-typed ticket ID or table name) that the client has no independent way to know.</p>
+</div>
+
+<div class="question" id="q32"><span class="level">MID</span>Q32. What is elicitation, and how is it different from sampling?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High — a newer spec feature, increasingly asked</p>
+<div class="answer">
+<p>Elicitation lets a server, mid-tool-call, ask the host to collect a specific piece of additional information directly from the end user before the server can finish — for example, a booking tool that needs the user to confirm a date range it wasn't given. Sampling, by contrast, asks the host's LLM to generate a completion on the server's behalf, not the human. Both flow in the "server asks host for something" direction that surprises engineers used to thinking of MCP as one-directional, but elicitation targets the human in the loop while sampling targets the model.</p>
+</div>
+
+<div class="question" id="q33"><span class="level">MID</span>Q33. Describe the shape of a sampling/createMessage request and the key piece of host-side policy around it.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A <code>sampling/createMessage</code> request from a server includes the messages it wants the model to see, optional <code>modelPreferences</code> (hints like "prefer a fast/cheap model" or "prefer the highest-capability model available," since the server doesn't know or control which model the host actually uses), and constraints like <code>maxTokens</code>. The key host-side policy point: a well-implemented host does not auto-forward this to the model — it treats it as requiring explicit approval (a user prompt, or a pre-configured policy) before honoring it, because otherwise any connected server could silently spend the host's model budget or extract completions for its own purposes.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Because modelPreferences are hints, not guarantees, a server should never assume a specific model actually served the request — server-side logic (and any prompt sent via sampling) should be written defensively, tolerant of whichever model the host's policy actually selected.</div>
+
+<div class="question" id="q34"><span class="level">MID</span>Q34. What is the "roots" primitive, and when would a host actually declare one to a server?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>Roots let a host tell a server which directories (or, more generally, which URI-scoped boundaries) it should consider in scope for the current session — for example, a code-editing host declaring the currently open project's folder as a root to a filesystem MCP server, so the server knows not to wander outside it. It's a scoping mechanism supplied by the host at connection time, distinct from authorization (which governs what the server will allow), used mainly for filesystem-shaped or workspace-shaped servers.</p>
+</div>
+
+<div class="question" id="q35"><span class="level">MID</span>Q35. What's the difference between a tool's unstructured content result and a structured output declared via outputSchema?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>By default, a tool's result is a list of content blocks (text, image, etc.) meant primarily for a human or the model to read directly. A tool that declares an <code>outputSchema</code> additionally returns a <code>structuredContent</code> object validated against that schema — machine-parseable data a host's orchestration code can consume programmatically (say, to drive a UI widget or feed a downstream computation) without needing to parse or regex the model-facing text representation.</p>
+</div>
+
+<div class="question" id="q36"><span class="level">MID</span>Q36. List the standard tool annotations (readOnlyHint, destructiveHint, idempotentHint, openWorldHint) and explain what each is telling the host.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p><code>readOnlyHint</code> signals the tool doesn't modify any state, so a host can treat it as safe to call more liberally (or auto-approve without confirmation). <code>destructiveHint</code> flags that the tool can cause hard-to-reverse effects (deleting data, sending an email) and should get extra scrutiny or explicit user confirmation. <code>idempotentHint</code> indicates repeated identical calls have the same effect as one call, which matters directly for whether a host's retry logic is safe to use after a timeout. <code>openWorldHint</code> signals the tool interacts with an open-ended external system (the public internet, an unbounded search space) rather than a fixed, enumerable domain, which affects caching and result-freshness assumptions.</p>
+</div>
+
+<div class="question" id="q37"><span class="level">MID</span>Q37. Why is idempotentHint significant specifically for how a host implements retries after a network timeout?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>If a <code>tools/call</code> request times out, the host genuinely doesn't know whether the server received and executed it before the timeout or never got it at all. Blindly retrying is safe only if the operation is idempotent — re-running <code>create_ticket("Server down")</code> after an ambiguous timeout could create two duplicate tickets if the original request actually did succeed. A host that respects <code>idempotentHint</code> can safely auto-retry tools marked idempotent and must instead surface an ambiguous-failure state (or require explicit user confirmation before retrying) for tools that aren't.</p>
+</div>
+
+<div class="question" id="q38"><span class="level">MID</span>Q38. What is notifications/progress used for, and what three pieces of information does it typically carry?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It's a fire-and-forget notification a server can send during a long-running tool call to report incremental progress rather than leaving the client staring at silence until the final result. It typically carries a <code>progressToken</code> (correlating it to the specific in-flight call, supplied by the client in the original request if it wants progress updates), a <code>progress</code> value, and optionally a <code>total</code>, letting a host render something like a percentage or a step counter to the user while the underlying work continues.</p>
+</div>
+
+<div class="question" id="q39"><span class="level">MID</span>Q39. What must a server do when it receives notifications/cancelled for an in-flight request?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It should make a best-effort attempt to stop the underlying work as soon as practical — cancel a downstream database query, abort a long-running computation — and must not send a response for the cancelled request's original id, since the client has already indicated it's no longer waiting for one. Cancellation is advisory rather than guaranteed instantaneous (a server can't always interrupt work mid-flight cleanly), but ignoring it entirely defeats the purpose of giving hosts a way to abandon calls the user no longer cares about.</p>
+</div>
+
+<div class="question" id="q40"><span class="level">MID</span>Q40. What is the _meta field that shows up in various MCP message objects, and what is it for?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p><code>_meta</code> is a reserved, freeform object that implementations can attach to requests, responses, or other MCP objects to carry information outside the protocol's own defined semantics — for example, a client attaching a trace/correlation identifier for its own observability pipeline, or a <code>progressToken</code> living inside a request's <code>_meta</code>. It exists precisely so that hosts and servers can extend messages with their own metadata without the spec needing to anticipate every possible extension field in advance, and any implementation encountering an unrecognized <code>_meta</code> field should simply ignore it rather than error.</p>
+</div>
+
+<div class="question" id="q41"><span class="level">MID</span>Q41. At a conceptual level, what problem does MCP's OAuth 2.1-based authorization framework solve, and why didn't the original spec need it as urgently?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior level</p>
+<div class="answer">
+<p>Remote, multi-tenant MCP servers reachable over the network need a real authorization story — who is allowed to connect, and on whose behalf — the same as any other internet-facing API, which a purely local stdio server (trusted by virtue of being spawned directly by the host on the same machine) mostly sidesteps. The authorization spec defines how an MCP client obtains and presents an access token to a remote server using standard OAuth 2.1 flows, rather than each server inventing its own bespoke auth scheme, extending MCP's "reuse boring, standard primitives" philosophy from transport (JSON-RPC) to identity (OAuth).</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Notice the asymmetry this creates in practice: a stdio server trusted purely by proximity to the host process can get away with a weaker identity story than a remote server ever could — which is itself a reason for extra caution, not less, before promoting a stdio-only server to a remote deployment without revisiting its auth model.</div>
+
+<div class="question" id="q42"><span class="level">MID</span>Q42. What is Dynamic Client Registration, and why does it matter for an MCP client connecting to a server it has never talked to before?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Dynamic Client Registration (an existing OAuth extension MCP's auth spec leans on) lets a client register itself with an authorization server programmatically at connection time, rather than requiring a human to manually provision OAuth client credentials for every new MCP server in advance. This matters because MCP is explicitly designed for a client to discover and connect to servers it has never seen before — requiring manual, out-of-band credential provisioning for every new server would defeat that discoverability.</p>
+</div>
+
+<div class="question" id="q43"><span class="level">MID</span>Q43. Why does MCP's authorization flow require PKCE even in flows where the client might otherwise be considered "confidential"?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>PKCE (Proof Key for Code Exchange) binds the authorization code to the specific client instance that initiated the flow via a locally-generated secret, preventing a stolen authorization code from being redeemed by a different party. MCP mandates it broadly because many MCP clients run as installed desktop apps, CLI tools, or embedded components without a securely stored client secret the way a traditional confidential server-side web app has — treating every client as potentially public and requiring PKCE unconditionally is simpler and safer than trying to classify clients into confidential versus public and applying different rules.</p>
+</div>
+
+<div class="question" id="q44"><span class="level">MID</span>Q44. If a host connects to two MCP servers that each expose a tool literally named search, how should the host handle the collision?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The protocol itself does not deduplicate or namespace tool names across servers — that responsibility sits with the host. In practice, a host typically prefixes or qualifies each tool name with its owning server's identifier before presenting the merged list to the model (e.g., <code>docs_search</code> vs <code>crm_search</code>), and maintains an internal mapping from the qualified name back to the correct (server, original tool name) pair so it can route a model's tool-call request to the right client.</p>
+</div>
+
+<div class="question" id="q45"><span class="level">MID</span>Q45. What problem is the MCP Registry meant to solve for the broader ecosystem?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>As the number of community- and vendor-built MCP servers grew, there was no canonical, trustworthy place to discover "what servers exist for X" or verify who actually published a given server — the same discovery-and-trust gap package registries (npm, PyPI, Maven Central) solve for code dependencies. An MCP registry provides a searchable catalog of servers with associated metadata (publisher, version, capabilities) so hosts and engineers can find and vet servers without relying purely on word of mouth or an unverified link — though, as with any package registry, listing in it is not by itself a security guarantee about a given server's behavior.</p>
+</div>
+
+<div class="question" id="q46"><span class="level">MID</span>Q46. How would you compare MCP's tool discovery model to a bespoke, hardcoded internal function-calling registry your team already built for one application?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A hardcoded internal registry is fully static at deploy time — the list of available functions and their schemas is baked into the application binary/config, and adding a new one requires a code change and redeploy of that specific application. MCP's <code>tools/list</code> is queried live at connection time (and can change further via <code>list_changed</code>), meaning a new capability added to a server becomes available to every already-deployed host the moment that host reconnects or refreshes, with zero code change on the consuming side — the tradeoff is the added indirection of a schema fetched over the wire rather than known at compile time, which is exactly the discoverability MCP was built to provide.</p>
+</div>
+
+<div class="question" id="q47"><span class="level">MID</span>Q47. A tool call to a remote MCP server returns after 8 seconds when it usually returns in 200ms. What in the MCP spec itself governs this, and what is actually the host's responsibility?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The MCP spec itself does not mandate any timeout — a slow or hung tool call is left entirely to the client/host to police. This means every production host must implement its own timeout policy per call (and ideally per-server, since a Postgres-backed server and a public-web-search server have very different latency profiles), decide what to do when a timeout fires (cancel via <code>notifications/cancelled</code> and surface an error to the model, or retry if the tool is known idempotent), and monitor server-side latency independently, because the protocol gives you no built-in safety net here.</p>
+</div>
+
+<div class="question" id="q48"><span class="level">SENIOR</span>Q48. Why did a later MCP spec revision remove support for JSON-RPC batch requests, and what does that removal say about how the spec evolves?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium — niche but revealing</p>
+<div class="answer">
+<p>JSON-RPC 2.0 natively supports sending an array of requests in one batch and receiving an array of responses, and MCP initially inherited that for free. In practice it added complexity (partial failures inside a batch, ambiguous ordering/cancellation semantics, and streaming responses over Streamable HTTP didn't compose cleanly with batched requests) without a strong enough real-world use case to justify it, so a later revision dropped it. The lesson for reading any protocol's changelog: inheriting a feature from an underlying standard for free doesn't obligate you to keep it if it doesn't earn its complexity once the protocol is actually exercised in production.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> This is a good instinct-check question — a candidate who says "batching sounds efficient, why remove it" without weighing how it interacts with streaming and cancellation semantics is reasoning about protocol features in isolation from how they're actually used.</div>
+
+<div class="question" id="q49"><span class="level">SENIOR</span>Q49. You're asked to add a required, non-optional parameter to a widely-used tool's schema. Walk through why that's a breaking change and how you'd actually ship it.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior/staff level</p>
+<div class="answer">
+<p>Every host currently connected to that server has already cached the old schema and may have models mid-conversation that were told the old, smaller argument set — a model calling the tool the old way will now fail schema validation the moment the change goes live, with no warning to the host beyond a sudden error. The safe path mirrors API versioning discipline generally: add the new parameter as optional with a sensible default first (non-breaking), give existing callers a deprecation window if you eventually want to force it, or ship a new tool name entirely (e.g. <code>create_ticket_v2</code>) for a truly incompatible shape change, and only retire the old one after consumers have measurably migrated off it.</p>
+</div>
+
+<div class="question" id="q50"><span class="level">SENIOR</span>Q50. What's the architectural difference between a server's implementation version and the MCP protocolVersion it declares, and why do interviewers care that candidates keep them separate?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p><code>protocolVersion</code> identifies which revision of the MCP specification itself the endpoint implements (governing what methods, capabilities, and message shapes are legal) — it changes rarely and is negotiated during <code>initialize</code>. The server's own implementation version (its <code>serverInfo.version</code>) tracks that particular server's own release history (bug fixes, new tools, schema tweaks) and can change constantly, independent of the protocol version underneath it. Conflating the two leads to wrong reasoning — assuming a server's frequent version bumps imply protocol incompatibility, or assuming a stable protocol version means the server's actual tool contracts haven't changed.</p>
+</div>
+
+<div class="question" id="q51"><span class="level">SENIOR</span>Q51. Design a host-side gateway that aggregates 50 internal MCP servers behind a single connection point for every AI application in the company. What are the core design decisions?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High — a common staff-level system-design prompt</p>
+<div class="answer">
+<p>Core decisions: (1) namespacing — every tool/resource/prompt name must be disambiguated by owning server before being exposed onward, since collisions across 50 independently-developed servers are a near-certainty; (2) a central capability/tool catalog so consuming applications don't have to independently discover and connect to 50 servers themselves — the gateway does discovery once and exposes an aggregated, cached view, refreshed on <code>list_changed</code>; (3) per-server credential and auth-scope management, so the gateway (not each application) holds and rotates the actual downstream credentials; (4) per-server circuit breaking and timeout isolation, so one slow or down server doesn't stall calls to the other 49; (5) centralized observability — the gateway is a natural place to emit per-tool-call traces, latency, and cost attribution across every application that shares it. The tradeoff to name explicitly: the gateway becomes a shared dependency and a single point of failure/bottleneck if not built with the same production rigor as the servers it fronts.</p>
+</div>
+
+<div class="question" id="q52"><span class="level">SENIOR</span>Q52. How would you sandbox an MCP server that needs filesystem or shell access, so that a compromised or buggy server can't affect the rest of the host machine?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Run the server as its own isolated process with the minimum OS-level privileges it actually needs — a dedicated low-privilege user, a container with a read-only root filesystem and only the specific directories it needs mounted (ideally matching the roots the host has declared to it), network egress restricted to only the downstream systems it legitimately talks to (blocking arbitrary outbound connections closes off a common data-exfiltration path for a compromised server), and resource limits (CPU/memory/file descriptors) so a runaway or malicious process can't starve the host machine. None of this is mandated by the MCP spec itself — it's operational discipline layered on top, exactly the same discipline you'd apply to any other third-party code granted execution rights on a machine you operate.</p>
+</div>
+
+<div class="question" id="q53"><span class="level">SENIOR</span>Q53. What is the "tool poisoning" / "rug-pull" attack pattern specific to MCP, and why is it hard to defend against with a one-time review?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High, rising</p>
+<div class="answer">
+<p>A server can be reviewed and approved when a host first connects to it, with tool descriptions that look completely benign — but because tool descriptions and schemas are fetched live via <code>tools/list</code> (and can change further via <code>list_changed</code>) rather than being fixed at approval time, a malicious or compromised server can later silently swap in a manipulated description crafted to influence the model's behavior (a form of prompt injection embedded in the tool's own metadata, not its results) after the one-time human review already happened. Defending against it requires either pinning and diffing the exact tool definitions you approved (alerting on any change) rather than trusting updates blindly, or treating every tool description, not just tool results, as untrusted input subject to the same scrutiny as retrieved documents.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Ask specifically whether the candidate distinguishes this from ordinary prompt injection via tool results — tool-poisoning targets the tool definition itself, a strictly earlier and more foundational trust boundary than the data a tool later returns.</div>
+
+<div class="question" id="q54"><span class="level">SENIOR</span>Q54. What is the DNS rebinding concern that was raised against early SSE-based local MCP servers, and how does it work?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium, niche security trivia</p>
+<div class="answer">
+<p>A local MCP server bound to localhost for a desktop host implicitly trusts that only local processes can reach it. DNS rebinding defeats that assumption: a malicious webpage in the user's browser causes a DNS name to first resolve to an attacker's server (to pass an initial same-origin-style check) and then re-resolve, after the browser has cached permission, to 127.0.0.1 — letting the malicious page's script make requests that land on the local MCP server as if they were legitimate local traffic. The mitigation is for local HTTP-based servers to validate the Host/Origin header strictly and refuse requests that don't match an expected value, rather than trusting "the request reached my local port" as sufficient proof of legitimacy.</p>
+</div>
+
+<div class="question" id="q55"><span class="level">SENIOR</span>Q55. Why is "the server returned a plausible-looking result" not sufficient grounds to trust a tool result, even from a server you built yourself?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A tool result flows directly into the model's context the same way retrieved RAG content does, and a "plausible-looking" result can still be wrong (a stale cache, a downstream system silently failing over to degraded data) or actively adversarial if the underlying data source itself accepts untrusted input (a customer-submitted ticket description containing injected instructions, a webpage a search tool retrieved). Building the server yourself only guarantees the protocol layer is correct — it says nothing about the trustworthiness of whatever data source that server is faithfully relaying, which is why treating tool results as untrusted input to the model is a blanket rule, not a case-by-case judgment call.</p>
+</div>
+
+<div class="question" id="q56"><span class="level">SENIOR</span>Q56. A destructive tool like delete_record or send_email is exposed via MCP. What layered controls would you put around it, beyond the destructiveHint annotation alone?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The annotation itself is only advisory metadata a well-behaved host can choose to honor — it enforces nothing on its own. Real layering needs: server-side authorization checks that verify the specific requesting end user (not just the host's service credential) is entitled to that specific action, independent of whatever the host claims; a host-side policy that requires explicit human confirmation before executing any tool flagged destructive, surfaced to the actual user in the loop rather than auto-approved; audit logging at the server for every invocation with enough context to reconstruct who/why after the fact; and, where feasible, splitting an overly broad destructive capability into narrower, harder-to-misuse variants (a soft-delete/archive tool with a separate, more heavily gated hard-delete) rather than one generic destructive endpoint.</p>
+</div>
+
+<div class="question" id="q57"><span class="level">SENIOR</span>Q57. How would you structure integration tests for an MCP server you're shipping, versus unit tests for its underlying business logic?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Unit tests target the actual business logic directly (call the Java method or Python function behind the tool with various inputs, assert on the return value) exactly as you would for any other code, independent of MCP entirely. Integration/contract tests target the protocol surface itself: spin up the server, drive it through a real (or scripted) client — the MCP Inspector or a lightweight test client using the SDK — and assert on the actual JSON-RPC exchange: does <code>tools/list</code> return the schema you expect, does <code>tools/call</code> with valid/invalid arguments behave per the schema, does the server correctly reject a request before <code>initialize</code> completes, does it handle cancellation correctly. The protocol layer needs its own tests precisely because schema-generation-from-code and transport handling are exactly the surfaces a purely unit-tested business-logic suite won't exercise.</p>
+</div>
+
+<div class="question" id="q58"><span class="level">SENIOR</span>Q58. What does contract testing buy you specifically when a tool's schema is generated automatically from your method signature (as in Spring AI or FastMCP)?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Auto-generation guarantees internal consistency (the schema always matches the actual method signature) but says nothing about whether that generated schema is still what every consuming host expects — a seemingly innocuous refactor (renaming a parameter, widening an enum, changing a return type's shape) will regenerate a different schema automatically, silently breaking every host that cached the old one, without your code ever "looking" broken from a unit-test perspective. A contract test that snapshots the generated <code>tools/list</code> output and fails on unintended diffs catches exactly this class of accidental breaking change before it reaches a real host.</p>
+</div>
+
+<div class="question" id="q59"><span class="level">SENIOR</span>Q59. How would you propagate distributed tracing context across a host → MCP client → MCP server call chain, given that MCP doesn't natively define trace propagation?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Since the spec doesn't define a standard tracing header the way HTTP has <code>traceparent</code>, the pragmatic approach is to carry your existing trace/span identifiers inside the <code>_meta</code> field of the request (and read them back out of the corresponding response's <code>_meta</code> on the server side), following whatever your organization's existing tracing convention is (W3C Trace Context values serialized as strings work fine inside a JSON field). This lets a single user-facing request be traced end-to-end — host receives request, forwards as <code>tools/call</code>, server processes and calls its own downstream dependency — the same way you'd already expect for any other internal RPC hop, just carried through a channel (<code>_meta</code>) the spec deliberately left open for exactly this kind of extension.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Point out explicitly that this is a convention your team invents, not something MCP mandates — a strong answer names that gap honestly rather than implying the spec already solved distributed tracing.</div>
+
+<div class="question" id="q60"><span class="level">SENIOR</span>Q60. Why does connecting a dozen MCP servers "just in case" have a cost that isn't obvious from a demo, and how would you actually measure it in production?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Every connected server's tools (and often resources/prompts) get folded into the tool-schema payload sent with every single model call, not just calls that end up using them — so twelve servers each averaging ten tools is 120 tool schemas riding along on every turn of every conversation, inflating prompt tokens (and therefore cost and latency) whether or not the model ever calls any of them. To measure it, instrument token counts attributable specifically to the tool-schema portion of the request separately from the conversation content, and track it per connected server so you can identify which servers are earning their token cost versus which are dead weight that should be disconnected or made available on-demand rather than always-on.</p>
+</div>
+
+<div class="question" id="q61"><span class="level">SENIOR</span>Q61. What's the tradeoff between exposing many narrow, single-purpose tools versus one flexible, parameterized tool from a single server?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Many narrow tools (<code>get_ticket_status</code>, <code>create_ticket</code>, <code>close_ticket</code>) each carry a small, precise schema and description, making the model's tool-selection problem easier and each tool's blast radius small and easy to reason about individually — but a large number of them inflates the schema payload sent with every call and can still overwhelm the model's selection accuracy past a certain count. One flexible tool (<code>run_ticket_operation(op, params)</code>) reduces schema count but pushes the "which operation, with which shape of params" decision back into free-form reasoning the model is more likely to get subtly wrong, and collapses distinct authorization/audit boundaries into one endpoint. Most production servers land closer to the narrow end, grouped tightly by domain, accepting the token cost as the price of reliability.</p>
+</div>
+
+<div class="question" id="q62"><span class="level">SENIOR</span>Q62. How should a host decide whether to dispatch multiple tool calls requested by the model in a single turn concurrently or sequentially?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>If the calls are genuinely independent (no call's result is needed as input to another, and they don't contend for the same limited downstream resource in a way that matters), dispatching them concurrently is a pure latency win the protocol doesn't preclude — MCP itself doesn't serialize calls for you, that's an orchestration-layer decision. The host does need to consider: whether the target server(s) can actually handle concurrent load without degrading (a shared server called from many hosts already needs this, but a single host firing five parallel calls at a fragile local stdio server can still overwhelm it), and whether any call has side effects whose ordering the model implicitly assumed even though it issued them "in parallel" from a message-format point of view.</p>
+</div>
+
+<div class="question" id="q63"><span class="level">SENIOR</span>Q63. What's the actual mechanism (not just the outcome) by which a compromised third-party MCP server could exfiltrate data, given that servers "have no idea" about the host's business logic?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A server doesn't need to understand the host's business logic to exfiltrate data — it only needs to see whatever arguments the model passes into its tool calls, and whatever context it can convince the host to hand it (e.g., via a resource read). If a user's conversation contains sensitive data and the model, in the course of using a tool, passes some of that data as an argument (a customer's PII in a "summarize this record" call, say), a malicious server simply logs or forwards that argument to an external endpoint under its control — no exploit needed, just faithfully doing what any server is allowed to do with the arguments it legitimately receives. This is why vetting what data ever reaches a third-party server's tool arguments matters as much as vetting the server's declared behavior.</p>
+</div>
+
+<div class="question" id="q64"><span class="level">SENIOR</span>Q64. Compare MCP's approach to authorization with how you'd typically secure an internal REST API, and identify the one place MCP explicitly leaves policy up to you.</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Both rely on the same underlying primitives — OAuth 2.1 bearer tokens for authenticating a caller to a remote endpoint — so the transport-level authentication story is genuinely similar to securing an internal REST API. What MCP explicitly does not do, by design, is decide the actual authorization policy: which specific user is allowed to invoke which specific tool with which specific arguments is left entirely to the server implementation, the same way HTTP itself doesn't decide who can call a given REST endpoint. A server that authenticates the caller correctly via OAuth but then executes any requested tool call for any authenticated caller has solved authentication without ever having implemented authorization — a distinction worth being precise about in an interview.</p>
+</div>
+
+<div class="question" id="q65"><span class="level">SENIOR</span>Q65. How would you migrate an existing in-house tool-calling framework (hardcoded per-application function registries) to MCP without a big-bang rewrite?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at senior/staff level</p>
+<div class="answer">
+<p>Start at the boundary, not the center: pick one already-well-understood, already-owned system (say, the ticketing integration) and wrap its existing business logic in a thin MCP server, without touching the logic itself — this is a transport/exposure change, not a rewrite, mirroring the "same business logic, new binding" lesson from wrapping a Java method as both a REST controller and an MCP tool. Run the MCP server alongside the existing hardcoded integration in the consuming application (feature-flagged) until you've validated parity, then cut over that one application's tool-calling path to the MCP client, and repeat system by system. The payoff compounds specifically because each successive system, once wrapped, becomes available to every other application without repeating the integration work — which is also the argument for prioritizing the systems with the most future reuse potential first, not the easiest one.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> The "pick the most-reused system first" prioritization is the detail that separates a staff-level migration plan from a merely correct one — it's the same sequencing logic that makes the N+M argument actually materialize sooner rather than later.</div>
+
+<div class="question" id="q66"><span class="level">SENIOR</span>Q66. Should an organization write custom MCP servers for every internal system, or can existing REST/OpenAPI-described APIs be exposed as MCP servers automatically?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High, increasingly common</p>
+<div class="answer">
+<p>Auto-generating an MCP server from an existing OpenAPI spec is a real and increasingly common shortcut — tooling exists to translate OpenAPI operations directly into MCP tools with schemas derived from the API's own request/response shapes, which is attractive because it requires no new server code for APIs that are already well-described. The tradeoff: a mechanically generated tool set inherits the REST API's own tool-selection ergonomics (verbose parameter names, an operation the API author designed for a human developer reading docs, not a model reading a description at inference time), whereas a hand-written MCP server lets you write descriptions and parameter shapes optimized specifically for how a model actually reasons about when to call something. A reasonable default: auto-generate as a fast starting point for internal APIs, but hand-tune the descriptions (and potentially the tool boundaries) for any tool that ends up seeing real production traffic.</p>
+</div>
+
+<div class="question" id="q67"><span class="level">SENIOR</span>Q67. How would you approach rate limiting for an MCP server that's shared across many host applications and, transitively, many end users?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Rate limiting needs to happen at more than one granularity to be meaningful: per calling host/application (so one misbehaving or unusually chatty application can't starve the server for everyone else), and ideally per end user if the server has enough identity information to attribute calls that granularly (propagated via the authorization token, not just the host's own service credential — tying back to the confused-deputy concern). Because MCP itself defines no rate-limiting mechanism, this is implemented the same way you'd rate-limit any other shared internal service — token buckets or sliding windows at the server's own request-handling layer, with a clear, structured error response (not a silent timeout) so calling hosts can distinguish "you're being throttled" from "something is actually broken" and react accordingly (backoff, surface to the user, or queue).</p>
+</div>
+
+<div class="question" id="q68"><span class="level">SENIOR</span>Q68. What observability signals would you want emitted specifically at the MCP client/server boundary, beyond generic application logging?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Per-tool-call latency and error rate, broken out by server and by individual tool name (not just "MCP calls" in aggregate, since a slow <code>run_query</code> tool and a fast <code>get_status</code> tool on the same server have very different normal baselines); token cost attributable to tool schemas versus actual tool-call results, since both consume context but only one is unavoidable overhead; connection-level health per server (is the stdio subprocess alive, is the remote HTTP server responding to health checks); and counts of protocol-level events that indicate friction — capability negotiation failures, cancelled calls, list_changed notification frequency (a server whose tool set churns constantly might indicate an unstable integration worth investigating).</p>
+</div>
+
+<div class="question" id="q69"><span class="level">SENIOR</span>Q69. What's the risk of a host blindly trusting a server's self-reported tool annotations (readOnlyHint, destructiveHint, etc.) without any independent verification?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Annotations are declared by the server itself, with nothing in the protocol verifying they're accurate — a malicious or simply buggy server can mark a genuinely destructive tool as <code>readOnlyHint: true</code> to bypass whatever extra confirmation step a host applies to destructive-flagged tools. A host that treats annotations as advisory-but-unverified for untrusted or unfamiliar servers (applying stricter default confirmation policies to any server outside an explicitly vetted allowlist, regardless of what it claims about its own tools) is meaningfully safer than one that fully trusts every server's self-description.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> A good moment to note that MCP's trust model, much like TLS's, secures the channel and the message format — it does not, and cannot, verify that what a participant says about itself is true.</div>
+
+<div class="question" id="q70"><span class="level">SENIOR</span>Q70. How does the "openWorldHint" annotation affect caching decisions a host or an intermediate layer might otherwise want to make?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>A tool interacting with a closed, enumerable domain (say, looking up one of a fixed set of internal product SKUs) is a reasonable candidate for result caching, since the space of possible answers is bounded and mostly stable. A tool marked <code>openWorldHint</code> (a web search, a query against an unbounded or rapidly changing external system) signals that caching identical-looking calls is unsafe to assume correct, because the "same" query against an open-ended domain can legitimately return different, equally valid results moment to moment — a caching layer that ignores this hint risks serving a model stale or simply wrong information under the guise of an optimization.</p>
+</div>
+
+<div class="question" id="q71"><span class="level">SENIOR</span>Q71. What's the significance of JSON Schema draft version compatibility when a tool's schema needs to work across multiple model providers?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>Not every model provider's tool-calling implementation supports the full JSON Schema specification identically — some support only a practical subset (basic types, enums, required arrays) and choke on or silently ignore more advanced constructs (complex conditionals, certain string format keywords) depending on which draft and which subset their own tool-calling layer was built against. A server whose generated schemas rely on advanced JSON Schema features that work fine against one provider's model can produce confusing failures or degraded tool-selection accuracy against another — worth explicitly testing a server's actual generated schemas against every model provider a host might realistically route through, rather than assuming schema validity in the abstract implies compatibility everywhere.</p>
+</div>
+
+<div class="question" id="q72"><span class="level">SENIOR</span>Q72. A host wants to expose only a subset of a connected server's tools to the model for a given conversation (not all of them). Does MCP support this natively, or is it the host's problem?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>MCP's <code>tools/list</code> simply returns everything the server is willing to expose to that client session — there's no protocol-level mechanism for the client to ask for a filtered subset per conversation. Selective exposure (only show the model tools relevant to the current task, to keep the token cost down and reduce tool-selection error) is entirely an orchestration-layer decision the host makes after receiving the full list — filtering, ranking, or dynamically choosing which subset of the aggregated tool list to actually pass to a given <code>ChatClient</code> call, based on the host's own logic (the conversation's topic, a per-session policy, etc.).</p>
+</div>
+
+<div class="question" id="q73"><span class="level">SENIOR</span>Q73. How would you reason about whether a given MCP server needs to be stateful across calls (maintaining session-scoped memory) versus fully stateless?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Statelessness (each <code>tools/call</code> is handled independently, with any needed context passed explicitly as arguments) is simpler to reason about, easier to scale horizontally, and safer under retries — the same argument that favors stateless services generally. A server does legitimately need session-scoped state when the underlying capability is inherently stateful — a database transaction spanning multiple tool calls, a multi-step wizard-like interaction the server itself is tracking progress through — but that state should be tied to the MCP session lifecycle explicitly (cleaned up on disconnect) rather than assumed to persist indefinitely, and a server author should default to stateless unless the capability genuinely requires otherwise.</p>
+</div>
+
+<div class="question" id="q74"><span class="level">SENIOR</span>Q74. What single design property of MCP most directly enables a tool to be migrated from a local Java method to a remote server (or vice versa) without changing any calling code?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>The stability of the tool-calling abstraction boundary — a <code>ToolCallback</code> (or equivalent construct in another SDK) — as the single contract the host's orchestration code depends on, regardless of whether the concrete implementation behind it is a three-line local method or a network call to an MCP server. Because both a local <code>@Tool</code> method and an MCP-provided tool are converted into the same callback shape before reaching the <code>ChatClient</code> call, the migration is purely a wiring change (swap what constructs the callback) rather than a change to any code that consumes it — the exact same value an interface/implementation split provides anywhere else in software.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> Tie this back explicitly to dependency inversion — the host depends on an abstraction (the callback contract), and both the local method and the remote MCP server depend on that same abstraction, not on each other, which is exactly what makes the swap invisible to calling code.</div>
+
+<div class="question" id="q75"><span class="level">SENIOR</span>Q75. Why is "the model never talks to the MCP server directly" a security-relevant property, not just an architectural detail?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Because every tool-call request the model produces still passes through the host's own orchestration layer before reaching a server, the host retains a mandatory interception point to apply policy — authorization checks, confirmation prompts for destructive actions, rate limiting, logging — on every single call, no matter how many servers are connected or what a given server's own trustworthiness looks like. If the model could reach servers directly, none of that host-mediated policy enforcement would have anywhere to attach; the architecture's insistence on host-mediated calls is precisely what makes centralized security controls possible at all.</p>
+</div>
+
+<div class="question" id="q76"><span class="level">SENIOR</span>Q76. How would you evaluate whether an MCP server you didn't build is safe to connect to production, beyond just reading its source code once?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>A one-time source read establishes a baseline but doesn't protect against the tool-poisoning/rug-pull risk (the server changing its behavior or tool descriptions after approval) or supply-chain compromise of a dependency the server itself pulls in later. A more durable process: pin the server to a specific, hash-verified version/build rather than "latest," diff its declared tools/schemas on every version bump before allowing an upgrade, run it with the sandboxing and least-privilege controls described earlier regardless of how trustworthy it looks, and monitor its actual runtime behavior (unexpected network egress, anomalous latency, anomalous argument patterns in what it's being called with) rather than trusting the one-time review to hold indefinitely.</p>
+</div>
+
+<div class="question" id="q77"><span class="level">SENIOR</span>Q77. What tradeoff is a team accepting when they choose to expose a single generic MCP tool (e.g. call_internal_api(endpoint, method, body)) that proxies arbitrary calls to an internal API surface, instead of purpose-built tools per operation?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The generic proxy tool is fast to ship (one tool covers an entire API surface with no per-operation server code) but collapses every distinct operation's authorization, description quality, and blast radius into a single undifferentiated capability — the model has to correctly reason, from a generic description alone, about which endpoint/method/body shape is appropriate for the current task, with far less guidance than a purpose-built <code>get_customer_order(order_id)</code> tool would provide, and a host has no way to apply different confirmation policy to a read operation versus a destructive one funneled through the same generic tool. It's a reasonable stopgap for rapid prototyping, but it trades away almost everything (tool-selection reliability, fine-grained authorization, meaningful destructiveHint annotations) that purpose-built tools were designed to provide.</p>
+</div>
+
+<div class="question" id="q78"><span class="level">STAFF</span>Q78. You're asked to set the versioning and deprecation policy for every internal MCP server your organization operates. What would that policy actually contain?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>At minimum: a rule that any change to a tool's required parameters, return shape, or observable side effects is treated as a breaking change requiring either a new tool name or a formally announced deprecation window (with a fixed sunset date communicated to known consumers, not silently applied); a distinction, enforced in review, between additive changes (new optional parameter, new tool added to an existing server) which can ship without notice, and anything else; a requirement that every server publish (in its own description or an accompanying registry entry) which protocolVersion range and which of its own implementation versions are currently supported, so consuming hosts can make informed upgrade decisions; and an owning-team accountability model — the team operating a given server is responsible for honoring this policy for that server, the same way any internal API's owning team is responsible for its own compatibility contract. The organizational payoff of writing this down explicitly, rather than leaving it to each team's judgment, is that consuming hosts can build automation (schema diffing, contract tests) against a policy that's actually guaranteed rather than merely hoped for.</p>
+</div>
+
+<div class="question" id="q79"><span class="level">STAFF</span>Q79. A skeptical staff engineer argues: "MCP just adds a network hop and an extra abstraction layer for something we could call directly." Steelman their position, then make the actual counter-argument.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: Very High — the single most common staff pushback question</p>
+<div class="answer">
+<p>The steelman is real and shouldn't be dismissed: for a single application with a small, stable, fully-owned set of tools, MCP genuinely does add latency (a network hop and JSON-RPC serialization versus an in-process method call), operational surface (a server to deploy, version, and monitor separately), and cognitive overhead (engineers now need to understand a protocol, not just call a function) — for that narrow case, direct integration is legitimately simpler and faster. The counter-argument is about where the organization actually sits on the N-applications-by-M-systems curve: the moment a second AI application needs any of the same capabilities, or a system's owning team wants to expose it to teams they don't control, the combinatorial cost of N direct integrations outgrows the fixed cost of standardizing once — and most organizations building more than one AI application cross that threshold quickly, whether or not they've noticed. The honest answer isn't "MCP is always better," it's "the case for MCP strengthens directly with the number of application-to-system pairings you actually have or expect to have."</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> A candidate who only gives the pro-MCP argument without engaging the steelman honestly is missing the exact kind of nuanced tradeoff reasoning staff-level system-design interviews are designed to surface.</div>
+
+<div class="question" id="q80"><span class="level">STAFF</span>Q80. How would you decide, for a specific internal capability, whether it should be exposed as an MCP tool at all, versus kept as an internal method only the owning application calls?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The deciding question isn't "can this be a tool" (almost anything can) but "does more than one AI-application-shaped consumer plausibly need this, now or in a reasonably foreseeable future, and is the owning team willing to operate it with the reliability and versioning discipline a shared dependency demands." A capability that's genuinely single-consumer and unlikely to stay that way is better left as a local method or a plain internal service call — turning it into an MCP server prematurely adds an operational and versioning surface (health checks, a compatibility contract, monitoring) that only pays for itself once real reuse materializes, and a team should be honest that "we might need this elsewhere someday" is a weak justification on its own without a second concrete consumer already in view.</p>
+</div>
+
+<div class="question" id="q81"><span class="level">STAFF</span>Q81. Describe how you'd design the failure-handling contract between a host and a critical, shared MCP server so that the server's downtime degrades gracefully instead of taking down every dependent application.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High</p>
+<div class="answer">
+<p>Per-server circuit breaking at the host's orchestration layer, so repeated failures/timeouts against one server stop being retried immediately and instead fail fast (returning a clear error the model can react to — "the ticketing system is currently unavailable" — rather than hanging the whole conversation turn); a fallback behavior defined per tool where one makes sense (serving a cached last-known-good result for a read-only tool, versus no sensible fallback for a genuinely destructive action); health-check-driven routing if multiple redundant instances of the server exist; and treating the server's own SLA and on-call ownership as a first-class part of the dependency, the same as you would for any other shared internal service a critical path depends on — a shared MCP server without an operational ownership model is a single point of failure wearing a protocol-compliant costume.</p>
+</div>
+
+<div class="question" id="q82"><span class="level">STAFF</span>Q82. What organizational failure mode does a strong MCP adoption actually prevent, that a technically-correct-but-organizationally-naive rollout would not?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>The technical protocol alone doesn't prevent the "everyone builds their own MCP server for the same underlying system" failure mode — without an organizational decision about who owns building and operating the canonical server for each system (CRM, ticketing, internal search), teams will independently re-implement competing MCP servers for the same capability, recreating the exact N×M duplication problem MCP was adopted to eliminate, just now expressed as multiple non-canonical MCP servers instead of multiple non-canonical direct integrations. Preventing this requires a deliberate governance decision — the team that owns a system also owns the one sanctioned MCP server exposing it, published somewhere discoverable (an internal registry) — layered on top of the protocol, not implied by adopting the protocol itself.</p>
+</div>
+
+<div class="question" id="q83"><span class="level">STAFF</span>Q83. How would you reconcile MCP's "servers know nothing about the host's business logic" design principle with a legitimate need for a tool's behavior to differ by which application is calling it (e.g., different default page sizes, different formatting)?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The cleanest reconciliation is to push that variation into parameters the calling host supplies explicitly on each call (an argument controlling verbosity or page size) rather than the server trying to infer or special-case behavior based on which host it thinks is calling — the moment a server starts branching its logic on "which application is this," it has broken the principle that made it independently reusable in the first place, and re-coupled itself to specific consumers exactly like the bespoke integrations MCP was meant to replace. Where genuinely host-specific configuration is unavoidable, it belongs in how that host is configured to call the tool (default arguments the host's orchestration layer supplies), not in server-side logic that inspects caller identity to change behavior.</p>
+</div>
+
+<div class="question" id="q84"><span class="level">STAFF</span>Q84. You're evaluating whether to adopt a third-party MCP server that solves a real business need but comes from an unfamiliar vendor with no long operating history. What's your actual decision framework, beyond "read the code once"?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Treat it exactly like onboarding any other third-party dependency with execution and data-access rights, using the same procurement/security diligence you'd apply to a new SaaS vendor with API access to sensitive systems — provenance and maintenance signal (is it actively maintained, does it have a real security disclosure process), the actual blast radius of what it's being granted (scope its access as narrowly as the use case allows regardless of how much you trust the vendor, per least-privilege), a sandboxed trial period with monitoring before it touches production data, and an explicit answer to "what's our rollback plan if this vendor's server is later found compromised or simply abandoned" before you build anything hard-to-unwind on top of it. The MCP-specific addition to that general framework is watching for the tool-poisoning pattern — pin and diff its tool definitions across versions rather than trusting a point-in-time review to hold.</p>
+</div>
+
+<div class="question" id="q85"><span class="level">STAFF</span>Q85. How does the existence of MCP change how you'd structure a team responsible for "AI platform" work at a company with many product teams building AI features?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>It creates a natural split between two responsibilities that used to be entangled: a platform team can own the host-side concerns that benefit every AI application (the orchestration framework, the MCP client infrastructure, cross-cutting policy like the confirmation-before-destructive-tool-call pattern, observability), while individual system-owning teams own the MCP servers exposing their own domain (a distinct, much smaller scope of work than building a whole application's AI integration). This is a meaningfully different shape than a world without MCP, where the platform team would otherwise be pulled into building or reviewing bespoke point-to-point integration code for every system every product team's AI feature happens to need, since there was no clean interface for other teams to expose their own systems' capabilities independently.</p>
+</div>
+
+<div class="question" id="q86"><span class="level">STAFF</span>Q86. A production incident: a shared MCP server starts returning malformed JSON-RPC responses intermittently under load, and multiple downstream AI applications start failing in different, confusing ways. How do you reason about where to look first, and what does this incident suggest about your architecture in hindsight?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High — an incident-review-style staff question</p>
+<div class="answer">
+<p>First isolate whether it's the server's own logic degrading under load (a downstream dependency it calls timing out and the server not handling that gracefully before serializing a response) versus a transport-layer issue (partial writes on the stdio stream, or a proxy/load balancer in front of a Streamable HTTP deployment mishandling the streaming response shape under concurrent load) — the MCP Inspector or direct traffic capture against the server in isolation, replicated under synthetic load, separates these quickly. In hindsight, "multiple downstream applications fail in different confusing ways" is itself the signal worth internalizing: a shared server without per-consuming-application circuit breaking and without contract-level response validation on the client side (rejecting malformed responses explicitly and surfacing a clear "upstream server error," rather than each host's parsing code failing idiosyncratically) turns one server's degradation into an incident shaped differently for every team depending on it, which is exactly the operational cost of a shared dependency that the N+M efficiency argument doesn't mention up front.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> The strongest answers name the missing safety net explicitly — response validation at the client and per-application circuit breaking — rather than just diagnosing this one incident and stopping there.</div>
+
+<div class="question" id="q87"><span class="level">STAFF</span>Q87. How would you decide, as a staff engineer, whether your organization should build a custom internal successor/fork to MCP rather than adopting the open spec as-is?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Low-Medium</p>
+<div class="answer">
+<p>This is very rarely the right call, and the bar should be set high on purpose: you'd only consider it if you had a requirement genuinely incompatible with the open spec's design (not merely "our first implementation of the spec was awkward," which is a solvable engineering problem, not a spec problem) and were willing to give up every ecosystem benefit that comes from standardization — every community and vendor MCP server, every host application built against the standard client SDKs, all of it becomes unusable or requires an adapter layer the moment you fork. In practice, almost every "we need something MCP doesn't do" situation is better solved by using MCP's own extension points (the <code>_meta</code> field, capability negotiation for optional features) or by contributing the missing capability back to the open spec's evolution, since the entire value proposition this chapter has been building toward — N+M instead of N×M — depends on staying on the shared standard rather than becoming your own bespoke island again.</p>
+</div>
+
+<div class="question" id="q88"><span class="level">STAFF</span>Q88. What's the deepest reason MCP standardizes the wire contract but deliberately refuses to standardize authorization policy, and why would baking in a full authz framework have likely hurt adoption?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Authorization policy is inherently organization-specific — what "this user is allowed to call this tool" means depends on each company's own identity system, role model, and compliance requirements, none of which a protocol spec can anticipate or should try to own without either being too rigid for most adopters or so configurable it stops being a simple, learnable standard. A protocol that tried to also mandate a specific authorization model would have forced every adopter to either fit their existing identity infrastructure awkwardly into the spec's assumptions or fork/extend it immediately, undermining the exact "everyone speaks the same thing" property that makes standardization valuable in the first place — the same reason HTTP defines how a request is structured but not who's allowed to call which endpoint, leaving that correctly to the application layer.</p>
+</div>
+
+<div class="question" id="q89"><span class="level">STAFF</span>Q89. You need to make the case, quantitatively, for why a company with 6 AI applications and 15 internal systems should invest in MCP servers now rather than later. What's the actual argument, and what's the honest caveat?</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High at staff level</p>
+<div class="answer">
+<p>At 6 applications and 15 systems, a fully-connected direct-integration world is bounded by up to 90 point-to-point integrations if every application eventually needs every system, versus 6 + 15 = 21 total integration efforts (one client-side integration per application, one server-side integration per system) under a shared protocol — and critically, every new application added afterward costs 1 more integration effort under MCP versus up to 15 more direct integrations without it, so the gap only widens as the company grows. The honest caveat: this argument assumes real, materializing reuse across applications and systems — if in practice each application only ever needs 2-3 systems and that never changes, the realized savings are much smaller than the theoretical N×M-versus-N+M ceiling suggests, so the pitch should be grounded in your organization's actual and expected reuse pattern, not the worst-case combinatorial bound alone.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> A candidate who leads with the raw N×M-vs-N+M formula without immediately caveating it against actual observed reuse is reciting the argument from earlier in the chapter, not applying it — watch for whether they self-correct to the honest caveat unprompted.</div>
+
+<div class="question" id="q90"><span class="level">STAFF</span>Q90. How would you audit, across an entire organization, whether MCP adoption is actually delivering its intended benefit versus having become a compliance checkbox with servers nobody reuses?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Look past "how many MCP servers exist" (a vanity metric that a compliance-driven rollout will happily inflate) to "how many distinct consuming applications does each server actually have," "how often does a newly built application reuse an existing server versus needing a new one built," and "how many servers exist that have exactly one consumer" (a strong signal of unrealized reuse potential, or of a server that should never have been split out from its one consumer in the first place). An organization where most servers have exactly one consumer has paid MCP's operational tax (versioning discipline, a server to run, a registry entry to maintain) without collecting its actual payoff, which is a legitimate finding to bring back to leadership rather than assuming adoption itself equals success.</p>
+</div>
+
+<div class="question" id="q91"><span class="level">STAFF</span>Q91. What's the strongest argument against over-standardizing too early — i.e., building a dozen MCP servers for internal systems before any second AI application actually exists to consume them?</div>
+<p class="roi">ROI: ★★★☆☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Building the server side of the protocol ahead of real demand means guessing at the tool boundaries, descriptions, and schema shapes a not-yet-built second consumer will actually need, with no real usage feedback to correct course — exactly the same risk as building a public API ahead of any real external consumer, where the first correction typically comes only after a consumer arrives and reveals the original design's wrong assumptions. It's usually better sequencing to let a second genuine consumer's needs pull the first server into existence (or at minimum, into its production-hardened form) rather than pushing servers out speculatively — the N+M efficiency argument is real, but it's an argument for building the second and later servers cheaply, not for front-loading server-building before the M side of the equation has any actual N greater than one.</p>
+</div>
+
+<div class="question" id="q92"><span class="level">STAFF</span>Q92. Two teams both want to expose "customer data" as an MCP server, with slightly different views of what fields matter. How would you resolve this as the staff engineer arbitrating the decision?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>Resist the instinct to let both ship separate servers "for now" — that's the exact non-canonical-duplication failure mode adoption governance is supposed to prevent, and it compounds the moment a third team needs customer data and has to guess which of two servers is authoritative. The right resolution is establishing a single canonical customer-data server, owned by whichever team is closer to the actual system of record (not whichever team asked first), designed with both consuming teams' actual field requirements gathered upfront as input to its tool/resource design — and if the two use cases are different enough to genuinely warrant different shapes, that's better solved as two distinct tools or resource views on one canonically-owned server than as two independently-operated servers with drifting data semantics for what should be the same underlying entity.</p>
+</div>
+
+<div class="question" id="q93"><span class="level">STAFF</span>Q93. What's the long-term risk of MCP's own ecosystem success — many high-quality, widely-adopted third-party servers — and how should a mature organization's dependency policy account for it?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium-High</p>
+<div class="answer">
+<p>Ecosystem success means it becomes tempting to depend on external, vendor- or community-maintained MCP servers for increasingly business-critical capabilities, which reintroduces classic third-party dependency risk (a maintainer abandoning a widely-used server, a vendor changing pricing or terms, a supply-chain compromise in a popular package) at exactly the moment organizations are least prepared for it because "it's just an MCP server, not really our system" feels lower-stakes than it is. A mature policy treats any externally-maintained MCP server powering a production path with the same vendor-risk diligence as any other critical third-party dependency — contingency plans for the maintainer disappearing, pinned and audited versions, and an honest inventory of which production capabilities actually depend on servers the organization doesn't control.</p>
+</div>
+
+<div class="question" id="q94"><span class="level">STAFF</span>Q94. If you were asked to bet on how MCP itself will need to evolve based on where its current design leaves the most friction, what would you point to and why?</div>
+<p class="roi">ROI: ★★★★☆ · Frequency: Medium</p>
+<div class="answer">
+<p>The areas this chapter has already flagged as "still maturing" are the honest answer, not speculation dressed as certainty: authorization and identity propagation at scale (today's OAuth-based framework is a solid start but per-organization identity federation across many servers is still largely bespoke), discovery and trust at scale as the registry ecosystem matures (moving from "a searchable catalog exists" to verified, reputationally-scored publishers, the way established package registries eventually grew), and tooling for the versioning/compatibility discipline this chapter argues for (automated schema-diffing and compatibility checking as a standard part of the server-authoring toolchain, rather than a discipline each team has to invent for itself). None of these are flaws in the current spec so much as the natural next layer any successful infrastructure standard grows once real-world scale exposes where hand-waving is currently doing the work that tooling and convention should.</p>
+</div>
+
+<div class="question" id="q95"><span class="level">STAFF</span>Q95. In one sentence each, articulate what MCP is not trying to be, and why an interviewer asking a staff candidate this question is really testing for architectural judgment, not protocol trivia.</div>
+<p class="roi">ROI: ★★★★★ · Frequency: High — a strong closing question in staff loops</p>
+<div class="answer">
+<p>MCP is not an authorization framework, not an agent-orchestration framework, not a guarantee of server trustworthiness, not a caching layer, and not a replacement for the model's own tool-calling mechanism — it is narrowly a wire contract for discovering and invoking tools, resources, and prompts across a host/client/server boundary. An interviewer asking this is testing whether a candidate understands that a protocol's power comes precisely from what it deliberately leaves to the layers above and below it — the same discipline that makes HTTP, JSON-RPC, or TCP successful standards — because an engineer who thinks MCP alone solves security, orchestration, or reliability will make exactly the wrong architectural bets when those concerns inevitably surface in a real system built on top of it.</p>
+</div>
+<div class="followup"><strong>Interview Gold Point:</strong> This is a strong chapter-closing question precisely because it forces a candidate to state the protocol's boundaries crisply — naming which sibling layer (tool selection, agent orchestration, multi-agent coordination) actually owns each of those concerns is itself worth volunteering if the interviewer presses further.</div>
+
 
 </div>
 
