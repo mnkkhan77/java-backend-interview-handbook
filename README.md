@@ -1,6 +1,6 @@
 # Java Backend Interview Handbook
 
-A mobile-friendly handbook covering three tracks in one single app, one reader: **Senior Java Backend Engineer** interview prep, a **React / Frontend Engineer** interview handbook, and a full **AI Engineering with Java & Spring AI** track. The sidebar reads Java → React → AI Engineering, in that order, even though chapter numbers are not contiguous across tracks (see the numbering note in each section below). Interview chapters (Java: 01–24, React: 112–135) carry high-ROI questions, sample answers, code, and "interview gold point" follow-ups; the AI Engineering chapters (25–111) are deep, book-style chapters (motivation → theory → internals → math → production architecture → Spring AI mapping → interview questions) covering everything from ML foundations through Spring AI, RAG, agents, and enterprise AI systems.
+A mobile-friendly handbook covering four tracks in one single app, one reader: **Senior Java Backend Engineer** interview prep, a **React / Frontend Engineer** interview handbook, a full **AI Engineering with Java & Spring AI** track, and a **System Design & Distributed Systems** track. The sidebar reads Java → React → AI Engineering → System Design, in that order, even though chapter numbers are not contiguous across tracks (see the numbering note in each section below). Interview chapters (Java: 01–24, React: 112–135) carry high-ROI questions, sample answers, code, and "interview gold point" follow-ups; the AI Engineering chapters (25–111) are deep, book-style chapters (motivation → theory → internals → math → production architecture → Spring AI mapping → interview questions) covering everything from ML foundations through Spring AI, RAG, agents, and enterprise AI systems; the System Design track (its own 01–12 numbering, same as Java) covers distributed-systems fundamentals through staff-level case studies.
 
 ### 🌐 Live site: **[inter-lyart.vercel.app](https://inter-lyart.vercel.app)**
 
@@ -138,7 +138,7 @@ Currently published:
 - **Mobile-adaptive** — collapsible sidebar and responsive layout.
 - **Searchable** — filter chapters and sub-sections instantly.
 - **400+ questions** with ROI ratings, frequency, sample answers, code snippets, and revision sheets across the interview chapters.
-- **Quiz Yourself** ([`quiz.html`](quiz.html), linked from the 🧠 Quiz button in the reader's top bar) — a randomized flashcard quiz drawn from the same Q&A across all 14,000+ questions. Pick tracks/topic groups (or leave everything unchecked to draw from the whole bank), set how many questions, then reveal each answer and self-mark Got it / Missed it for active-recall practice. Ends with a score, a missed-question list linking straight back into the handbook, and a lightweight per-question accuracy history saved in your browser (`localStorage`).
+- **Quiz Yourself** ([`quiz.html`](quiz.html), linked from the 🧠 Quiz button in the reader's top bar) — a randomized flashcard quiz drawn from the same Q&A across all 15,000+ questions. Pick tracks/topic groups (or leave everything unchecked to draw from the whole bank), set how many questions, then reveal each answer and self-mark Got it / Missed it for active-recall practice. Ends with a score, a missed-question list linking straight back into the handbook, and a lightweight per-question accuracy history saved in your browser (`localStorage`).
 
 ## 🚀 Usage
 
@@ -165,7 +165,24 @@ Same format and depth as the Java interview chapters, now **merged into the sing
 | 122 | Forms & Validation | 134 | Data Structures & Algorithms (JS) |
 | 123 | React Router & Navigation | 135 | Behavioural & Self-Introduction |
 
-Regenerate the handbook after editing any chapter (Java, React, or AI Engineering) with `python _build_index.py` — one script, one combined `handbook.html`. CI (`.github/workflows/build-check.yml`) re-runs this on every push and fails the build if it produces a diff, so a forgotten rebuild never reaches `main`.
+Regenerate the handbook after editing any chapter (Java, React, AI Engineering, or System Design) with `python _build_index.py` — one script, one combined `handbook.html`. CI (`.github/workflows/build-check.yml`) re-runs this on every push and fails the build if it produces a diff, so a forgotten rebuild never reaches `main`.
+
+---
+
+## 🏗️ System Design & Distributed Systems Track
+
+A fourth track, same format and depth as the others, with its own **01–12** numbering (`system-design/` folder). Concept chapters run junior through staff; the three case studies at the end are deliberately staff-skewed, synthesis-heavy capstones that cross-reference the Java and other System Design chapters rather than re-teaching the same mechanics.
+
+| # | Chapter | # | Chapter |
+|---|---------|---|---------|
+| 01 | System Design Fundamentals | 07 | Message Queues & Event-Driven Architecture |
+| 02 | CAP Theorem & Consistency Models | 08 | Rate Limiting, Throttling & Backpressure |
+| 03 | Load Balancing & DNS | 09 | Consensus & Distributed Coordination |
+| 04 | Caching & CDNs at the Architecture Level | 10 | Designing a URL Shortener |
+| 05 | Database Replication & Sharding | 11 | Designing a Chat & Messaging System |
+| 06 | Consistent Hashing & Data Partitioning | 12 | Designing a Social Media News Feed |
+
+Each chapter also ships an MCQ bank (`mcq/system-design/`, 15 questions each) for the Quiz page, same as the other three tracks.
 
 ---
 
