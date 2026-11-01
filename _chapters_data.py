@@ -27,11 +27,13 @@ TRACK_FOLDER = {
     "Java Backend Interview Handbook": "java",
     "React & Frontend Interview Handbook": "react",
     "AI Engineering & Production": "ai-engineering",
+    "System Design & Distributed Systems": "system-design",
 }
 TRACK_SLUG = {
     "Java Backend Interview Handbook": "java",
     "React & Frontend Interview Handbook": "react",
     "AI Engineering & Production": "ai",
+    "System Design & Distributed Systems": "sys",
 }
 
 TRACKS = [
@@ -72,6 +74,13 @@ TRACKS = [
         ("Advanced & Specialized Topics", ["88", "89", "90", "91", "92", "93"]),
         ("AI Engineer Interview Question Bank", ["94", "95", "96", "97", "98", "99", "100"]),
         ("Problem Solving (DSA)", ["101"]),
+    ]),
+    ("System Design & Distributed Systems", [
+        ("Foundations", ["01", "02"]),
+        ("Scaling the Infrastructure Layer", ["03", "04"]),
+        ("Data at Scale", ["05", "06"]),
+        ("Messaging & Coordination", ["07", "08", "09"]),
+        ("Case Studies", ["10", "11", "12"]),
     ]),
 ]
 
@@ -253,6 +262,20 @@ TITLES = {
         "28": "Build Tools & Tooling",
         "29": "Frontend System Design",
         "30": "Data Structures & Algorithms (JavaScript)",
+    },
+    "system-design": {
+        "01": "System Design Fundamentals",
+        "02": "CAP Theorem & Consistency Models",
+        "03": "Load Balancing & DNS",
+        "04": "Caching & CDNs at the Architecture Level",
+        "05": "Database Replication & Sharding",
+        "06": "Consistent Hashing & Data Partitioning",
+        "07": "Message Queues & Event-Driven Architecture",
+        "08": "Rate Limiting, Throttling & Backpressure",
+        "09": "Consensus & Distributed Coordination",
+        "10": "Designing a URL Shortener",
+        "11": "Designing a Chat & Messaging System",
+        "12": "Designing a Social Media News Feed",
     },
 }
 
